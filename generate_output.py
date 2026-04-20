@@ -3,6 +3,13 @@ import os
 import openpyxl
 from datetime import datetime
 from funds import get_funds, get_funds_bond
+from technical_analysis import (
+    ADX_WEIGHT, BUY_SIGNAL, SELL_SIGNAL,
+    CONSEC_CHANGE_PCT, FORCE_TAKE_PROFIT,
+    BUY_PERCENTILE_CAP, SELL_PERCENTILE_FLOOR,
+    TREND_60_ENABLED, TREND_60_SCORE,
+    FORCE_TAKE_PROFIT_ENABLED,
+)
 from openpyxl.styles.colors import Color
 from openpyxl.styles import PatternFill
 
@@ -545,6 +552,8 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             boll_s = sig.get('boll_score', 0)
 
             force_note = '<br><small style="color:#722ed1">触发止盈</small>' if sig.get('is_force_sell') else ''
+            filter_reason = sig.get('filter_reason', '')
+            filter_note = f'<br><small style="color:#fa8c16">{filter_reason}</small>' if filter_reason else ''
             if sig.get('is_force_sell'):
                 overall_badge = '<span class="signal-badge badge-force-sell">止盈信号</span>'
             else:
@@ -563,8 +572,9 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
                 <td>{render_adx_bar(sig.get('adx_value'), sig.get('market_state', ''))}</td>
                 <td>{render_atr_display(sig.get('atr_pct'))}</td>
                 <td>{render_percentile_bar(sig.get('nav_percentile'))}<br></td>
+                <td>{render_trend_badge(sig.get('trend_60', '')) if TREND_60_ENABLED else '--'}</td>
                 <td>{render_score_bar(sig.get('score', 0))}{force_note}</td>
-                <td>{overall_badge}{gztime_display}</td>
+                <td>{overall_badge}{filter_note}{gztime_display}</td>
             </tr>\n'''
 
         signal_html = f'''
@@ -579,14 +589,14 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#52c41a" opacity="0.85"/></svg> 卖出信号</span>
             <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#722ed1" opacity="0.85"/></svg> 止盈信号</span>
         </div>
-        <p class="signal-note">ADX&ge;25=趋势行情（MA/MACD权重&times;1.5），ADX&lt;25=震荡行情（RSI/布林权重&times;1.5），KDJ固定权重&times;1 | 综合建议: 评分 &ge;+4 买入, &le;-4 卖出 | 买卖信号经历史去重(变动需超3%)、百分位过滤(买&gt;90%/卖&lt;10%无效) | 净值涨幅&gt;25%触发<span style="color:#722ed1">止盈信号</span> | ATR/百分位仅展示</p>
+        <p class="signal-note">ADX&ge;25=趋势行情（MA/MACD权重&times;{ADX_WEIGHT}，MA60趋势&plusmn;{TREND_60_SCORE}），ADX&lt;25=震荡行情（RSI/布林权重&times;{ADX_WEIGHT}，MA60趋势=0），KDJ固定权重&times;1 | 综合建议: 评分 &ge;+{BUY_SIGNAL} 买入, &le;{SELL_SIGNAL} 卖出 | 买卖信号经历史去重(变动需超{round(CONSEC_CHANGE_PCT * 100)}%)、百分位过滤(买&gt;{BUY_PERCENTILE_CAP}%/卖&lt;{SELL_PERCENTILE_FLOOR}%无效) | {'净值涨幅&gt;' + str(round((FORCE_TAKE_PROFIT - 1) * 100)) + '%触发<span style="color:#722ed1">止盈信号</span>' if FORCE_TAKE_PROFIT_ENABLED else '止盈信号已关闭'} | ATR/百分位仅展示</p>
         <div class="table-wrapper">
         <table class="signal-table">
             <thead>
                 <tr>
                     <th>代码</th><th>名字</th><th>净值</th><th>近5年走势</th>
                     <th>MA(5/20)</th><th>RSI(14)</th><th>MACD</th><th>KDJ(交叉/J值)</th><th>布林带</th>
-                    <th>ADX(14)</th><th>ATR%</th><th>百分位（近6年）</th>
+                    <th>ADX(14)</th><th>ATR%</th><th>百分位（近6年）</th><th>趋势60</th>
                     <th>评分</th><th>建议</th>
                 </tr>
             </thead>

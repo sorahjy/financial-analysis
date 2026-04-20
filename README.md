@@ -1,5 +1,5 @@
 # fund-excess-returns-checker
-检查：1）基金各个阶段的超额收益。2）基金经理是否变更
+检查：1）基金各个阶段的超额收益。2）基金技术面分析与买卖点推荐。3）基金经理是否变更。
 
 ### USAGE STEP 1
 ##### funds.py文件下修改基金参数：
@@ -11,6 +11,8 @@
 * fund是需要跟踪的中高风险基金代码
 
 * fund_bond是需要跟踪的中低风险基金代码
+
+* technical_analysis 中可以设置各个指标的参数。
 
 ### USAGE STEP 2
 bash run.sh
@@ -58,6 +60,9 @@ cryptography
 
 ### Update v2.0.2  2026.4.18
 新增买卖点判断逻辑以及止盈卖出点位
+
+### Update v2.0.3  2026.4.20
+新增60日趋势线指标，新增参数配置功能。
 
 
 ### Acknowledgment

@@ -1,20 +1,87 @@
 """
 技术分析模块：基于历史净值计算多维度技术指标，生成买卖信号。
 
-指标体系：
-  - MA均线交叉 (MA5/MA20)
-  - RSI(14)
-  - MACD(12,26,9)
-  - KDJ(9,3,3 或 14,3,3，根据ADX动态选择)
-  - 布林带 (Bollinger Bands, 20日)
-  - ADX(14) 平均趋向指数（动态调整权重）
-  - ATR(14) 真实波幅（仅展示）
-  - 历史净值百分位
-  - 最大回撤 (近1250日)
+═══════════════════════════════════════════════════════════════
+一、指标体系（6大评分指标 + 辅助展示指标）
+═══════════════════════════════════════════════════════════════
+
+  评分指标（参与综合评分）：
+    1. MA均线交叉 (MA5/MA20)    — 金叉=买入(+分)，死叉=卖出(-分)
+    2. RSI(14)                 — <RSI_OVERSOLD 超卖=买入，>RSI_OVERBOUGHT 超买=卖出
+    3. MACD(12,26,9)           — DIF上穿DEA=买入，DIF下穿DEA=卖出
+    4. KDJ交叉 + J值           — K上穿D=买入，K下穿D=卖出；J>100超买，J<0超卖
+       (ADX>=25 趋势行情用 KDJ(KDJ_N_TREND,3,3)，ADX<25 震荡行情用 KDJ(KDJ_N_OSCILLATE,3,3))
+    5. 布林带 (20日, 2倍标准差) — %B>BOLL_OVERBOUGHT 超买=卖出，%B<BOLL_OVERSOLD 超卖=买入
+    6. MA60趋势方向             — 仅趋势市生效：价格>=MA60=多头(+TREND_60_SCORE)，价格<MA60=空头(-TREND_60_SCORE)；震荡市=0
+
+  辅助展示指标（不参与评分）：
+    7. ADX(14) 平均趋向指数     — 判断趋势/震荡，动态调整上述指标权重
+    8. ATR(14) 真实波幅         — 展示波动率
+    9. 历史净值百分位（近6年）   — 展示估值位置，同时用于过滤买卖信号
+    10. 最大回撤（近5年）        — 展示风险
+    11. MA120 趋势方向           — 展示长期趋势（多头/空头）
+
+═══════════════════════════════════════════════════════════════
+二、评分机制（ADX 动态权重）
+═══════════════════════════════════════════════════════════════
+
+  ADX >= 25（趋势行情）：
+    MA/MACD 权重 × ADX_WEIGHT(1.5)，RSI/布林 权重 × 1，KDJ 固定 × 1，MA60趋势 固定 ±TREND_60_SCORE
+  ADX < 25（震荡行情）：
+    MA/MACD 权重 × 1，RSI/布林 权重 × ADX_WEIGHT(1.5)，KDJ 固定 × 1，MA60趋势 = 0
+
+  各指标得分范围：
+    MA: ±ADX_WEIGHT 或 ±1 | RSI: ±ADX_WEIGHT 或 ±1
+    MACD: ±ADX_WEIGHT 或 ±1 | KDJ交叉: ±1 | KDJ J值: ±1
+    布林: ±ADX_WEIGHT 或 ±1 | MA60趋势: ±TREND_60_SCORE（趋势市）或 0（震荡市）
+
+  综合评分 = MA + RSI + MACD + KDJ交叉 + KDJ_J + 布林 + MA60趋势
+  理论极值：趋势市 ±(7 + TREND_60_SCORE)，震荡市 ±7
+
+═══════════════════════════════════════════════════════════════
+三、买卖信号生成规则
+═══════════════════════════════════════════════════════════════
+
+  1. 阈值判定：综合评分 >= BUY_SIGNAL → 买入；<= SELL_SIGNAL → 卖出
+  2. 百分位过滤：百分位 > BUY_PERCENTILE_CAP 时买入无效；
+                 百分位 < SELL_PERCENTILE_FLOOR 时卖出无效
+  3. 连续信号去重：
+     - 连续买入：新买点净值须 <= 上次买入价 ×(1 - CONSEC_CHANGE_PCT)
+     - 连续卖出：新卖点净值须 >= 上次卖出价 ×(1 + CONSEC_CHANGE_PCT)
+  4. 强制止盈：净值 > 上次买入价 × FORCE_TAKE_PROFIT 时触发止盈信号
+
+  百分位评分（辅助参考）：< PERCENTILE_LOW → +1 | > PERCENTILE_HIGH → -1
 """
 import json
 import math
 import os
+
+
+# ============================================================
+# 可调参数（修改后 generate_output.py 会自动引用）
+# ============================================================
+ADX_WEIGHT = 1.5              # ADX 动态权重倍数
+BUY_SIGNAL = 4              # 综合评分 >= 此值 → 买入信号
+SELL_SIGNAL = -4            # 综合评分 <= 此值 → 卖出信号
+CONSEC_CHANGE_PCT = 0.03    # 连续买卖去重：变动须超过此比例（3%）才再标记
+FORCE_TAKE_PROFIT = 1.25    # 净值涨超上次买入价 × 此值 → 强制止盈（涨25%）
+BUY_PERCENTILE_CAP = 90     # 百分位 > 此值时，买入信号无效
+SELL_PERCENTILE_FLOOR = 10  # 百分位 < 此值时，卖出信号无效
+RSI_OVERBOUGHT = 70         # RSI 超买阈值
+RSI_OVERSOLD = 30           # RSI 超卖阈值
+KDJ_J_OVERBOUGHT = 100      # KDJ J值超买
+KDJ_J_OVERSOLD = 0          # KDJ J值超卖
+BOLL_OVERBOUGHT = 0.8       # 布林 %B 超买
+BOLL_OVERSOLD = 0.2         # 布林 %B 超卖
+KDJ_N_TREND = 14             # KDJ 趋势行情(ADX>=25)的 N 参数
+KDJ_N_OSCILLATE = 9          # KDJ 震荡行情(ADX<25)的 N 参数
+TREND_60_ENABLED = True       # 是否启用 MA60 趋势评分
+TREND_60_SCORE = 2            # MA60 趋势评分的分值（趋势市±此值，震荡市=0）
+FORCE_TAKE_PROFIT_ENABLED = True  # 是否启用强制止盈信号
+PERCENTILE_LOW = 5           # 百分位评分：< 此值 → +0.5分（低估）
+PERCENTILE_HIGH = 95         # 百分位评分：> 此值 → -0.5分（高估）
+CHART_LOOKBACK_DAYS = 1250   # 走势图 / 最大回撤回看天数（不建议修改）
+PERCENTILE_LOOKBACK_DAYS = 1500  # 历史百分位回看天数（不建议修改）
 
 
 # ============================================================
@@ -296,9 +363,9 @@ def signal_to_score(signal):
 # 单点综合评分（消除重复逻辑的核心函数）
 # ============================================================
 
-def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
-                     k_line_9, d_line_9, j_line_9,
-                     k_line_14, d_line_14, j_line_14,
+def calc_point_score(gi, navs, ma60, ma5, ma20, rsi, dif, dea,
+                     k_trend, d_trend, j_trend,
+                     k_osc, d_osc, j_osc,
                      pct_b, adx, adx_weight, detail=False):
     """计算单个时间点 gi 的综合评分。
 
@@ -306,8 +373,8 @@ def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
     detail=True:  返回 dict，包含各指标分项得分，用于最终展示
 
     权重规则：
-      - ADX >= 25 (趋势): MA/MACD ×adx_weight, RSI ×1, KDJ ×1, 布林 ×1
-      - ADX < 25  (震荡): MA/MACD ×1, RSI ×adx_weight, KDJ ×1, 布林 ×adx_weight
+      - ADX >= 25 (趋势): MA/MACD ×adx_weight, RSI/布林 ×1, KDJ ×1, MA60趋势 固定±TREND_60_SCORE
+      - ADX < 25  (震荡): MA/MACD ×1, RSI/布林 ×adx_weight, KDJ ×1, MA60趋势 = 0
     """
     adx_i = adx[gi] if gi < len(adx) else None
     is_trend = adx_i is not None and adx_i >= 25
@@ -334,11 +401,11 @@ def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
         elif diff_prev >= 0 > diff_now:
             ma_score = -tw
 
-    # RSI（震荡类）— 阈值 70/30
+    # RSI（震荡类）
     if rsi[gi] is not None:
-        if rsi[gi] > 70:
+        if rsi[gi] > RSI_OVERBOUGHT:
             rsi_score = -ow
-        elif rsi[gi] < 30:
+        elif rsi[gi] < RSI_OVERSOLD:
             rsi_score = ow
 
     # MACD（趋势类）
@@ -352,7 +419,7 @@ def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
             macd_score = -tw
 
     # KDJ（根据ADX选参数，固定权重×1）
-    ki, di, ji = (k_line_14, d_line_14, j_line_14) if is_trend else (k_line_9, d_line_9, j_line_9)
+    ki, di, ji = (k_trend, d_trend, j_trend) if is_trend else (k_osc, d_osc, j_osc)
     if (ki[gi] is not None and di[gi] is not None
             and ki[gi - 1] is not None and di[gi - 1] is not None):
         kd_now = ki[gi] - di[gi]
@@ -362,18 +429,27 @@ def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
         elif kd_prev >= 0 > kd_now:
             kdj_cross_score = -1
         if ji[gi] is not None:
-            if ji[gi] > 100:
+            if ji[gi] > KDJ_J_OVERBOUGHT:
                 kdj_j_score = -1
-            elif ji[gi] < 0:
+            elif ji[gi] < KDJ_J_OVERSOLD:
                 kdj_j_score = 1
 
     # 布林带
     if pct_b[gi] is not None:
-        if pct_b[gi] > 0.8:
+        if pct_b[gi] > BOLL_OVERBOUGHT:
             boll_score = -ow
-        elif pct_b[gi] < 0.2:
+        elif pct_b[gi] < BOLL_OVERSOLD:
             boll_score = ow
-    total = ma_score + rsi_score + macd_score + kdj_cross_score + kdj_j_score + boll_score
+
+    # MA60 趋势方向（趋势市±TREND_60_SCORE，震荡市=0）
+    trend_60_score = 0
+    if TREND_60_ENABLED and ma60[gi] is not None and is_trend:
+        if navs[gi] >= ma60[gi]:
+            trend_60_score = TREND_60_SCORE
+        else:
+            trend_60_score = -TREND_60_SCORE
+
+    total = ma_score + rsi_score + macd_score + kdj_cross_score + kdj_j_score + boll_score + trend_60_score
 
     if not detail:
         return total
@@ -386,6 +462,7 @@ def calc_point_score(gi, ma5, ma20, rsi, dif, dea,
         'kdj_cross': kdj_cross_score,
         'kdj_j': kdj_j_score,
         'boll': boll_score,
+        'trend_60': trend_60_score,
     }
 
 
@@ -432,15 +509,14 @@ def analyze_fund(nav_records, estimate=None):
     ma120 = calc_ma(navs, 120)
     rsi = calc_rsi(navs, 14)
     dif, dea, macd_hist = calc_macd(navs)
-    k_line_9, d_line_9, j_line_9 = calc_kdj(navs, n=9)
-    k_line_14, d_line_14, j_line_14 = calc_kdj(navs, n=14)
+    k_trend, d_trend, j_trend = calc_kdj(navs, n=KDJ_N_TREND)
+    k_osc, d_osc, j_osc = calc_kdj(navs, n=KDJ_N_OSCILLATE)
     boll_upper, boll_middle, boll_lower, pct_b = calc_bollinger(navs)
     adx = calc_adx(navs, 14)
     atr = calc_atr(navs, 14)
-    max_drawdown = calc_max_drawdown(navs, 1250)
+    max_drawdown = calc_max_drawdown(navs, CHART_LOOKBACK_DAYS)
 
     # --- ADX / ATR 最新值 & 市场状态 ---
-    ADX_WEIGHT = 1.5
     latest_adx = latest_valid(adx)
     if latest_adx is not None:
         latest_adx = round(latest_adx, 1)
@@ -459,9 +535,9 @@ def analyze_fund(nav_records, estimate=None):
         latest_rsi = round(latest_rsi, 2)
 
     if is_trend:
-        k_line, d_line, j_line = k_line_14, d_line_14, j_line_14
+        k_line, d_line, j_line = k_trend, d_trend, j_trend
     else:
-        k_line, d_line, j_line = k_line_9, d_line_9, j_line_9
+        k_line, d_line, j_line = k_osc, d_osc, j_osc
     latest_j = latest_valid(j_line)
 
     latest_pct_b = latest_valid(pct_b)
@@ -469,15 +545,15 @@ def analyze_fund(nav_records, estimate=None):
         latest_pct_b = round(latest_pct_b, 4)
 
     # 历史净值百分位（最6年）
-    lookback_navs = navs[-1500:] if len(navs) > 1500 else navs
+    lookback_navs = navs[-PERCENTILE_LOOKBACK_DAYS:] if len(navs) > PERCENTILE_LOOKBACK_DAYS else navs
     current_nav = navs[-1]
     nav_low = min(lookback_navs)
     nav_high = max(lookback_navs)
     nav_percentile = round((current_nav - nav_low) / (nav_high - nav_low) * 100, 1)
 
-    if nav_percentile < 20:
+    if nav_percentile < PERCENTILE_LOW:
         percentile_score = 1
-    elif nav_percentile > 80:
+    elif nav_percentile > PERCENTILE_HIGH:
         percentile_score = -1
     else:
         percentile_score = 0
@@ -487,9 +563,9 @@ def analyze_fund(nav_records, estimate=None):
     trend_120 = get_trend(navs, ma120)
 
     # --- 综合评分（调用统一函数，detail=True 获取分项得分）---
-    score_args = (ma5, ma20, rsi, dif, dea,
-                  k_line_9, d_line_9, j_line_9,
-                  k_line_14, d_line_14, j_line_14,
+    score_args = (navs, ma60, ma5, ma20, rsi, dif, dea,
+                  k_trend, d_trend, j_trend,
+                  k_osc, d_osc, j_osc,
                   pct_b, adx, ADX_WEIGHT)
 
     score_detail = calc_point_score(len(navs) - 1, *score_args, detail=True)
@@ -509,12 +585,10 @@ def analyze_fund(nav_records, estimate=None):
     kdj_cross_signal = _score_to_signal(score_detail['kdj_cross'])
     j_signal = _score_to_signal(score_detail['kdj_j'])
     boll_signal = _score_to_signal(score_detail['boll'])
-
-    BUY_SIGNAL = 4
-    SELL_SIGNAL = -4
+    trend_60_signal = _score_to_signal(score_detail['trend_60'])
 
     # --- 走势图数据 (近5年≈1250日) + 每日信号标记（含历史去重 & 百分位过滤）---
-    recent_n = min(1250, len(navs))
+    recent_n = min(CHART_LOOKBACK_DAYS, len(navs))
     sl = slice(-recent_n, None)
     start_idx = len(navs) - recent_n
 
@@ -524,27 +598,27 @@ def analyze_fund(nav_records, estimate=None):
     last_buy_nav = 0.0
     last_sell_nav = 0.0
     overall = '持有'
+    filter_reason = ''
     is_force_sell = False
 
     for ci in range(recent_n):
         gi = start_idx + ci
         if gi < 120:
             continue
-        s = calc_point_score(gi, *score_args)
-
         # 计算该时刻的近6年百分位
-        lb_start = max(0, gi - 1500 + 1)
+        lb_start = max(0, gi - PERCENTILE_LOOKBACK_DAYS + 1)
         lb_navs = navs[lb_start:gi + 1]
         nav_lo = min(lb_navs)
         nav_hi = max(lb_navs)
         pt_pct = (navs[gi] - nav_lo) / (nav_hi - nav_lo) * 100 if nav_hi > nav_lo else 50.0
+        s = calc_point_score(gi, *score_args)
 
         is_last = (gi == len(navs) - 1)
         point_signal = '持有'
         point_forced = False
 
-        # ① 强制止盈：last_buy_nav≠0 且当前净值 > last_buy_nav × 1.25
-        if last_buy_nav != 0 and navs[gi] > last_buy_nav * 1.25:
+        # ① 强制止盈
+        if FORCE_TAKE_PROFIT_ENABLED and last_buy_nav != 0 and navs[gi] > last_buy_nav * FORCE_TAKE_PROFIT:
             point_forced = True
             # 强制卖出也算卖点，执行规则2流程
             last_buy_nav = 0.0
@@ -555,31 +629,37 @@ def analyze_fund(nav_records, estimate=None):
         # ② 普通买卖信号（非强制止盈时才判断）
         if not point_forced:
             if s >= BUY_SIGNAL:
-                # 百分位 > 90% 时买点不成立
-                if pt_pct <= 90:
+                if pt_pct <= BUY_PERCENTILE_CAP:
                     last_sell_nav = 0.0
                     if last_buy_nav == 0:
                         last_buy_nav = navs[gi]
                         buy_markers.append((ci, navs[gi]))
                         point_signal = '买入'
                     else:
-                        if navs[gi] <= last_buy_nav * 0.97:
+                        if navs[gi] <= last_buy_nav * (1 - CONSEC_CHANGE_PCT):
                             last_buy_nav = navs[gi]
                             buy_markers.append((ci, navs[gi]))
                             point_signal = '买入'
+                        elif is_last:
+                            filter_reason = f'连续买入去重(距上次买入跌幅不足{CONSEC_CHANGE_PCT*100:.0f}%)'
+                elif is_last:
+                    filter_reason = f'百分位过滤(当前{pt_pct:.1f}%>{BUY_PERCENTILE_CAP}%)'
             elif s <= SELL_SIGNAL:
-                # 百分位 < 10% 时卖点不成立
-                if pt_pct >= 10:
+                if pt_pct >= SELL_PERCENTILE_FLOOR:
                     last_buy_nav = 0.0
                     if last_sell_nav == 0:
                         last_sell_nav = navs[gi]
                         sell_markers.append((ci, navs[gi]))
                         point_signal = '卖出'
                     else:
-                        if navs[gi] >= last_sell_nav * 1.03:
+                        if navs[gi] >= last_sell_nav * (1 + CONSEC_CHANGE_PCT):
                             last_sell_nav = navs[gi]
                             sell_markers.append((ci, navs[gi]))
                             point_signal = '卖出'
+                        elif is_last:
+                            filter_reason = f'连续卖出去重(距上次卖出涨幅不足{CONSEC_CHANGE_PCT*100:.0f}%)'
+                elif is_last:
+                    filter_reason = f'百分位过滤(当前{pt_pct:.1f}%<{SELL_PERCENTILE_FLOOR}%)'
 
         if is_last:
             overall = point_signal
@@ -617,6 +697,8 @@ def analyze_fund(nav_records, estimate=None):
         'd_value': latest_d,
         'boll_signal': boll_signal,
         'boll_score': score_detail['boll'],
+        'trend_60_signal': trend_60_signal,
+        'trend_60_score': score_detail['trend_60'],
         'pct_b': latest_pct_b,
         'adx_value': latest_adx,
         'atr_pct': atr_pct,
@@ -628,6 +710,7 @@ def analyze_fund(nav_records, estimate=None):
         'max_drawdown': max_drawdown,
         'score': score,
         'overall': overall,
+        'filter_reason': filter_reason,
         'recent_navs': navs[sl],
         'recent_dates': dates[sl],
         'recent_ma5': ma5[sl],
@@ -681,10 +764,10 @@ def main():
         json.dump(signals, f, ensure_ascii=False, indent=2)
 
     print(f'技术分析完成，共分析 {len(signals)} 只基金，结果已写入 data/signals.json')
-    print(f'{"代码":>8}  {"MA":>4} {"RSI":>4} {"MACD":>4} {"KDJ":>4} {"布林":>4} {"百分位":>6}  '
+    print(f'{"代码":>8}  {"MA":>4} {"RSI":>4} {"MACD":>4} {"KDJ":>4} {"布林":>4} {"趋60":>4} {"百分位":>6}  '
           f'{"ADX":>5} {"状态":>4} {"ATR%":>6}  '
           f'{"评分":>4}  {"建议":>4}  {"回撤":>6}  {"趋势60":>6} {"趋势120":>6}')
-    print('-' * 124)
+    print('-' * 130)
     for code, sig in signals.items():
         adx_str = f'{sig["adx_value"]:.1f}' if sig.get("adx_value") is not None else '--'
         atr_str = f'{sig["atr_pct"]:.3f}' if sig.get("atr_pct") is not None else '--'
@@ -694,6 +777,7 @@ def main():
               f'{sig["macd_signal"]:>4} '
               f'{sig["kdj_cross_signal"]:>4} '
               f'{sig["boll_signal"]:>4} '
+              f'{sig["trend_60_signal"]:>4} '
               f'{sig["nav_percentile"]:>5.1f}%  '
               f'{adx_str:>5} '
               f'{sig["market_state"]:>4} '
