@@ -1,4 +1,4 @@
-# fund-excess-returns-checker
+# financial-analysis
 检查：1）基金各个阶段的超额收益。2）基金技术面分析与买卖点推荐。3）基金经理是否变更。
 
 ### USAGE STEP 1

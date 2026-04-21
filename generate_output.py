@@ -572,7 +572,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
                 <td>{render_adx_bar(sig.get('adx_value'), sig.get('market_state', ''))}</td>
                 <td>{render_atr_display(sig.get('atr_pct'))}</td>
                 <td>{render_percentile_bar(sig.get('nav_percentile'))}<br></td>
-                <td>{render_trend_badge(sig.get('trend_60', '')) if TREND_60_ENABLED else '--'}</td>
+                <td>{render_trend_badge(sig.get('trend_60', '')) + '<br><small>得分: ' + (f'{sig.get("trend_60_score", 0):+g}' if sig.get('market_state') == '趋势' else '0 (非趋势市)') + '</small>' if TREND_60_ENABLED else '--'}</td> 
                 <td>{render_score_bar(sig.get('score', 0))}{force_note}</td>
                 <td>{overall_badge}{filter_note}{gztime_display}</td>
             </tr>\n'''
