@@ -6,7 +6,7 @@
   2. 中金300 (931069) - 高ROE稳定性、分红+成长
   3. 科技100 (931187) - 研发强度+盈利+成长
 
-数据来源: data/stock_data/CN_*.json (由 crawl_index_stocks.py 爬取)
+数据来源: data/stock_data/CN_*.json (由 stock_crawl_index_all_stock_data.py 爬取)
 
 参考指数编制方案：
   - 中证红利低波动100 (930955): index_report/红利低波100.pdf

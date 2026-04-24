@@ -5,7 +5,7 @@
   --mode full    全量爬取: 中证全指+全A股合并 → 逐只爬取详细数据
   --mode staged  分步粗筛(默认): 先获取全市场快照做粗筛, 再只爬通过粗筛的股票
 
-使用 fetch_stock_data.py 中的数据获取函数，爬取：
+使用 stock_fetch_data.py 中的数据获取函数，爬取：
   - 日频行情、财务报表、财务指标、分红历史、质押比例
 
 特性：
@@ -27,7 +27,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-from fetch_stock_data import (
+from stock_fetch_data import (
     fetch_daily_price,
     fetch_financial_reports,
     fetch_financial_indicators,
