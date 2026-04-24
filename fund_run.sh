@@ -14,7 +14,7 @@ if [ -d "$CACHE_DIR" ]; then
 fi
 
 scrapy crawl jijin
-python fetch_nav_history.py
-python fetch_realtime_estimate.py
-python technical_analysis.py
-python generate_output.py
+python fund_fetch_nav_history.py
+python fund_fetch_realtime_estimate.py
+python fund_technical_analysis.py
+python fund_generate_output.py

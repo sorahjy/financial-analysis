@@ -1,7 +1,7 @@
 """
-回测模块：读取 technical_analysis.py 生成的 data/signals.json，回测买卖信号收益。
+回测模块：读取 fund_technical_analysis.py 生成的 data/signals.json，回测买卖信号收益。
 
-修改 technical_analysis.py 参数后重新运行 technical_analysis.py 生成 signals.json，
+修改 fund_technical_analysis.py 参数后重新运行 fund_technical_analysis.py 生成 signals.json，
 再运行本脚本即可回测，无需修改本文件。
 
 回测规则：
@@ -172,7 +172,7 @@ def load_fund_names():
 def main():
     signals_file = 'data/signals.json'
     if not os.path.exists(signals_file):
-        print(f'错误：{signals_file} 不存在，请先运行 technical_analysis.py 生成信号数据')
+        print(f'错误：{signals_file} 不存在，请先运行 fund_technical_analysis.py 生成信号数据')
         return
 
     with open(signals_file, encoding='utf-8') as f:

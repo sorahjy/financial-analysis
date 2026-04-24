@@ -1,39 +1,39 @@
 # financial-analysis
 检查：1）基金各个阶段的超额收益。2）基金技术面分析与买卖点推荐。3）基金经理是否变更。
 
-### USAGE STEP 1
-##### funds.py文件下修改基金参数：
+### 1 Requirements
 
-* compare_index是对比的股票基金或指数ETF代码
+* pip install -r requirements.txt
 
-* compare_index_bond是对比的债券或固收+基金代码
 
-* fund是需要跟踪的中高风险基金代码
+### 2 基金相关配置与使用
+##### 2.1 STEP 1 参数修改
 
-* fund_bond是需要跟踪的中低风险基金代码
+* funds.py 里可以配置具体的基金。
 
-* technical_analysis 中可以设置各个指标的参数。
+* technical_analysis.py 中可以设置各个指标的参数。
 
-### USAGE STEP 2
-bash run.sh
+##### 2.2 STEP 2 运行
 
-### Outputs
+* bash fund_run.sh
+
+##### 2.3 Outputs
 会输出一个html文件 'fund_report.html' 展示：
  * 基金近期超额收益表现。
  * 基金当日的买卖指标和技术面指标。基金的历史买卖点。 
  * 提示经理人事变动情况
 
-### Requirements
-scrapy
-lxml
-openpyxl
-pandas
-chinese_calendar
-twisted
-pyopenssl
-cryptography
+### 3 股票相关配置与使用
 
-### 更新历史
+施工中
+
+[//]: # (##### 3.1 STEP 1)
+
+[//]: # (##### 3.2 STEP 2)
+
+[//]: # (##### 3.3)
+
+### 4 更新历史
 
 ##### Update v1.1  2021.7
 新增该基金的基金经理管理规模提示，小于100亿标红（表示管理规模小），大于300亿标绿（表示管理规模较大）。
@@ -68,6 +68,9 @@ cryptography
 ##### Update v2.1.0  2026.4.23
 新增回测能力 backtest.py
 
+##### Update v2.1.0.post1  2026.4.24
+更新股票分析相关骨架
 
-### Acknowledgment
-感谢天天基金网
+### 5 Acknowledgment
+
+感谢东方财富，新浪财经，腾讯财经。爱您们，感恩！

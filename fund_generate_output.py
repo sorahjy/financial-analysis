@@ -3,7 +3,7 @@ import os
 import openpyxl
 from datetime import datetime
 from funds import get_funds, get_funds_bond
-from technical_analysis import (
+from fund_technical_analysis import (
     ADX_WEIGHT, BUY_SIGNAL, SELL_SIGNAL,
     CONSEC_CHANGE_PCT, FORCE_TAKE_PROFIT,
     BUY_PERCENTILE_CAP, SELL_PERCENTILE_FLOOR,

@@ -18,7 +18,7 @@
      a. 向后补数据：从 end_date+1 到今天
      b. 向前追溯：从 start_date 往前，每次1年，直到接口无数据（基金成立前）
   3. 去重、按日期排序后写回持久化文件
-  4. 同时导出 data/nav_history.json（仅 records，兼容下游 technical_analysis.py）
+  4. 同时导出 data/nav_history.json（仅 records，兼容下游 fund_technical_analysis.py）
 """
 import json
 import os
