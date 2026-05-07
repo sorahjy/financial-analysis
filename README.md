@@ -72,7 +72,7 @@
 #### Update v2.1.0.post1  2026.4.24
 更新股票分析相关骨架
 
-#### Update v2.2.dev0  2026.4.24
+#### Update v2.2.dev0  2026.5.7
 更新左侧交易股票分析相关代码
 
 ## 5. Acknowledgment
