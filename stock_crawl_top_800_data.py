@@ -4,7 +4,7 @@
 数据字段:
   行情: 收盘价(close)、涨跌幅(change_pct)、换手率(turnover_rate)
   估值: 总市值(market_cap,亿元)、PE(TTM)(pe_ttm)、PE(静)(pe_static)、PB(pb)、PCF(pcf)
-        — 来自百度接口，只覆盖近3年，更早记录该字段为 None
+        — 来自百度接口，只覆盖近5年（非逐日，约914点），更早记录该字段为 None
 存储路径: data/CN_stock/CN_{code}_{name}.json
 增量更新: 已有文件只补充 end_date+1 至今的缺失数据
 并发: 20线程
@@ -14,6 +14,7 @@ import json
 import math
 import os
 import random
+import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -129,7 +130,7 @@ VALUATION_INDICATORS = {
 }
 
 
-def fetch_valuation_data(symbol, period="近三年"):
+def fetch_valuation_data(symbol, period="近五年"):
     """拉取 5 个百度估值指标，返回 {date_str: {field: value, ...}}
 
     某个 indicator 失败不影响整体，该字段对所有日期置空。
@@ -190,10 +191,10 @@ def _decide_valuation_period(records, today):
     """决定估值拉取策略：
       - None    : 最后一条（end_date）已有 market_cap → 跳过
       - "近一年": 估值落后 ≤300 天
-      - "近三年": 首次 / 估值缺失 / 落后韩 过多（百度接口最远也只 3 年日频）
+      - "近五年": 首次 / 估值缺失 / 落后过多（百度接口最远可取 5 年）
     """
     if not records:
-        return "近三年"
+        return "近五年"
 
     # 最新一条已覆盖 → 无需再爬
     if records[-1].get("market_cap") is not None:
@@ -207,15 +208,15 @@ def _decide_valuation_period(records, today):
             break
 
     if latest_val_date is None:
-        return "近三年"
+        return "近五年"
 
     try:
         gap_days = (datetime.strptime(today, "%Y-%m-%d")
                     - datetime.strptime(latest_val_date, "%Y-%m-%d")).days
     except ValueError:
-        return "近三年"
+        return "近五年"
 
-    return "近一年" if gap_days <= 300 else "近三年"
+    return "近一年" if gap_days <= 300 else "近五年"
 
 
 def process_stock(code, name, idx, total):
@@ -282,19 +283,26 @@ def _pad_visual(s, width):
 
 
 def select_by_drawdown(start_time=None, max_drawdown_pct=40,
-                       min_market_cap=500, max_pb=8):
+                       min_market_cap=500, max_market_cap=None,
+                       max_pb=8, filter_negative_pe=True,
+                       print_details=True, persist=True):
     """扫描 data/CN_stock/ 下所有股票，选出同时满足：
        (1) [start_time-2年, start_time] 窗口内最高收盘价 → start_time 当日收盘价的
            跌幅 > `max_drawdown_pct`
-       (2) 市值（亿元）> `min_market_cap`
+       (2) 市值（亿元）区间 `(min_market_cap, max_market_cap)`；任一端为 None 表示不限
        (3) PB < `max_pb`
+       (4) 若 `filter_negative_pe=True`，剔除 PE(TTM) 为负的股票
        的股票；按跌幅降序打印 代码/名称/跌幅/市值/PE(TTM)/PB。
 
     Args:
         start_time: 窗口右端（'YYYY-MM-DD' 字符串或 datetime 对象），默认今天。
         max_drawdown_pct: 跌幅阈值（百分比），默认 40。
-        min_market_cap: 市值下限（亿元），默认 500。市值缺失的股票会被过滤掉。
-        max_pb: PB 上限，默认 10。PB 缺失的股票会被过滤掉。
+        min_market_cap: 市值下限（亿元），默认 500。None 表示不设下限。
+        max_market_cap: 市值上限（亿元），默认 None 表示不设上限。
+        max_pb: PB 上限，默认 8。PB 缺失的股票会被过滤掉。
+        filter_negative_pe: 默认 True，过滤 PE(TTM) 为负的股票。
+        print_details: 默认 True，在终端打印完整选股明细表；
+            False 时只打印新增/保留/删除的 diff 摘要。
 
     Returns:
         list[dict]: 命中股票列表，按跌幅从大到小排序。
@@ -343,10 +351,16 @@ def select_by_drawdown(start_time=None, max_drawdown_pct=40,
             if pe is not None and pb is not None and mc is not None:
                 break
 
-        # 市值 / PB 过滤（缺失视为不合格）
-        if mc is None or mc <= min_market_cap:
+        # 市值区间过滤：下限/上限任一为 None 表示不限
+        if min_market_cap is not None and (mc is None or mc <= min_market_cap):
             continue
+        if max_market_cap is not None and (mc is None or mc >= max_market_cap):
+            continue
+        # PB 过滤（缺失视为不合格）
         if pb is None or pb >= max_pb:
+            continue
+        # 负 PE 过滤（缺失不过滤）
+        if filter_negative_pe and pe is not None and pe < 0:
             continue
 
         selected.append({
@@ -362,9 +376,34 @@ def select_by_drawdown(start_time=None, max_drawdown_pct=40,
 
     selected.sort(key=lambda x: -x["drop_from_peak"])
 
-    # 持久化
+    # 回测等场景下禁用持久化与终端输出
+    if not persist:
+        return selected
+
     out_fp = DATA_DIR / "selected_stocks.json"
+    backup_fp = DATA_DIR / "selected_stocks_old.json"
     out_fp.parent.mkdir(parents=True, exist_ok=True)
+
+    # 读取旧选股并计算 diff
+    old_stocks = []
+    if out_fp.exists():
+        try:
+            with open(out_fp, encoding="utf-8") as f:
+                old_stocks = json.load(f).get("stocks", [])
+        except (json.JSONDecodeError, OSError):
+            old_stocks = []
+    old_by_code = {s.get("code", ""): s for s in old_stocks}
+    new_by_code = {s["code"]: s for s in selected}
+    old_codes = set(old_by_code)
+    new_codes = set(new_by_code)
+    added_codes = new_codes - old_codes
+    removed_codes = old_codes - new_codes
+    kept_codes = new_codes & old_codes
+
+    # 备份旧文件再写新文件
+    if out_fp.exists():
+        shutil.copy2(out_fp, backup_fp)
+
     with open(out_fp, "w", encoding="utf-8") as f:
         json.dump({
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -373,42 +412,77 @@ def select_by_drawdown(start_time=None, max_drawdown_pct=40,
                 "window_start": window_start,
                 "max_drawdown_pct": max_drawdown_pct,
                 "min_market_cap": min_market_cap,
+                "max_market_cap": max_market_cap,
                 "max_pb": max_pb,
+                "filter_negative_pe": filter_negative_pe,
             },
             "count": len(selected),
             "stocks": selected,
         }, f, ensure_ascii=False, indent=2)
 
     # 终端对齐输出
+    mc_desc_parts = []
+    if min_market_cap is not None:
+        mc_desc_parts.append(f"市值>{min_market_cap}亿")
+    if max_market_cap is not None:
+        mc_desc_parts.append(f"市值<{max_market_cap}亿")
+    mc_desc = " 且 ".join(mc_desc_parts) if mc_desc_parts else "市值不限"
+    pe_desc = " 且 排除负PE" if filter_negative_pe else ""
     print("=" * 80)
     print(f"  近2年高点→{start_time} 跌幅 > {max_drawdown_pct}% "
-          f"且 市值>{min_market_cap}亿 且 PB<{max_pb} 的股票")
+          f"且 {mc_desc} 且 PB<{max_pb}{pe_desc} 的股票")
     print(f"  窗口 {window_start} ~ {start_time} · 命中 {len(selected)} 只")
     print("=" * 80)
-    header = (
-        _pad_visual("代码", 8)
-        + _pad_visual("名称", 14)
-        + _pad_visual("跌幅%", 10)
-        + _pad_visual("市值(亿)", 14)
-        + _pad_visual("PE(TTM)", 12)
-        + _pad_visual("PB", 8)
+
+    # Diff 摘要（对比上次 selected_stocks.json）
+    print(
+        f"变化：新增 {len(added_codes)} · 保留 {len(kept_codes)} · 删除 {len(removed_codes)}"
     )
-    print(header)
-    print("-" * 80)
-    for s in selected:
-        pe_s = f"{s['pe_ttm']:.2f}" if s["pe_ttm"] is not None else "N/A"
-        pb_s = f"{s['pb']:.2f}" if s["pb"] is not None else "N/A"
-        mc_s = f"{s['market_cap']:.2f}" if s["market_cap"] is not None else "N/A"
-        dd_s = f"{s['drop_from_peak']:.2f}"
-        line = (
-            _pad_visual(s["code"], 8)
-            + _pad_visual(s["name"], 14)
-            + _pad_visual(dd_s, 10)
-            + _pad_visual(mc_s, 14)
-            + _pad_visual(pe_s, 12)
-            + _pad_visual(pb_s, 8)
+    if added_codes:
+        added_items = sorted(
+            (new_by_code[c] for c in added_codes),
+            key=lambda x: -x["drop_from_peak"],
         )
-        print(line)
+        print("  [新增]")
+        for s in added_items:
+            print(f"    + {s['code']} {s['name']}  跌幅 {s['drop_from_peak']:.2f}%")
+    if removed_codes:
+        removed_items = sorted(
+            (old_by_code[c] for c in removed_codes),
+            key=lambda x: -x.get("drop_from_peak", 0),
+        )
+        print("  [删除]")
+        for s in removed_items:
+            dd = s.get("drop_from_peak")
+            dd_s = f"{dd:.2f}%" if isinstance(dd, (int, float)) else "N/A"
+            print(f"    - {s.get('code','')} {s.get('name','')}  上次跌幅 {dd_s}")
+    print("-" * 80)
+
+    if print_details:
+        header = (
+            _pad_visual("代码", 8)
+            + _pad_visual("名称", 14)
+            + _pad_visual("跌幅%", 10)
+            + _pad_visual("市值(亿)", 14)
+            + _pad_visual("PE(TTM)", 12)
+            + _pad_visual("PB", 8)
+        )
+        print(header)
+        print("-" * 80)
+        for s in selected:
+            pe_s = f"{s['pe_ttm']:.2f}" if s["pe_ttm"] is not None else "N/A"
+            pb_s = f"{s['pb']:.2f}" if s["pb"] is not None else "N/A"
+            mc_s = f"{s['market_cap']:.2f}" if s["market_cap"] is not None else "N/A"
+            dd_s = f"{s['drop_from_peak']:.2f}"
+            line = (
+                _pad_visual(s["code"], 8)
+                + _pad_visual(s["name"], 14)
+                + _pad_visual(dd_s, 10)
+                + _pad_visual(mc_s, 14)
+                + _pad_visual(pe_s, 12)
+                + _pad_visual(pb_s, 8)
+            )
+            print(line)
 
     return selected
 
