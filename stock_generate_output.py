@@ -4,6 +4,7 @@
 """
 import json
 import os
+import html
 from datetime import datetime
 from pathlib import Path
 
@@ -20,15 +21,20 @@ from fund_generate_output import (
     render_trend_badge, render_percentile_bar, render_adx_bar,
     render_atr_display, render_score_bar,
 )
+from stock_crawl_top_800_data import find_stock_file
 
 DATA_DIR = Path("data/CN_stock")
 SELECTED_FILE = DATA_DIR / "selected_stocks.json"
 
 
+def esc(value):
+    return html.escape(str(value), quote=True)
+
+
 def load_stock_records(code, name):
     """读取单只股票文件，返回 analyze_fund 能接受的 records（nav_acc=close）"""
-    fp = DATA_DIR / f"CN_{code}_{name}.json"
-    if not fp.exists():
+    fp = find_stock_file(code, name)
+    if fp is None:
         return None
     with open(fp, encoding="utf-8") as f:
         data = json.load(f)
@@ -72,7 +78,7 @@ def render_signal_row(code, name, sig):
     pct_b = sig.get('pct_b', '')
     pct_b_display = f'{pct_b:.2f}' if isinstance(pct_b, (int, float)) else '--'
 
-    nav_display = str(sig.get('latest_nav', ''))
+    nav_display = esc(sig.get('latest_nav', ''))
 
     ma_s = sig.get('ma_score', 0)
     rsi_s = sig.get('rsi_score', 0)
@@ -83,7 +89,7 @@ def render_signal_row(code, name, sig):
 
     force_note = '<br><small style="color:#722ed1">触发止盈</small>' if sig.get('is_force_sell') else ''
     filter_reason = sig.get('filter_reason', '')
-    filter_note = f'<br><small style="color:#fa8c16">{filter_reason}</small>' if filter_reason else ''
+    filter_note = f'<br><small style="color:#fa8c16">{esc(filter_reason)}</small>' if filter_reason else ''
     if sig.get('is_force_sell'):
         overall_badge = '<span class="signal-badge badge-force-sell">止盈信号</span>'
     else:
@@ -95,8 +101,8 @@ def render_signal_row(code, name, sig):
         trend_cell = render_trend_badge(sig.get('trend_60', '')) + f'<br><small>得分: {t60_score}</small>'
 
     return f'''<tr>
-        <td>{code}</td>
-        <td>{name}</td>
+        <td>{esc(code)}</td>
+        <td>{esc(name)}</td>
         <td>{nav_display}</td>
         <td class="chart-cell">{sparkline}</td>
         <td>{render_signal_badge(sig['ma_signal'], ma_s)}</td>
@@ -129,11 +135,11 @@ def generate_html(selected_data, signals, output_path='stock_report.html'):
         signal_rows += render_signal_row(code, code_to_name.get(code, code), signals[code])
 
     params_html = (
-        f'窗口 {params.get("window_start", "?")} ~ {params.get("start_time", "?")} · '
-        f'跌幅 &gt; {params.get("max_drawdown_pct", "?")}% · '
-        f'市值 &gt; {params.get("min_market_cap", "?")}亿 · '
-        f'PB &lt; {params.get("max_pb", "?")} · '
-        f'命中 {count} 只'
+        f'窗口 {esc(params.get("window_start", "?"))} ~ {esc(params.get("start_time", "?"))} · '
+        f'跌幅 &gt; {esc(params.get("max_drawdown_pct", "?"))}% · '
+        f'市值 &gt; {esc(params.get("min_market_cap", "?"))}亿 · '
+        f'PB &lt; {esc(params.get("max_pb", "?"))} · '
+        f'命中 {esc(count)} 只'
     )
 
     if FORCE_TAKE_PROFIT_ENABLED:

@@ -123,6 +123,17 @@ def latest_valid(series):
     return None
 
 
+def calc_percentile(current, values, default=50.0):
+    """计算 current 在 values 中的区间百分位；区间无波动时返回 default。"""
+    if not values:
+        return None
+    low = min(values)
+    high = max(values)
+    if high == low:
+        return default
+    return (current - low) / (high - low) * 100
+
+
 # ============================================================
 # 技术指标
 # ============================================================
@@ -547,9 +558,7 @@ def analyze_fund(nav_records, estimate=None):
     # 历史净值百分位（最6年）
     lookback_navs = navs[-PERCENTILE_LOOKBACK_DAYS:] if len(navs) > PERCENTILE_LOOKBACK_DAYS else navs
     current_nav = navs[-1]
-    nav_low = min(lookback_navs)
-    nav_high = max(lookback_navs)
-    nav_percentile = round((current_nav - nav_low) / (nav_high - nav_low) * 100, 1)
+    nav_percentile = round(calc_percentile(current_nav, lookback_navs), 1)
 
     if nav_percentile < PERCENTILE_LOW:
         percentile_score = 1
@@ -608,9 +617,7 @@ def analyze_fund(nav_records, estimate=None):
         # 计算该时刻的近6年百分位
         lb_start = max(0, gi - PERCENTILE_LOOKBACK_DAYS + 1)
         lb_navs = navs[lb_start:gi + 1]
-        nav_lo = min(lb_navs)
-        nav_hi = max(lb_navs)
-        pt_pct = (navs[gi] - nav_lo) / (nav_hi - nav_lo) * 100 if nav_hi > nav_lo else 50.0
+        pt_pct = calc_percentile(navs[gi], lb_navs)
         s = calc_point_score(gi, *score_args)
 
         is_last = (gi == len(navs) - 1)

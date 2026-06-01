@@ -1,6 +1,8 @@
 import json
 import os
+import html
 import openpyxl
+import warnings
 from datetime import datetime
 from funds import get_funds, get_funds_bond
 from fund_technical_analysis import (
@@ -27,30 +29,68 @@ PERIOD_KEYS = [
 
 PERIOD_LABELS = ['近一周', '1周~1月', '1月~3月', '3月~6月', '6月~1年', '1年~2年', '2年~3年', '3年~5年']
 TOT_METRIC = 8
+MISSING_VALUE = '--'
+
+
+def esc(value):
+    return html.escape(str(value), quote=True)
 
 
 def parse_percent(val):
-    return float(val[:-1])
+    if val is None:
+        raise ValueError('percent value is missing')
+    text = str(val).strip()
+    if text in ('', '--', '---'):
+        raise ValueError('percent value is empty')
+    if text.endswith('%'):
+        text = text[:-1]
+    return float(text)
+
+
+def _parse_percent_or_missing(json_file, key, code):
+    try:
+        return parse_percent(json_file[key])
+    except KeyError:
+        warnings.warn(f'{code}: 缺少字段 {key}', RuntimeWarning)
+    except (TypeError, ValueError) as exc:
+        warnings.warn(f'{code}: 字段 {key} 不是有效百分比: {json_file.get(key)!r} ({exc})', RuntimeWarning)
+    return MISSING_VALUE
+
+
+def _safe_asset_class(total_asset):
+    try:
+        asset_val = float(total_asset)
+    except (TypeError, ValueError):
+        return ''
+    if asset_val <= 100:
+        return 'red'
+    if asset_val > 300:
+        return 'green'
+    return ''
 
 
 def process_item(json_file):
     code = json_file['fundCode']
     name = json_file['name']
-    total_asset = json_file['fund_manager_total_asset']
+    total_asset = json_file.get('fund_manager_total_asset', MISSING_VALUE)
 
-    week = round(parse_percent(json_file[PERIOD_KEYS[0]]), 2)
+    week_val = _parse_percent_or_missing(json_file, PERIOD_KEYS[0], code)
+    week = round(week_val, 2) if isinstance(week_val, (int, float)) else MISSING_VALUE
     increments = [week]
 
-    prev = week + 100
+    prev = week + 100 if isinstance(week, (int, float)) else None
     for key in PERIOD_KEYS[1:]:
-        try:
-            cur = parse_percent(json_file[key]) + 100
+        cur_val = _parse_percent_or_missing(json_file, key, code)
+        if isinstance(cur_val, (int, float)) and prev is not None:
+            cur = cur_val + 100
             increments.append(round(cur / prev * 100 - 100, 2))
             prev = cur
-        except Exception:
-            increments.append('--')
+        else:
+            increments.append(MISSING_VALUE)
+            if isinstance(cur_val, (int, float)):
+                prev = cur_val + 100
 
-    return (code, name, *increments, total_asset, json_file['managerTrigger'])
+    return (code, name, *increments, total_asset, json_file.get('managerTrigger', ''))
 
 
 def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_data,
@@ -60,7 +100,7 @@ def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_d
 
     title1 = ['', '', '']
     for index in compare_index:
-        title1.append(tmp_data[index][1])
+        title1.append(tmp_data[index][1] if index in tmp_data else index)
         title1.extend([''] * TOT_METRIC)
     title2 = ['代码', '名字', '基金经理管理规模']
     for _ in compare_index:
@@ -77,12 +117,23 @@ def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_d
         fund_id = worksheet.cell(row, 1, item)
         if item in hold_index:
             fund_id.fill = fill_purple
+        if item not in tmp_data:
+            warnings.warn(f'{item}: temp.json 中缺少该基金，报告中以 -- 占位', RuntimeWarning)
+            worksheet.cell(row, 2, MISSING_VALUE)
+            worksheet.cell(row, 3, MISSING_VALUE)
+            cnt = 4
+            for _ in compare_index:
+                for _ in range(TOT_METRIC):
+                    worksheet.cell(row, cnt, MISSING_VALUE)
+                    cnt += 1
+                cnt += 1
+            continue
         worksheet.cell(row, 2, tmp_data[item][1])
         asset = worksheet.cell(row, 3, tmp_data[item][-2])
-        asset_val = float(tmp_data[item][-2])
-        if asset_val <= 100:
+        asset_class = _safe_asset_class(tmp_data[item][-2])
+        if asset_class == 'red':
             asset.fill = fill_red
-        elif asset_val > 300:
+        elif asset_class == 'green':
             asset.fill = fill_green
 
         cnt = 4
@@ -95,8 +146,8 @@ def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_d
                         c.fill = fill_green
                     if i < len(highlight_red) and value > highlight_red[i]:
                         c.fill = fill_red
-                except Exception:
-                    worksheet.cell(row, cnt, '--')
+                except (TypeError, KeyError):
+                    worksheet.cell(row, cnt, MISSING_VALUE)
                 cnt += 1
             cnt += 1
 
@@ -104,7 +155,7 @@ def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_d
             try:
                 if int(tmp_data[item][-1][:-1]) < 20:
                     change_manager.append((tmp_data[item][0], tmp_data[item][1]))
-            except ValueError:
+            except (TypeError, ValueError):
                 pass
 
     return change_manager, len(fund_list)
@@ -163,6 +214,18 @@ def compute_excess_table(fund_list, compare_index, tmp_data, highlight_red, high
     hold_index = hold_index or []
     rows = []
     for item in fund_list:
+        if item not in tmp_data:
+            warnings.warn(f'{item}: temp.json 中缺少该基金，HTML 报告中以 -- 占位', RuntimeWarning)
+            rows.append({
+                'code': item,
+                'name': MISSING_VALUE,
+                'total_asset': MISSING_VALUE,
+                'is_held': item in hold_index,
+                'manager_trigger': '',
+                'asset_class': '',
+                'benchmarks': [[(MISSING_VALUE, '') for _ in range(TOT_METRIC)] for _ in compare_index],
+            })
+            continue
         row = {
             'code': item,
             'name': tmp_data[item][1],
@@ -171,8 +234,7 @@ def compute_excess_table(fund_list, compare_index, tmp_data, highlight_red, high
             'manager_trigger': tmp_data[item][-1],
             'benchmarks': [],
         }
-        asset_val = float(tmp_data[item][-2])
-        row['asset_class'] = 'red' if asset_val <= 100 else ('green' if asset_val > 300 else '')
+        row['asset_class'] = _safe_asset_class(tmp_data[item][-2])
 
         for index in compare_index:
             cells = []
@@ -185,8 +247,8 @@ def compute_excess_table(fund_list, compare_index, tmp_data, highlight_red, high
                     if i < len(highlight_red) and value > highlight_red[i]:
                         css = 'red'
                     cells.append((f'{value:.2f}', css))
-                except Exception:
-                    cells.append(('--', ''))
+                except (TypeError, KeyError):
+                    cells.append((MISSING_VALUE, ''))
             row['benchmarks'].append(cells)
         rows.append(row)
     return rows
@@ -470,17 +532,17 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
 
     def render_table(title, compare_index, rows):
-        benchmark_names = [tmp_data[idx][1] for idx in compare_index]
+        benchmark_names = [tmp_data[idx][1] if idx in tmp_data else idx for idx in compare_index]
         n_benchmarks = len(compare_index)
         header1 = '<tr><th></th><th></th><th></th>'
         for name in benchmark_names:
-            header1 += f'<th colspan="{TOT_METRIC}" class="benchmark-header">{name}</th>'
+            header1 += f'<th colspan="{TOT_METRIC}" class="benchmark-header">{esc(name)}</th>'
         header1 += '</tr>'
 
         header2 = '<tr><th>代码</th><th>名字</th><th>管理规模(亿)</th>'
         for _ in range(n_benchmarks):
             for label in PERIOD_LABELS:
-                header2 += f'<th>{label}</th>'
+                header2 += f'<th>{esc(label)}</th>'
         header2 += '</tr>'
 
         body = ''
@@ -488,13 +550,13 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             code_class = ' class="held"' if row['is_held'] else ''
             asset_cls = f' class="{row["asset_class"]}"' if row['asset_class'] else ''
             body += '<tr>'
-            body += f'<td{code_class}>{row["code"]}</td>'
-            body += f'<td>{row["name"]}</td>'
-            body += f'<td{asset_cls}>{row["total_asset"]}</td>'
+            body += f'<td{code_class}>{esc(row["code"])}</td>'
+            body += f'<td>{esc(row["name"])}</td>'
+            body += f'<td{asset_cls}>{esc(row["total_asset"])}</td>'
             for cells in row['benchmarks']:
                 for val, css in cells:
                     cls = f' class="{css}"' if css else ''
-                    body += f'<td{cls}>{val}</td>'
+                    body += f'<td{cls}>{esc(val)}</td>'
             body += '</tr>\n'
 
         return f'''
@@ -508,7 +570,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
 
     manager_html = ''
     if change_manager:
-        items = ''.join(f'<li>{code} - {name}</li>' for code, name in change_manager)
+        items = ''.join(f'<li>{esc(code)} - {esc(name)}</li>' for code, name in change_manager)
         manager_html = f'<div class="alert">近20天内以下基金经理发生变更：<ul>{items}</ul></div>'
     else:
         manager_html = '<div class="ok">近20天内列表中基金经理没有变更。</div>'
@@ -532,7 +594,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             pct_b_display = f'{pct_b:.2f}' if isinstance(pct_b, (int, float)) else '--'
 
             # 净值列：如果有估算数据，追加显示
-            nav_display = str(sig.get('latest_nav', ''))
+            nav_display = esc(sig.get('latest_nav', ''))
             if sig.get('estimated') and sig.get('latest_nav'):
                 nav_display += f'<br><small style="color:#1890ff">估值</small>'
 
@@ -542,7 +604,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             if gztime:
                 # "2026-04-14 13:52" → "04-14 13:52"
                 gztime_short = gztime[5:] if len(gztime) > 5 else gztime
-                gztime_display = f'<br><small>估算: {gztime_short}</small>'
+                gztime_display = f'<br><small>估算: {esc(gztime_short)}</small>'
 
             ma_s = sig.get('ma_score', 0)
             rsi_s = sig.get('rsi_score', 0)
@@ -553,15 +615,15 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
 
             force_note = '<br><small style="color:#722ed1">触发止盈</small>' if sig.get('is_force_sell') else ''
             filter_reason = sig.get('filter_reason', '')
-            filter_note = f'<br><small style="color:#fa8c16">{filter_reason}</small>' if filter_reason else ''
+            filter_note = f'<br><small style="color:#fa8c16">{esc(filter_reason)}</small>' if filter_reason else ''
             if sig.get('is_force_sell'):
                 overall_badge = '<span class="signal-badge badge-force-sell">止盈信号</span>'
             else:
                 overall_badge = render_signal_badge(sig['overall'])
 
             signal_rows += f'''<tr>
-                <td>{code}</td>
-                <td>{name}</td>
+                <td>{esc(code)}</td>
+                <td>{esc(name)}</td>
                 <td>{nav_display}</td>
                 <td class="chart-cell">{sparkline}</td>
                 <td>{render_signal_badge(sig['ma_signal'], ma_s)}</td>

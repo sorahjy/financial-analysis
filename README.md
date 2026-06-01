@@ -2,6 +2,8 @@
 
 一些自用的金融指标分析工具
 
+当前版本：v2.2.dev1
+
 ## 1. Requirements
 
 * pip install -r requirements.txt
@@ -74,6 +76,9 @@
 
 #### Update v2.2.dev0  2026.5.7
 更新左侧交易股票分析相关代码
+
+#### Update v2.2.dev1  2026.6.1
+修复基金爬虫阻塞请求、数据缺失静默吞错、百分位边界、股票文件名兼容与股票抓取失败可见性问题；新增核心纯函数单测。
 
 ## 5. Acknowledgment
 

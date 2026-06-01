@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from fund_fetch_nav_history import fetch_range, merge_records
-from stock_crawl_top_800_data import select_by_drawdown, DATA_DIR
+from stock_crawl_top_800_data import select_by_drawdown, find_stock_file
 
 CSI300_ETF_CODE = "510310"
 CSI300_FILE = Path("data/csi300_etf_nav.json")
@@ -84,8 +84,8 @@ def _load_stock_series(code, name):
     key = (code, name)
     if key in _stock_cache:
         return _stock_cache[key]
-    fp = DATA_DIR / f"CN_{code}_{name}.json"
-    if not fp.exists():
+    fp = find_stock_file(code, name)
+    if fp is None:
         _stock_cache[key] = []
         return []
     with open(fp, encoding="utf-8") as f:
