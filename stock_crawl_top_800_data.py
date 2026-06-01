@@ -7,13 +7,14 @@
         — 来自百度接口，只覆盖近5年（非逐日，约914点），更早记录该字段为 None
 存储路径: data/CN_stock/CN_{code}_{name}.json
 增量更新: 已有文件只补充 end_date+1 至今的缺失数据
-并发: 20线程
+并发: 默认6线程，可通过 STOCK_THREAD_COUNT 环境变量调整
 """
 
 import json
 import math
 import os
 import random
+import re
 import shutil
 import threading
 import time
@@ -27,7 +28,25 @@ import pandas as pd
 DATA_DIR = Path("data/CN_stock")
 MAX_YEARS = 10
 MAX_RETRIES = 3
-THREAD_COUNT = 20
+DEFAULT_THREAD_COUNT = 6
+
+
+def _env_int(name, default, minimum=1, maximum=None):
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    if value < minimum:
+        return default
+    if maximum is not None:
+        return min(value, maximum)
+    return value
+
+
+THREAD_COUNT = _env_int("STOCK_THREAD_COUNT", DEFAULT_THREAD_COUNT, maximum=20)
 
 _print_lock = threading.Lock()
 
@@ -75,13 +94,34 @@ def get_csi800_stocks():
 
 # ─── 文件 I/O ────────────────────────────────────────────────
 
+def _safe_name_component(name):
+    text = str(name).strip()
+    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
+    return text.strip(" ._") or "UNKNOWN"
+
+
 def _filepath(code, name):
-    return DATA_DIR / f"CN_{code}_{name}.json"
+    return DATA_DIR / f"CN_{code}_{_safe_name_component(name)}.json"
+
+
+def find_stock_file(code, name=None):
+    candidates = []
+    if name is not None:
+        candidates.append(_filepath(code, name))
+        legacy = DATA_DIR / f"CN_{code}_{name}.json"
+        if legacy not in candidates:
+            candidates.append(legacy)
+    candidates.extend(sorted(DATA_DIR.glob(f"CN_{code}_*.json")))
+
+    for fp in candidates:
+        if fp.exists():
+            return fp
+    return None
 
 
 def load_stock_file(code, name):
-    fp = _filepath(code, name)
-    if fp.exists():
+    fp = find_stock_file(code, name)
+    if fp is not None:
         with open(fp, encoding="utf-8") as f:
             return json.load(f)
     return {}
@@ -128,6 +168,7 @@ VALUATION_INDICATORS = {
     "pb": "市净率",
     "pcf": "市现率",
 }
+VALUATION_FIELDS = tuple(VALUATION_INDICATORS.keys())
 
 
 def fetch_valuation_data(symbol, period="近五年"):
@@ -189,21 +230,21 @@ def attach_valuation(records, val_by_date):
 
 def _decide_valuation_period(records, today):
     """决定估值拉取策略：
-      - None    : 最后一条（end_date）已有 market_cap → 跳过
+      - None    : 最后一条（end_date）已有完整估值字段 → 跳过
       - "近一年": 估值落后 ≤300 天
       - "近五年": 首次 / 估值缺失 / 落后过多（百度接口最远可取 5 年）
     """
     if not records:
         return "近五年"
 
-    # 最新一条已覆盖 → 无需再爬
-    if records[-1].get("market_cap") is not None:
+    # 最新一条已完整覆盖 → 无需再爬。选股依赖 PB/PE，不能只看 market_cap。
+    if all(records[-1].get(field) is not None for field in VALUATION_FIELDS):
         return None
 
-    # 找最新一条带 market_cap 的日期
+    # 找最新一条估值字段完整的日期
     latest_val_date = None
     for r in reversed(records):
-        if r.get("market_cap") is not None:
+        if all(r.get(field) is not None for field in VALUATION_FIELDS):
             latest_val_date = r["date"]
             break
 
@@ -525,8 +566,11 @@ def main():
         safe_print(f"失败 {len(failed)} 只:")
         for code, name in failed:
             safe_print(f"  {code} {name}")
+    return failed
 
 
 if __name__ == "__main__":
-    main()
+    failed_stocks = main()
     select_by_drawdown()
+    if failed_stocks:
+        raise SystemExit(1)
