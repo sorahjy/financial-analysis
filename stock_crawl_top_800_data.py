@@ -48,6 +48,24 @@ def _env_int(name, default, minimum=1, maximum=None):
 
 THREAD_COUNT = _env_int("STOCK_THREAD_COUNT", DEFAULT_THREAD_COUNT, maximum=20)
 
+
+def _strip_proxy_env():
+    """STOCK_CRAWL_NO_PROXY=1 时绕过系统/环境变量代理直连。
+
+    东财/腾讯/新浪/百度均为境内接口，经本地代理转发常出现
+    ProxyError(RemoteDisconnected)；NO_PROXY=* 同时屏蔽 macOS 系统代理。
+    """
+    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(var, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
+
+_strip_proxy_env()
+
 _print_lock = threading.Lock()
 
 
@@ -136,10 +154,21 @@ def save_stock_file(code, name, data):
 
 # ─── 数据爬取 ─────────────────────────────────────────────────
 
-def fetch_daily_range(symbol, start_date, end_date):
-    """爬取 [start_date, end_date] 的日频数据，返回 records 列表"""
-    df = _retry_fetch(
-        ak.stock_zh_a_hist,
+# 腾讯/新浪接口不直接返回涨跌幅，需要多取一段历史用相邻收盘价推算首日涨跌幅
+CHANGE_PCT_LOOKBACK_DAYS = 15
+
+
+def _exchange_prefix(code):
+    code = str(code).zfill(6)
+    if code[0] in ("6", "9", "5"):
+        return "sh"
+    if code[0] in ("4", "8"):
+        return "bj"
+    return "sz"
+
+
+def _fetch_daily_eastmoney(symbol, start_date, end_date):
+    df = ak.stock_zh_a_hist(
         symbol=symbol,
         period="daily",
         start_date=start_date.replace("-", ""),
@@ -158,6 +187,92 @@ def fetch_daily_range(symbol, start_date, end_date):
             "turnover_rate": _safe_float(row["换手率"]),
         })
     return records
+
+
+def _records_with_computed_change(rows, start_date, end_date):
+    """rows: 按日期升序的 (date, close, turnover_rate)，含 lookback 段；
+    用相邻收盘价推算 change_pct 后截取 [start_date, end_date]。"""
+    records = []
+    prev_close = None
+    for date_str, close, turnover_rate in rows:
+        change_pct = None
+        if close is not None and prev_close:
+            change_pct = round((close / prev_close - 1) * 100, 6)
+        if start_date <= date_str <= end_date:
+            records.append({
+                "date": date_str,
+                "close": close,
+                "change_pct": change_pct,
+                "turnover_rate": turnover_rate,
+            })
+        if close is not None:
+            prev_close = close
+    return records
+
+
+def _lookback_start(start_date):
+    return (datetime.strptime(start_date, "%Y-%m-%d")
+            - timedelta(days=CHANGE_PCT_LOOKBACK_DAYS)).strftime("%Y%m%d")
+
+
+def _fetch_daily_tencent(symbol, start_date, end_date):
+    """腾讯日线：无换手率字段，turnover_rate 置 None"""
+    df = ak.stock_zh_a_hist_tx(
+        symbol=f"{_exchange_prefix(symbol)}{symbol}",
+        start_date=_lookback_start(start_date),
+        end_date=end_date.replace("-", ""),
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        return []
+    rows = [(str(row["date"])[:10], _safe_float(row["close"]), None)
+            for _, row in df.sort_values("date").iterrows()]
+    return _records_with_computed_change(rows, start_date, end_date)
+
+
+def _fetch_daily_sina(symbol, start_date, end_date):
+    """新浪日线：turnover 为小数形式换手率（×100 对齐东财百分比口径）"""
+    df = ak.stock_zh_a_daily(
+        symbol=f"{_exchange_prefix(symbol)}{symbol}",
+        start_date=_lookback_start(start_date),
+        end_date=end_date.replace("-", ""),
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        return []
+    has_turnover = "turnover" in df.columns
+    rows = []
+    for _, row in df.sort_values("date").iterrows():
+        turnover = _safe_float(row["turnover"]) if has_turnover else None
+        rows.append((
+            str(row["date"])[:10],
+            _safe_float(row["close"]),
+            round(turnover * 100, 6) if turnover is not None else None,
+        ))
+    return _records_with_computed_change(rows, start_date, end_date)
+
+
+DAILY_SOURCES = (
+    ("东财", _fetch_daily_eastmoney),
+    ("腾讯", _fetch_daily_tencent),
+    ("新浪", _fetch_daily_sina),
+)
+
+
+def fetch_daily_range(symbol, start_date, end_date):
+    """爬取 [start_date, end_date] 的日频数据，返回 records 列表。
+
+    数据源回退链：东财 → 腾讯 → 新浪。腾讯无换手率；腾讯/新浪的涨跌幅
+    由相邻收盘价推算。每个源内部仍走 _retry_fetch 重试。
+    """
+    last_err = None
+    for source, fetcher in DAILY_SOURCES:
+        try:
+            return _retry_fetch(fetcher, symbol, start_date, end_date)
+        except Exception as e:
+            last_err = e
+            safe_print(f"  [FALLBACK] {symbol} {source}行情失败({e})，切换下一数据源")
+    raise last_err
 
 
 # 百度估值指标映射: 存盘字段名 → akshare indicator 参数
@@ -263,21 +378,32 @@ def _decide_valuation_period(records, today):
 def process_stock(code, name, idx, total):
     existing = load_stock_file(code, name)
     existing_records = existing.get("records", [])
+    start_date = existing.get("start_date")
     end_date = existing.get("end_date")
+    if existing_records:
+        existing_records = sorted(existing_records, key=lambda row: str(row.get("date", "")))
+        start_date = start_date or existing_records[0].get("date")
+        end_date = end_date or existing_records[-1].get("date")
 
     today = datetime.now().strftime("%Y-%m-%d")
     max_start = (datetime.now() - timedelta(days=365 * MAX_YEARS)).strftime("%Y-%m-%d")
 
     hist_new_records = []
 
+    if existing_records and start_date and start_date > max_start:
+        prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
+        if max_start <= prev_day:
+            safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {max_start} ~ {prev_day}")
+            hist_new_records.extend(fetch_daily_range(code, max_start, prev_day))
+
     if end_date:
         if end_date < today:
             next_day = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
             safe_print(f"[{idx}/{total}] {code} {name}: 补行情 {next_day} ~ {today}")
-            hist_new_records = fetch_daily_range(code, next_day, today)
+            hist_new_records.extend(fetch_daily_range(code, next_day, today))
     else:
         safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {max_start} ~ {today}")
-        hist_new_records = fetch_daily_range(code, max_start, today)
+        hist_new_records.extend(fetch_daily_range(code, max_start, today))
 
     merged = merge_records(existing_records, hist_new_records)
     if not merged:
