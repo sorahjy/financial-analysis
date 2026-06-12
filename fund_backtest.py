@@ -97,17 +97,17 @@ def backtest_fund(sig):
                 buy_count += 1
 
         elif action in ('sell', 'force_sell'):
-            if capital > MIN_CAPITAL:
-                sell_val = min(TRADE_AMOUNT, capital - MIN_CAPITAL)
+            if capital > MIN_CAPITAL and shares > 0:
+                # 份额不足整笔时按可卖份额部分卖出，保持本金轨迹与持仓一致
+                sell_val = min(TRADE_AMOUNT, capital - MIN_CAPITAL, shares * nav)
                 sell_shares = sell_val / nav
-                if sell_shares <= shares:
-                    shares -= sell_shares
-                    cash += sell_val
-                    capital -= sell_val
-                    if action == 'force_sell':
-                        force_sell_count += 1
-                    else:
-                        sell_count += 1
+                shares -= sell_shares
+                cash += sell_val
+                capital -= sell_val
+                if action == 'force_sell':
+                    force_sell_count += 1
+                else:
+                    sell_count += 1
 
     # --- 计算收益 ---
     last_nav = navs[-1]

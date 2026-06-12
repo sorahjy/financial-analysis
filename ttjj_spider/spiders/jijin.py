@@ -153,7 +153,8 @@ class JijinSpider(scrapy.Spider):
                 meta={'item': item},
             )
         else:
-            item['fund_manager_total_asset'] = 99999
+            # 缺失置空，下游显示 '--'；不能用大数哨兵，否则会被当成真实规模染色
+            item['fund_manager_total_asset'] = ''
             yield item
 
     def parse_manager(self, response):
@@ -164,12 +165,11 @@ class JijinSpider(scrapy.Spider):
             asset = _first(html.xpath('/html/body/div[6]/div[2]/div[1]/div/div[2]/div[2]/div/div[1]/span[2]/span[1]/text()'))
         if not asset:
             self.logger.warning('基金 %s 基金经理管理规模缺失: %s', item.get('fundCode'), response.url)
-            asset = 99999
         item['fund_manager_total_asset'] = asset
         yield item
 
     def handle_manager_error(self, failure):
         item = failure.request.meta['item']
         self.logger.warning('基金 %s 基金经理管理规模请求失败: %s', item.get('fundCode'), failure.value)
-        item['fund_manager_total_asset'] = 99999
+        item['fund_manager_total_asset'] = ''
         yield item

@@ -1,7 +1,6 @@
 import json
 import os
 import html
-import openpyxl
 import warnings
 from datetime import datetime
 from funds import get_funds, get_funds_bond
@@ -12,8 +11,6 @@ from fund_technical_analysis import (
     TREND_60_ENABLED, TREND_60_SCORE,
     FORCE_TAKE_PROFIT_ENABLED,
 )
-from openpyxl.styles.colors import Color
-from openpyxl.styles import PatternFill
 
 
 PERIOD_KEYS = [
@@ -30,6 +27,15 @@ PERIOD_KEYS = [
 PERIOD_LABELS = ['近一周', '1周~1月', '1月~3月', '3月~6月', '6月~1年', '1年~2年', '2年~3年', '3年~5年']
 TOT_METRIC = 8
 MISSING_VALUE = '--'
+
+# 超额收益高亮阈值，与 PERIOD_LABELS 一一对应（8个周期）
+EQUITY_HIGHLIGHT_RED = [1.5, 3, 5, 7, 12, 20, 20, 25]
+EQUITY_HIGHLIGHT_GREEN = [-1.5, -3, -4.5, -6, -10, -15, -15, -20]
+BOND_HIGHLIGHT_RED = [0.04, 0.1, 0.3, 0.4, 0.75, 1.5, 1.5, 2.0]
+BOND_HIGHLIGHT_GREEN = [-0.03, 0, -0.1, -0.15, -0.25, -0.5, -0.5, -0.75]
+
+# 综合评分理论极值：趋势市 MA/MACD ×ADX_WEIGHT + RSI/布林/KDJ交叉/J值 ±1×4 + MA60趋势
+SCORE_RANGE = 2 * ADX_WEIGHT + 4 + (TREND_60_SCORE if TREND_60_ENABLED else 0)
 
 
 def esc(value):
@@ -72,7 +78,10 @@ def _safe_asset_class(total_asset):
 def process_item(json_file):
     code = json_file['fundCode']
     name = json_file['name']
-    total_asset = json_file.get('fund_manager_total_asset', MISSING_VALUE)
+    # 抓取失败时爬虫填空字符串（旧数据可能是哨兵 99999），统一占位
+    total_asset = json_file.get('fund_manager_total_asset') or MISSING_VALUE
+    if total_asset == 99999 or total_asset == '99999':
+        total_asset = MISSING_VALUE
 
     week_val = _parse_percent_or_missing(json_file, PERIOD_KEYS[0], code)
     week = round(week_val, 2) if isinstance(week_val, (int, float)) else MISSING_VALUE
@@ -93,121 +102,25 @@ def process_item(json_file):
     return (code, name, *increments, total_asset, json_file.get('managerTrigger', ''))
 
 
-def write_excel_section(worksheet, start_row, funds_config, compare_index, tmp_data,
-                        highlight_red, highlight_green, fill_red, fill_green, fill_purple):
-    hold_index = funds_config.get('hold_index', [])
-    fund_list = funds_config['fund']
+def detect_manager_changes(fund_list, tmp_data):
+    """检测任职时长 < 20 天的基金经理（视为新近变更）。
 
-    title1 = ['', '', '']
-    for index in compare_index:
-        title1.append(tmp_data[index][1] if index in tmp_data else index)
-        title1.extend([''] * TOT_METRIC)
-    title2 = ['代码', '名字', '基金经理管理规模']
-    for _ in compare_index:
-        title2.extend(PERIOD_LABELS + [''])
-
-    for i, val in enumerate(title1):
-        worksheet.cell(start_row, i + 1, val)
-    for i, val in enumerate(title2):
-        worksheet.cell(start_row + 1, i + 1, val)
-
-    change_manager = []
-    for ind, item in enumerate(fund_list):
-        row = start_row + 2 + ind
-        fund_id = worksheet.cell(row, 1, item)
-        if item in hold_index:
-            fund_id.fill = fill_purple
+    天天基金的任职时长格式为 "N天" 或 "X年又N天"：含"年"的一律视为老经理，
+    避免整年数（如"2年"）被误解析成 2 天。
+    """
+    changes = []
+    for item in fund_list:
         if item not in tmp_data:
-            warnings.warn(f'{item}: temp.json 中缺少该基金，报告中以 -- 占位', RuntimeWarning)
-            worksheet.cell(row, 2, MISSING_VALUE)
-            worksheet.cell(row, 3, MISSING_VALUE)
-            cnt = 4
-            for _ in compare_index:
-                for _ in range(TOT_METRIC):
-                    worksheet.cell(row, cnt, MISSING_VALUE)
-                    cnt += 1
-                cnt += 1
             continue
-        worksheet.cell(row, 2, tmp_data[item][1])
-        asset = worksheet.cell(row, 3, tmp_data[item][-2])
-        asset_class = _safe_asset_class(tmp_data[item][-2])
-        if asset_class == 'red':
-            asset.fill = fill_red
-        elif asset_class == 'green':
-            asset.fill = fill_green
-
-        cnt = 4
-        for index in compare_index:
-            for i in range(TOT_METRIC):
-                try:
-                    value = tmp_data[item][i + 2] - tmp_data[index][i + 2]
-                    c = worksheet.cell(row, cnt, value)
-                    if i < len(highlight_green) and value < highlight_green[i]:
-                        c.fill = fill_green
-                    if i < len(highlight_red) and value > highlight_red[i]:
-                        c.fill = fill_red
-                except (TypeError, KeyError):
-                    worksheet.cell(row, cnt, MISSING_VALUE)
-                cnt += 1
-            cnt += 1
-
-        if '又' not in tmp_data[item][-1]:
-            try:
-                if int(tmp_data[item][-1][:-1]) < 20:
-                    change_manager.append((tmp_data[item][0], tmp_data[item][1]))
-            except (TypeError, ValueError):
-                pass
-
-    return change_manager, len(fund_list)
-
-
-def write_excel_signals(workbook, signals, tmp_data):
-    ws = workbook.create_sheet(title="技术信号")
-    headers = [
-        '代码', '名字', '最新净值', '日期',
-        'MA信号', 'MA得分', 'RSI值', 'RSI信号', 'RSI得分', 'MACD信号', 'MACD得分',
-        'KDJ(J)', 'KDJ交叉', 'KDJ交叉得分', 'J值信号', 'J值得分',
-        '布林%B', '布林信号', '布林得分',
-        'ADX', '市场状态', 'ATR%',
-        '百分位%', '百分位得分',
-        '趋势60', '趋势120', '365日回撤%', '评分', '综合建议',
-    ]
-    for i, h in enumerate(headers):
-        ws.cell(1, i + 1, h)
-
-    green = Color(indexed=3, tint=0.5)
-    fill_green = PatternFill('solid', fgColor=green)
-    red = Color(indexed=2, tint=0.5)
-    fill_red = PatternFill('solid', fgColor=red)
-
-    row = 2
-    for code, sig in signals.items():
-        name = tmp_data[code][1] if code in tmp_data else code
-        col = 1
-        for val in [
-            code, name, sig.get('latest_nav', ''), sig.get('latest_date', ''),
-            sig['ma_signal'], sig.get('ma_score', 0),
-            sig.get('rsi_value', ''), sig['rsi_signal'], sig.get('rsi_score', 0),
-            sig['macd_signal'], sig.get('macd_score', 0),
-            sig.get('j_value', ''), sig.get('kdj_cross_signal', ''), sig.get('kdj_cross_score', 0),
-            sig.get('j_signal', ''), sig.get('j_score', 0),
-            sig.get('pct_b', ''), sig.get('boll_signal', ''), sig.get('boll_score', 0),
-            sig.get('adx_value', ''), sig.get('market_state', ''), sig.get('atr_pct', ''),
-            sig.get('nav_percentile', ''), sig.get('percentile_score', ''),
-            sig.get('trend_60', ''), sig.get('trend_120', ''),
-            sig.get('max_drawdown', ''), sig.get('score', ''),
-        ]:
-            ws.cell(row, col, val)
-            col += 1
-        overall_cell = ws.cell(row, col, sig['overall'])
-        if sig['overall'] == '买入':
-            overall_cell.fill = fill_red
-        elif sig['overall'] == '卖出':
-            overall_cell.fill = fill_green
-        row += 1
-
-    ws.column_dimensions['B'].width = 32
-    ws.column_dimensions['D'].width = 14
+        trigger = str(tmp_data[item][-1])
+        if '年' in trigger or not trigger.endswith('天'):
+            continue
+        try:
+            if int(trigger[:-1]) < 20:
+                changes.append((tmp_data[item][0], tmp_data[item][1]))
+        except ValueError:
+            pass
+    return changes
 
 
 def compute_excess_table(fund_list, compare_index, tmp_data, highlight_red, highlight_green, hold_index=None):
@@ -479,13 +392,13 @@ def render_atr_display(atr_pct):
     return f'<span class="{cls}">{atr_pct:.3f}%</span>'
 
 
-def render_score_bar(score, max_score=7):
-    """评分条：动态范围"""
+def render_score_bar(score, max_score=SCORE_RANGE):
+    """评分条：范围取自评分理论极值，买卖阈值与技术分析参数联动"""
     pct = (score + max_score) / (2 * max_score) * 100
     pct = max(0, min(100, pct))
-    if score >= 4:
+    if score >= BUY_SIGNAL:
         color = '#f5222d'
-    elif score <= -4:
+    elif score <= SELL_SIGNAL:
         color = '#52c41a'
     elif score > 0:
         color = '#ff7875'
@@ -517,17 +430,12 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
     equity_compare = equity_config['compare_index']
     bond_compare = bond_config['compare_index']
 
-    equity_highlight_red = [1.5, 3, 5, 7, 12, 20, 20, 25]
-    equity_highlight_green = [-1.5, -3, -4.5, -6, -10, -15, -15, -20]
-    bond_highlight_red = [0.04, 0.1, 0.3, 0.4, 0.75, 1.5, 1.5]
-    bond_highlight_green = [-0.03, 0, -0.1, -0.15, -0.25, -0.5, -0.5]
-
     equity_rows = compute_excess_table(
         equity_config['fund'], equity_compare, tmp_data,
-        equity_highlight_red, equity_highlight_green, equity_config.get('hold_index', []))
+        EQUITY_HIGHLIGHT_RED, EQUITY_HIGHLIGHT_GREEN, equity_config.get('hold_index', []))
     bond_rows = compute_excess_table(
         bond_config['fund'], bond_compare, tmp_data,
-        bond_highlight_red, bond_highlight_green)
+        BOND_HIGHLIGHT_RED, BOND_HIGHLIGHT_GREEN)
 
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
 
@@ -755,41 +663,21 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
 
 
 if __name__ == '__main__':
-    green = Color(indexed=3, tint=0.5)
-    fill_green = PatternFill('solid', fgColor=green)
-    red = Color(indexed=2, tint=0.5)
-    fill_red = PatternFill('solid', fgColor=red)
-    purple = Color(indexed=20, tint=0.3)
-    fill_purple = PatternFill('solid', fgColor=purple)
-
     tmp_data = {}
     with open('data/temp.json', encoding='utf8') as file:
         for line in file:
+            line = line.strip()
+            if not line:
+                continue
             data = json.loads(line)
             item = process_item(data)
             tmp_data[item[0]] = item
 
-    workbook = openpyxl.Workbook()
-    worksheet = workbook.active
-    worksheet.title = "fund"
-
-    # 股票基金
     equity_config = get_funds()
-    equity_highlight_red = [1.5, 3, 5, 7, 12, 20, 20, 25]
-    equity_highlight_green = [-1.5, -3, -4.5, -6, -10, -15, -15, -20]
-    change_manager, equity_count = write_excel_section(
-        worksheet, 1, equity_config, equity_config['compare_index'], tmp_data,
-        equity_highlight_red, equity_highlight_green, fill_red, fill_green, fill_purple)
-
-    # 债券基金
     bond_config = get_funds_bond()
-    bond_highlight_red = [0.04, 0.1, 0.3, 0.4, 0.75, 1.5, 1.5]
-    bond_highlight_green = [-0.03, 0, -0.1, -0.15, -0.25, -0.5, -0.5]
-    bond_start = 1 + equity_count + 5
-    bond_change, _ = write_excel_section(
-        worksheet, bond_start, bond_config, bond_config['compare_index'], tmp_data,
-        bond_highlight_red, bond_highlight_green, fill_red, fill_green, fill_purple)
-    change_manager.extend(bond_change)
+
+    change_manager = detect_manager_changes(equity_config['fund'], tmp_data)
+    change_manager.extend(detect_manager_changes(bond_config['fund'], tmp_data))
 
     # 加载技术信号
     signals = None
@@ -797,17 +685,12 @@ if __name__ == '__main__':
     if os.path.exists(signals_file):
         with open(signals_file, encoding='utf-8') as f:
             signals = json.load(f)
-        write_excel_signals(workbook, signals, tmp_data)
-
-    worksheet.column_dimensions['B'].width = 32
-    worksheet.column_dimensions['C'].width = 20
-    workbook.save(filename='fund.xlsx')
 
     # 生成 HTML 报告
     generate_html(tmp_data, equity_config, bond_config, change_manager, signals)
 
     print('*' * 30, 'result', '*' * 30)
-    print('处理完毕，文件 fund.xlsx 和 fund_report.html 已输出。')
+    print('处理完毕，文件 fund_report.html 已输出。')
     if signals:
         buy_count = sum(1 for s in signals.values() if s['overall'] == '买入')
         sell_count = sum(1 for s in signals.values() if s['overall'] == '卖出')

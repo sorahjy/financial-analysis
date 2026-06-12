@@ -1,6 +1,5 @@
 scrapy
 lxml
-openpyxl
 pandas
 chinese_calendar
 twisted

@@ -1,3 +1,16 @@
+#!/bin/sh
+# 任一步失败立即停止，避免用残缺数据覆盖上一次的正常报告
+set -e
+cd "$(dirname "$0")"
+
+# FUND_CRAWL_NO_PROXY=1 时绕过系统代理直连（天天基金均为境内接口，
+# 经本地代理转发易出现 ProxyError；NO_PROXY=* 同时屏蔽 macOS 系统代理）
+if [ "$FUND_CRAWL_NO_PROXY" = "1" ]; then
+    unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
+    export NO_PROXY="*" no_proxy="*"
+    echo "已绕过代理直连境内数据源"
+fi
+
 python funds.py
 
 # Scrapy 缓存每日失效：非今日缓存自动清除

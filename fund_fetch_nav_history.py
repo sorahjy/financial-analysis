@@ -39,6 +39,7 @@ API_URL = 'https://fundf10.eastmoney.com/F10DataApi.aspx'
 
 STORE_FILE = os.path.join('data', 'nav_store.json')
 EXPORT_FILE = os.path.join('data', 'nav_history.json')
+MAX_RETRIES = 3
 
 META_RE = re.compile(r'records:(\d+),pages:(\d+),curpage:(\d+)')
 ROW_RE = re.compile(r'<td[^>]*>(.*?)</td>')
@@ -72,8 +73,26 @@ def parse_response(text):
     return rows, total_records, total_pages
 
 
+def _get_with_retry(params):
+    last_err = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
+            r.raise_for_status()
+            return r.text
+        except Exception as e:
+            last_err = e
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt + random.uniform(0, 1))
+    raise last_err
+
+
 def fetch_range(code, sdate, edate):
-    """爬取单只基金 [sdate, edate] 区间内的全部净值数据"""
+    """爬取单只基金 [sdate, edate] 区间内的全部净值数据。
+
+    任一页重试耗尽后直接抛异常：接口按日期倒序分页，部分页数据一旦被
+    当成完整区间合并，end_date/start_date 会跳过缺口，造成永久空洞。
+    """
     collected = []
     page = 1
 
@@ -86,12 +105,8 @@ def fetch_range(code, sdate, edate):
             'sdate': sdate,
             'edate': edate,
         }
-        try:
-            r = requests.get(API_URL, params=params, headers=HEADERS, timeout=15)
-            rows, total_records, total_pages = parse_response(r.text)
-        except Exception as e:
-            print(f'  [ERROR] {code} page {page}: {e}')
-            break
+        text = _get_with_retry(params)
+        rows, total_records, total_pages = parse_response(text)
 
         if not rows:
             break
@@ -155,10 +170,15 @@ def fetch_fund_incremental(code, entry):
     new_records = []
 
     # === 1. 向后补数据 ===
+    # 失败时不合并任何后段数据：end_date 不前进，下次运行重试
     if end_date and end_date < today:
         next_day = (datetime.strptime(end_date, '%Y-%m-%d') + timedelta(days=1)).strftime('%Y-%m-%d')
         print(f'  → 补后段 {next_day} ~ {today}', end='', flush=True)
-        rows = fetch_range(code, next_day, today)
+        try:
+            rows = fetch_range(code, next_day, today)
+        except Exception as e:
+            rows = []
+            print(f' 请求失败({e})，本次跳过')
         if rows:
             new_records.extend(rows)
             print(f' +{len(rows)}条')
@@ -168,7 +188,11 @@ def fetch_fund_incremental(code, entry):
         # 全新基金，先爬最近1年
         sdate = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
         print(f'  → 首次爬取 {sdate} ~ {today}', end='', flush=True)
-        rows = fetch_range(code, sdate, today)
+        try:
+            rows = fetch_range(code, sdate, today)
+        except Exception as e:
+            print(f' 请求失败({e})，本次跳过')
+            return entry
         if rows:
             new_records.extend(rows)
             print(f' +{len(rows)}条')
@@ -193,7 +217,12 @@ def fetch_fund_incremental(code, entry):
         batch_start = (datetime.strptime(batch_end, '%Y-%m-%d') - timedelta(days=365)).strftime('%Y-%m-%d')
 
         print(f'  ← 追溯 {batch_start} ~ {batch_end}', end='', flush=True)
-        rows = fetch_range(code, batch_start, batch_end)
+        try:
+            rows = fetch_range(code, batch_start, batch_end)
+        except Exception as e:
+            # 已成功的整批是完整区间可安全合并；本批失败则中止，下次从新 start_date 继续
+            print(f' 请求失败({e})，本次中止追溯')
+            break
         if not rows:
             print(' 已到最早')
             break

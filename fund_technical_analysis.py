@@ -123,15 +123,22 @@ def latest_valid(series):
     return None
 
 
-def calc_percentile(current, values, default=50.0):
-    """计算 current 在 values 中的区间百分位；区间无波动时返回 default。"""
+def calc_percentile(current, values):
+    """current 在 values 中的排名百分位（中位秩法：低于的占比 + 相等占比的一半）。
+
+    注意是排名分位而非 min-max 区间位置：单根历史插针不会长期压扁结果。
+    values 全部相等时自然返回 50。
+    """
     if not values:
         return None
-    low = min(values)
-    high = max(values)
-    if high == low:
-        return default
-    return (current - low) / (high - low) * 100
+    below = 0
+    equal = 0
+    for v in values:
+        if v < current:
+            below += 1
+        elif v == current:
+            equal += 1
+    return (below + equal * 0.5) / len(values) * 100
 
 
 # ============================================================
@@ -487,12 +494,19 @@ def analyze_fund(nav_records, estimate=None):
 
     navs = []
     dates = []
+    unit_navs = []
     for r in records:
         try:
-            navs.append(float(r['nav_acc']))
-            dates.append(r['date'])
-        except (ValueError, TypeError):
+            acc = float(r['nav_acc'])
+        except (ValueError, TypeError, KeyError):
             continue
+        try:
+            unit = float(r['nav'])
+        except (ValueError, TypeError, KeyError):
+            unit = acc
+        navs.append(acc)
+        dates.append(r['date'])
+        unit_navs.append(unit)
 
     if len(navs) < 30:
         return None
@@ -505,7 +519,9 @@ def analyze_fund(nav_records, estimate=None):
             gz_date = estimate['gztime'].split(' ')[0]
             if gz_date > dates[-1]:
                 gszzl = float(estimate['gszzl'])
-                estimated_nav = navs[-1] * (1 + gszzl / 100)
+                # gszzl 是单位净值涨幅，序列是累计净值：增量 = 单位净值 × 涨幅，
+                # 直接乘 (1+gszzl) 会按 acc/nav 倍数放大有分红基金的当日变动
+                estimated_nav = navs[-1] + unit_navs[-1] * gszzl / 100
                 navs.append(round(estimated_nav, 4))
                 dates.append(gz_date)
                 estimated = True
@@ -612,7 +628,10 @@ def analyze_fund(nav_records, estimate=None):
 
     for ci in range(recent_n):
         gi = start_idx + ci
-        if gi < 120:
+        is_last = (gi == len(navs) - 1)
+        # 前120日指标预热期不标记信号，但末点始终评估，
+        # 否则历史不足121天的基金 overall 永远停留在'持有'
+        if gi < 120 and not is_last:
             continue
         # 计算该时刻的近6年百分位
         lb_start = max(0, gi - PERCENTILE_LOOKBACK_DAYS + 1)
@@ -620,7 +639,6 @@ def analyze_fund(nav_records, estimate=None):
         pt_pct = calc_percentile(navs[gi], lb_navs)
         s = calc_point_score(gi, *score_args)
 
-        is_last = (gi == len(navs) - 1)
         point_signal = '持有'
         point_forced = False
 
@@ -752,20 +770,15 @@ def main():
         print(f'已加载 {len(estimate_data)} 只基金的实时估算数据')
 
     signals = {}
-    for code in fund_codes:
+    for code in sorted(fund_codes):
         records = history.get(code)
         if not records:
             print(f'  [SKIP] {code}: 无历史净值数据')
             continue
         result = analyze_fund(records, estimate=estimate_data.get(code))
         if result is not None:
-            clean = {}
-            for k, v in result.items():
-                if isinstance(v, list):
-                    clean[k] = [x if x is not None else 'null' for x in v]
-                else:
-                    clean[k] = v
-            signals[code] = clean
+            # None 直接序列化为 JSON null，下游按 None 判断
+            signals[code] = result
 
     with open('data/signals.json', 'w', encoding='utf-8') as f:
         json.dump(signals, f, ensure_ascii=False, indent=2)

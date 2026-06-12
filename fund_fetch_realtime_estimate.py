@@ -25,6 +25,7 @@ HEADERS = {
 
 API_URL = 'https://fundgz.1234567.com.cn/js/{code}.js'
 OUTPUT_FILE = os.path.join('data', 'realtime_estimate.json')
+MAX_RETRIES = 3
 
 JSONP_RE = re.compile(r'jsonpgz\((.*)\)')
 
@@ -32,22 +33,26 @@ JSONP_RE = re.compile(r'jsonpgz\((.*)\)')
 def fetch_estimate(code):
     """获取单只基金的实时估算数据，返回 dict 或 None"""
     url = API_URL.format(code=code)
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=10)
-        r.encoding = 'utf-8'
-        m = JSONP_RE.search(r.text)
-        if not m:
-            return None
-        data = json.loads(m.group(1))
-        return {
-            'gsz': data.get('gsz', ''),
-            'gszzl': data.get('gszzl', ''),
-            'gztime': data.get('gztime', ''),
-            'dwjz': data.get('dwjz', ''),
-        }
-    except Exception as e:
-        print(f'  [ERROR] {code}: {e}')
-        return None
+    for attempt in range(MAX_RETRIES):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=10)
+            r.encoding = 'utf-8'
+            m = JSONP_RE.search(r.text)
+            if not m:
+                return None
+            data = json.loads(m.group(1))
+            return {
+                'gsz': data.get('gsz', ''),
+                'gszzl': data.get('gszzl', ''),
+                'gztime': data.get('gztime', ''),
+                'dwjz': data.get('dwjz', ''),
+            }
+        except Exception as e:
+            if attempt < MAX_RETRIES - 1:
+                time.sleep(2 ** attempt + random.uniform(0, 0.5))
+            else:
+                print(f'  [ERROR] {code}: {e}')
+    return None
 
 
 def main():
