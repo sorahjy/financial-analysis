@@ -1,0 +1,394 @@
+:root {
+  --bg: #f4f6f8;
+  --panel: #ffffff;
+  --panel-soft: #f8fafc;
+  --ink: #1f2933;
+  --muted: #64748b;
+  --line: #d8dee8;
+  --blue: #2563eb;
+  --teal: #0f766e;
+  --green: #14804a;
+  --shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  color: var(--ink);
+  background: var(--bg);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+  font-size: 14px;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app-shell {
+  min-height: 100vh;
+}
+
+.app-topbar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  min-height: 58px;
+  padding: 0 28px;
+  border-bottom: 1px solid var(--line);
+  background: rgba(255, 255, 255, 0.94);
+  backdrop-filter: blur(14px);
+}
+
+.brand {
+  font-size: 15px;
+  font-weight: 800;
+  color: #111827;
+}
+
+.main-nav {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.main-nav a,
+.btn {
+  min-height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  padding: 0 12px;
+  cursor: pointer;
+  font-weight: 650;
+}
+
+.main-nav a {
+  color: var(--muted);
+}
+
+.main-nav a:hover,
+.btn:hover {
+  border-color: #93c5fd;
+  color: var(--blue);
+}
+
+.btn.primary {
+  background: var(--blue);
+  border-color: var(--blue);
+  color: #ffffff;
+}
+
+.btn:disabled,
+.btn.is-busy {
+  cursor: not-allowed;
+  opacity: 0.58;
+}
+
+.btn:disabled:hover,
+.btn.is-busy:hover {
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.btn.primary:disabled,
+.btn.primary.is-busy {
+  background: #94a3b8;
+  border-color: #94a3b8;
+  color: #ffffff;
+}
+
+.btn.ghost {
+  background: var(--panel-soft);
+}
+
+.app-main {
+  width: min(1480px, 94vw);
+  margin: 0 auto;
+  padding: 20px 0 28px;
+}
+
+.page-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 18px;
+  margin-bottom: 16px;
+}
+
+.page-head h1 {
+  margin: 0;
+  font-size: 24px;
+  line-height: 1.2;
+}
+
+.eyebrow {
+  margin: 0 0 5px;
+  color: var(--teal);
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.action-row {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.fund-command-bar {
+  position: sticky;
+  top: 58px;
+  z-index: 9;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 42px;
+  margin-bottom: 12px;
+  padding: 5px 8px 5px 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.94);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+  backdrop-filter: blur(14px);
+}
+
+.fund-command-meta {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.fund-command-meta b {
+  margin-left: 4px;
+  color: var(--ink);
+  font-weight: 750;
+}
+
+.fund-command-bar .btn {
+  min-height: 28px;
+  padding: 0 10px;
+  font-size: 13px;
+}
+
+.fund-job-log {
+  margin-bottom: 12px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 8px 20px rgba(15, 23, 42, 0.06);
+}
+
+.fund-job-log[hidden] {
+  display: none;
+}
+
+.fund-job-log-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.fund-job-log-head div {
+  min-width: 0;
+}
+
+.fund-job-log-head span {
+  font-weight: 700;
+}
+
+.fund-job-log-head b {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--ink);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-weight: 650;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.fund-job-log pre {
+  max-height: 260px;
+  margin: 0;
+  padding: 12px;
+  overflow: auto;
+  background: #f8fafc;
+  color: #334155;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.module-grid,
+.status-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+
+.module-card,
+.status-card,
+.embed-panel {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: var(--shadow);
+}
+
+.module-card {
+  min-height: 180px;
+  padding: 18px;
+}
+
+.module-card:hover {
+  border-color: #93c5fd;
+}
+
+.module-type {
+  display: inline-flex;
+  margin-bottom: 12px;
+  color: var(--teal);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.module-card strong {
+  display: block;
+  margin-bottom: 20px;
+  font-size: 22px;
+}
+
+.module-card dl {
+  display: grid;
+  grid-template-columns: 76px 1fr;
+  gap: 8px 12px;
+  margin: 0;
+}
+
+.module-card dt,
+.status-card span {
+  color: var(--muted);
+}
+
+.module-card dd {
+  margin: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.status-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 14px;
+}
+
+.status-card {
+  padding: 13px 14px;
+}
+
+.status-card span {
+  display: block;
+  margin-bottom: 6px;
+  font-size: 12px;
+}
+
+.status-card strong {
+  font-size: 14px;
+  font-variant-numeric: tabular-nums;
+}
+
+.embed-panel {
+  overflow: hidden;
+}
+
+.fund-native-panel {
+  overflow: visible;
+}
+
+.fund-native > .page {
+  width: 100% !important;
+  margin: 0 !important;
+  padding-top: 0 !important;
+}
+
+.report-frame {
+  display: block;
+  width: 100%;
+  border: 0;
+  background: #ffffff;
+}
+
+.report-frame {
+  height: calc(100vh - 210px);
+  min-height: 620px;
+}
+
+.empty-state {
+  padding: 48px 20px;
+  text-align: center;
+  color: var(--muted);
+}
+
+.empty-state h2 {
+  margin: 0 0 8px;
+  color: var(--ink);
+  font-size: 18px;
+}
+
+.empty-state p {
+  margin: 0;
+}
+
+@media (max-width: 900px) {
+  .app-topbar,
+  .page-head,
+  .fund-command-bar,
+  .fund-command-meta {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .app-topbar {
+    padding: 12px 18px;
+  }
+
+  .module-grid,
+  .status-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .app-main {
+    width: min(100% - 24px, 1480px);
+  }
+}

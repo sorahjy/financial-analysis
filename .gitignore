@@ -5,6 +5,11 @@
 data/*
 .claude
 
+# Generated reports (HTML is built from data/, never edited by hand)
+/fund_report.html
+/stock_report.html
+*.bak
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

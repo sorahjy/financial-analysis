@@ -3,16 +3,54 @@ import unittest
 from stock_advanced_strategies import (
     FactorSpec,
     apply_scores,
+    compute_long_raw_factors,
     csi300_persistence_proxy,
     first_not_none,
     get_factor_registry,
     get_default_config,
     high_to_latest_drawdown_pct,
     institution_conflict_score,
+    passes_long_hard_filters,
+    report_available_date,
+    reports_available_asof,
     rsi_sweetspot_score,
     run_long_strategy,
     run_strategies,
 )
+
+
+PIT_SYNTH_STOCK = {
+    "indicators": {
+        "records": [
+            {"date": "2025-12-31", "roe": 30.0, "total_assets": 1e9,
+             "asset_liability_ratio": 40, "gross_margin": 50, "net_margin": 20,
+             "bvps_adjusted": 10.0},
+            {"date": "2024-12-31", "roe": 10.0, "total_assets": 9e8,
+             "asset_liability_ratio": 42, "gross_margin": 48, "net_margin": 18,
+             "bvps_adjusted": 9.0},
+        ],
+        "roe_stats": {"mean": 20.0, "std": 10.0, "count": 2},
+    },
+    "financials": {
+        "income": [
+            {"date": "2025-12-31", "revenue": 200, "net_profit": 60,
+             "cost_of_revenue": 100, "operating_cost": 120},
+            {"date": "2024-12-31", "revenue": 150, "net_profit": 40,
+             "cost_of_revenue": 80, "operating_cost": 95},
+        ],
+        "balance": [
+            {"date": "2025-12-31", "total_equity_parent": 500, "total_assets_liabilities": 1000},
+            {"date": "2024-12-31", "total_equity_parent": 450, "total_assets_liabilities": 900},
+        ],
+        "cashflow": [
+            {"date": "2025-12-31", "operating_cashflow_net": 70},
+            {"date": "2024-12-31", "operating_cashflow_net": 45},
+        ],
+    },
+    "dividends": {"records": [], "yearly_dividends": {}, "consecutive_3y_dividend": False},
+    "daily": {"recent_daily": [], "stats": {"volatility_annual": 0.3,
+                                            "avg_daily_turnover_approx": 1e8, "latest_close": 15}},
+}
 
 
 class StockAdvancedStrategyTest(unittest.TestCase):
@@ -30,6 +68,27 @@ class StockAdvancedStrategyTest(unittest.TestCase):
 
         self.assertGreater(old_member, young_member)
         self.assertGreater(old_member, old_non_member)
+
+    def test_csi300_persistence_does_not_hard_filter_long_pool(self):
+        item = {
+            "name": "测试股份",
+            "raw_factors": {
+                "market_cap": 500,
+                "listing_age": 8,
+                "csi300_current": 0.0,
+                "csi300_persistence": 0.0,
+            },
+        }
+        config = {
+            "exclude_st": True,
+            "min_market_cap_yi": 100,
+            "min_listing_years": 5,
+            "min_csi300_persistence": 100,
+            "require_csi300": False,
+            "require_high_drawdown": False,
+        }
+
+        self.assertTrue(passes_long_hard_filters(item, config))
 
     def test_rsi_sweetspot_prefers_attack_zone(self):
         self.assertEqual(rsi_sweetspot_score(60), 100.0)
@@ -109,7 +168,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
             "require_csi300": False,
             "min_market_cap_yi": 500,
             "min_listing_years": 12,
-            "min_csi300_persistence": 60,
             "min_high_drawdown_pct": 10,
             "min_score": 0,
             "top_n": 9999,
@@ -135,7 +193,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         base.update({
             "min_market_cap_yi": 500,
             "min_listing_years": 12,
-            "min_csi300_persistence": 60,
             "min_score": 0,
             "top_n": 9999,
         })
@@ -160,7 +217,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         base.update({
             "require_csi300": False,
             "min_listing_years": 12,
-            "min_csi300_persistence": 60,
             "min_score": 0,
             "top_n": 9999,
         })
@@ -180,6 +236,32 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertGreaterEqual(strict_moutai["raw_factors"]["market_cap"], 500)
         self.assertAlmostEqual(loose_moutai["score"], strict_moutai["score"], places=6)
 
+    def test_report_available_date_uses_statutory_deadlines(self):
+        self.assertEqual(report_available_date("2024-12-31"), "2025-04-30")
+        self.assertEqual(report_available_date("2024-03-31"), "2024-04-30")
+        self.assertEqual(report_available_date("2024-06-30"), "2024-08-31")
+        self.assertEqual(report_available_date("2024-09-30"), "2024-10-31")
+
+    def test_reports_available_asof_hides_unannounced_reports(self):
+        recs = [{"date": "2025-12-31", "v": 2}, {"date": "2024-12-31", "v": 1}]
+        # 2025-06-01: 2025年报(法定可见日 2026-04-30)尚未公布，只剩 2024 年报
+        visible = reports_available_asof(recs, "2025-06-01")
+        self.assertEqual([r["date"] for r in visible], ["2024-12-31"])
+        # as_of=None 原样返回(保护实盘路径)
+        self.assertIs(reports_available_asof(recs, None), recs)
+
+    def test_compute_long_factors_pit_uses_only_visible_reports(self):
+        live = compute_long_raw_factors(
+            "X", PIT_SYNTH_STOCK, {}, False, False, 5.0, 1e10, None,
+        )
+        pit = compute_long_raw_factors(
+            "X", PIT_SYNTH_STOCK, {}, False, False, 5.0, 1e10, None, as_of="2025-06-01",
+        )
+        # 实盘 roe_mean 用全部记录(均值20)；PIT 只看 2024 年报已可见(=10)
+        self.assertAlmostEqual(live["roe_mean"], 20.0)
+        self.assertAlmostEqual(pit["roe_mean"], 10.0)
+        self.assertNotAlmostEqual(live["net_margin"], pit["net_margin"])
+
     def test_run_strategies_returns_usable_sections(self):
         result = run_strategies(persist=False)
 
@@ -193,4 +275,3 @@ class StockAdvancedStrategyTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

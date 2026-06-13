@@ -292,17 +292,46 @@ def mirror_capital_outputs() -> Dict[str, Any]:
     }
 
 
+def refresh_csi300_benchmark() -> Dict[str, Any]:
+    from stock_crawl_top_800_data import (
+        CSI300_ETF_CODE,
+        CSI300_ETF_YEARS,
+        CSI300_FILE,
+        fetch_csi300_etf,
+    )
+
+    records = fetch_csi300_etf(years=CSI300_ETF_YEARS)
+    path = Path(CSI300_FILE)
+    try:
+        display_path = str(path.resolve().relative_to(ROOT))
+    except ValueError:
+        display_path = str(path)
+    return {
+        "code": CSI300_ETF_CODE,
+        "target_years": CSI300_ETF_YEARS,
+        "records": len(records),
+        "start_date": records[0]["date"] if records else None,
+        "end_date": records[-1]["date"] if records else None,
+        "file": display_path,
+    }
+
+
 def collect_data_health() -> Dict[str, Any]:
     stock_data_count = len(list((DATA_DIR / "stock_data").glob("CN_*.json")))
     cn_stock_count = len(list((DATA_DIR / "CN_stock").glob("CN_*.json")))
     capital = load_json(CAPITAL_DIR / "scored_stocks.json", {})
     strategy = load_json(DATA_DIR / "stock_advanced_strategy_results.json", {})
+    csi300 = load_json(DATA_DIR / "csi300_etf_nav.json", {})
+    csi300_records = csi300.get("records", []) if isinstance(csi300, dict) else []
     return {
         "stock_data_files": stock_data_count,
         "cn_stock_files": cn_stock_count,
         "capital_scored_count": capital.get("count") if isinstance(capital, dict) else None,
         "capital_generated_at": capital.get("generated_at") if isinstance(capital, dict) else None,
         "strategy_generated_at": strategy.get("generated_at") if isinstance(strategy, dict) else None,
+        "csi300_benchmark_records": len(csi300_records),
+        "csi300_benchmark_start": csi300.get("start_date") if isinstance(csi300, dict) else None,
+        "csi300_benchmark_end": csi300.get("end_date") if isinstance(csi300, dict) else None,
     }
 
 
@@ -334,7 +363,6 @@ def refresh_before_server(
         env["no_proxy"] = "*"
         env["STOCK_CRAWL_NO_PROXY"] = "1"
 
-    quick = mode == "quick"
     full = mode == "full"
     if mode not in {"full", "quick", "capital-only"}:
         raise ValueError(f"unsupported refresh mode: {mode}")
@@ -372,6 +400,14 @@ def refresh_before_server(
             skip=not full,
         )
     )
+    if mode != "capital-only":
+        steps.append(
+            local_step_result(
+                "csi300_benchmark",
+                "fetch 510310 CSI300 ETF accumulated NAV for 12 years",
+                refresh_csi300_benchmark,
+            )
+        )
     if full:
         steps.append(
             local_step_result(

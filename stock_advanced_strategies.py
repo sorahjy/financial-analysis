@@ -20,7 +20,7 @@ import math
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
 from statistics import mean
@@ -165,12 +165,11 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
-        "top_n": 12,
+        "top_n": 10,
         "min_score": 60,
         "min_market_cap_yi": 100,
         "min_listing_years": 5,
         "require_csi300": False,
-        "min_csi300_persistence": 45,
         "require_high_drawdown": False,
         "min_high_drawdown_pct": 40,
         "exclude_st": True,
@@ -230,14 +229,26 @@ def clean_round(value: Any, digits: int = 4) -> Any:
     return round(num, digits)
 
 
+@lru_cache(maxsize=131072)
+def _parse_date_text(text: str) -> Optional[datetime]:
+    if len(text) < 10:
+        return None
+    text = text[:10]
+    try:
+        # Hot path for YYYY-MM-DD avoids datetime.strptime's locale machinery.
+        if text[4] == "-" and text[7] == "-":
+            return datetime(int(text[:4]), int(text[5:7]), int(text[8:10]))
+        return datetime.strptime(text, "%Y-%m-%d")
+    except (TypeError, ValueError):
+        return None
+
+
 def parse_date(value: Any) -> Optional[datetime]:
     if not value:
         return None
-    text = str(value)[:10]
-    try:
-        return datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
-        return None
+    if isinstance(value, datetime):
+        return value
+    return _parse_date_text(str(value)[:10])
 
 
 def _file_signature(path: Path) -> Tuple[int, int]:
@@ -424,27 +435,62 @@ def estimate_market_cap_cny(stock: Dict[str, Any], snapshot: Optional[Dict[str, 
     return None
 
 
-def dividend_yield(stock: Dict[str, Any], years: int = 5) -> Optional[float]:
-    yearly = stock.get("dividends", {}).get("yearly_dividends", {})
-    price = safe_float(stock.get("daily", {}).get("stats", {}).get("latest_close"))
-    if not yearly or not price or price <= 0:
+def dividend_yield(
+        stock: Dict[str, Any],
+        years: int = 5,
+        as_of: Optional[str] = None,
+        price: Optional[float] = None,
+) -> Optional[float]:
+    # 实盘(as_of=None)：直接用预算的 yearly_dividends 与最新收盘。
+    if as_of is None:
+        yearly = stock.get("dividends", {}).get("yearly_dividends", {})
+        ref_price = price if price is not None else safe_float(
+            stock.get("daily", {}).get("stats", {}).get("latest_close")
+        )
+        ref_year = datetime.now().year
+    else:
+        # PIT：只数 announce_date <= as_of 的分红，按公告年聚合每10股派息。
+        yearly = {}
+        for rec in stock.get("dividends", {}).get("records", []) or []:
+            ann = str(rec.get("announce_date") or "")[:10]
+            div = safe_float(rec.get("dividend_per_10"))
+            if len(ann) == 10 and ann <= as_of and div and div > 0:
+                yr = ann[:4]
+                yearly[yr] = yearly.get(yr, 0.0) + div
+        ref_price = price
+        ref_year = int(as_of[:4])
+    if not yearly or not ref_price or ref_price <= 0:
         return None
-    current_year = datetime.now().year
     values = []
     for offset in range(1, years + 1):
-        div = safe_float(yearly.get(str(current_year - offset)))
+        div = safe_float(yearly.get(str(ref_year - offset)))
         if div is not None and div > 0:
             values.append(div / 10.0)
     if not values:
         return None
-    return (sum(values) / len(values)) / price
+    return (sum(values) / len(values)) / ref_price
 
 
-def listing_age_years(snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
+def consecutive_dividend_asof(stock: Dict[str, Any], as_of: str, years: int = 3) -> bool:
+    """PIT：截止 as_of，近 years 个公告年是否都有现金分红。"""
+    paid_years = set()
+    for rec in stock.get("dividends", {}).get("records", []) or []:
+        ann = str(rec.get("announce_date") or "")[:10]
+        div = safe_float(rec.get("dividend_per_10"))
+        if len(ann) == 10 and ann <= as_of and div and div > 0:
+            paid_years.add(int(ann[:4]))
+    base = int(as_of[:4])
+    return all((base - i) in paid_years for i in range(1, years + 1))
+
+
+def listing_age_years(
+        snapshot: Optional[Dict[str, Any]], as_of: Optional[str] = None
+) -> Optional[float]:
     date = parse_date((snapshot or {}).get("listing_date"))
     if not date:
         return None
-    return max(0.0, (datetime.now() - date).days / 365.25)
+    ref = parse_date(as_of) if as_of else datetime.now()
+    return max(0.0, (ref - date).days / 365.25)
 
 
 def high_to_latest_drawdown_pct(rows: List[Dict[str, Any]]) -> Optional[float]:
@@ -456,6 +502,93 @@ def high_to_latest_drawdown_pct(rows: List[Dict[str, Any]]) -> Optional[float]:
     if peak <= 0:
         return None
     return (peak - closes[-1]) / peak * 100.0
+
+
+# ---------------------------------------------------------------------------
+# Point-in-time (PIT) helpers — 回测时只用某时点已可见的数据，消除前视偏差。
+# 所有 as_of=None 分支必须与改动前逐字等价，保护实盘/dashboard 路径。
+# ---------------------------------------------------------------------------
+
+
+@lru_cache(maxsize=131072)
+def report_available_date(period: Optional[str]) -> Optional[str]:
+    """报告期 → 法定披露截止日(保守取，避免前视；实际公告通常更早)。
+    年报(12-31)→次年4-30、一季报(03-31)→4-30、半年报(06-30)→8-31、三季报(09-30)→10-31。"""
+    d = parse_date(period)
+    if not d:
+        return None
+    md = f"{d.month:02d}-{d.day:02d}"
+    if md == "12-31":
+        return f"{d.year + 1}-04-30"
+    if md == "03-31":
+        return f"{d.year}-04-30"
+    if md == "06-30":
+        return f"{d.year}-08-31"
+    if md == "09-30":
+        return f"{d.year}-10-31"
+    return (d + timedelta(days=120)).strftime("%Y-%m-%d")  # 非标准报告期兜底
+
+
+def reports_available_asof(
+        records: List[Dict[str, Any]], as_of: Optional[str]
+) -> List[Dict[str, Any]]:
+    """财报记录按可见日 <= as_of 过滤；as_of=None 原样返回。"""
+    if as_of is None:
+        return records
+    return [
+        r for r in records or []
+        if (report_available_date(str(r.get("date", ""))) or "9999-99-99") <= as_of
+    ]
+
+
+def price_rows_asof(
+        rows: List[Dict[str, Any]], as_of: Optional[str]
+) -> List[Dict[str, Any]]:
+    """日线切到 date <= as_of；as_of=None 原样返回。"""
+    if as_of is None:
+        return rows
+    if not rows:
+        return []
+    first_date = str(rows[0].get("date", ""))
+    last_date = str(rows[-1].get("date", ""))
+    if first_date <= last_date:
+        if last_date <= as_of:
+            return rows
+        lo = 0
+        hi = len(rows)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if str(rows[mid].get("date", "")) <= as_of:
+                lo = mid + 1
+            else:
+                hi = mid
+        return rows[:lo]
+    return [r for r in rows if str(r.get("date", "")) <= as_of]
+
+
+def annualized_vol_from_rows(
+        rows: List[Dict[str, Any]], window: int = 250
+) -> Optional[float]:
+    """日线收盘 → 年化波动率(日收益 std × sqrt(252))。"""
+    closes = [safe_float(r.get("close")) for r in (rows or [])[-(window + 1):]]
+    closes = [c for c in closes if c is not None and c > 0]
+    if len(closes) < 20:
+        return None
+    rets = [closes[i] / closes[i - 1] - 1 for i in range(1, len(closes))]
+    return stdev_or_zero(rets) * math.sqrt(252)
+
+
+def pit_liquidity(
+        rows: List[Dict[str, Any]], market_cap_cny: Optional[float], window: int = 60
+) -> Optional[float]:
+    """PIT 日均成交额(元)代理 = 近窗平均换手率% × 总市值。CN_stock 无成交额字段，故近似。"""
+    if not market_cap_cny:
+        return None
+    tos = [safe_float(r.get("turnover_rate")) for r in (rows or [])[-window:]]
+    tos = [t for t in tos if t is not None and t > 0]
+    if not tos:
+        return None
+    return (sum(tos) / len(tos)) / 100.0 * market_cap_cny
 
 
 def safe_ratio(numerator: Any, denominator: Any) -> Optional[float]:
@@ -643,15 +776,51 @@ def _load_fundamental_stocks_cached(fingerprint: int) -> Dict[str, Dict[str, Any
     return stocks
 
 
-def latest_valuation_from_cn(code: str) -> Dict[str, Optional[float]]:
-    cn = load_cn_stock_index().get(code) or {}
-    records = cn.get("records", [])
-    return {
-        "market_cap": latest_record_with(records, "market_cap"),
-        "pe_ttm": latest_record_with(records, "pe_ttm"),
-        "pb": latest_record_with(records, "pb"),
-        "pcf": latest_record_with(records, "pcf"),
+def latest_valuation_from_records(
+        records: List[Dict[str, Any]],
+        as_of: Optional[str] = None,
+) -> Dict[str, Optional[float]]:
+    fields = {
+        "market_cap": "market_cap",
+        "pe_ttm": "pe_ttm",
+        "pb": "pb",
+        "pcf": "pcf",
     }
+    values: Dict[str, Optional[float]] = {key: None for key in fields}
+    missing = set(fields)
+    if not records:
+        return values
+
+    sorted_ascending = str(records[0].get("date", "")) <= str(records[-1].get("date", ""))
+    end = len(records)
+    if as_of is not None and sorted_ascending:
+        lo = 0
+        hi = len(records)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if str(records[mid].get("date", "")) <= as_of:
+                lo = mid + 1
+            else:
+                hi = mid
+        end = lo
+
+    for idx in range(end - 1, -1, -1):
+        row = records[idx]
+        if as_of is not None and not sorted_ascending and str(row.get("date", "")) > as_of:
+            continue
+        for key in list(missing):
+            value = safe_float(row.get(fields[key]))
+            if value is not None:
+                values[key] = value
+                missing.remove(key)
+        if not missing:
+            break
+    return values
+
+
+def latest_valuation_from_cn(code: str, as_of: Optional[str] = None) -> Dict[str, Optional[float]]:
+    cn = load_cn_stock_index().get(code) or {}
+    return latest_valuation_from_records(cn.get("records", []), as_of=as_of)
 
 
 def combined_recent_rows(code: str, stock: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -668,8 +837,14 @@ def price_history_rows(code: str, stock: Dict[str, Any]) -> List[Dict[str, Any]]
     return stock.get("daily", {}).get("recent_daily", [])
 
 
-def historical_high_drawdown_pct(code: str, stock: Dict[str, Any]) -> Optional[float]:
-    return high_to_latest_drawdown_pct(price_history_rows(code, stock))
+def historical_high_drawdown_pct(
+        code: str,
+        stock: Dict[str, Any],
+        as_of: Optional[str] = None,
+        hist_rows: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[float]:
+    rows = hist_rows if hist_rows is not None else price_rows_asof(price_history_rows(code, stock), as_of)
+    return high_to_latest_drawdown_pct(rows)
 
 
 # ---------------------------------------------------------------------------
@@ -804,20 +979,60 @@ def available_factor_ratio(raw_factors: Dict[str, Any], specs: List[FactorSpec])
 # ---------------------------------------------------------------------------
 
 
-def build_long_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+def pit_market_cap_cny(
+        code: str,
+        stock: Dict[str, Any],
+        as_of: str,
+        hist_rows: Optional[List[Dict[str, Any]]] = None,
+        cn_records: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[float]:
+    """PIT 总市值(元)：优先 CN_stock ≤as_of 的 market_cap；否则用截止 as_of 收盘 ×
+    当时可见财报推算的股本(归母权益 / 每股净资产)。不碰 market_snapshot 的当前市值。"""
+    cn_val = (
+        latest_valuation_from_records(cn_records, as_of=as_of)
+        if cn_records is not None
+        else latest_valuation_from_cn(code, as_of=as_of)
+    )
+    if cn_val.get("market_cap"):
+        return cn_val["market_cap"] * 1e8
+    prows = hist_rows if hist_rows is not None else price_rows_asof(price_history_rows(code, stock), as_of)
+    price_asof = next(
+        (c for c in (safe_float(r.get("close")) for r in reversed(prows)) if c and c > 0),
+        None,
+    )
+    ind = reports_available_asof(stock.get("indicators", {}).get("records", []), as_of)
+    bal = reports_available_asof(stock.get("financials", {}).get("balance", []), as_of)
+    bvps = safe_float(ind[0].get("bvps_adjusted")) if ind else None
+    equity = safe_float(bal[0].get("total_equity_parent")) if bal else None
+    shares = equity / bvps if (bvps and bvps > 0 and equity and equity > 0) else None
+    return shares * price_asof if (shares and price_asof) else None
+
+
+def build_long_candidates(
+        config: Dict[str, Any],
+        as_of: Optional[str] = None,
+        universe: Optional[set] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
     stocks = load_fundamental_stocks()
+    if universe is not None:
+        stocks = {c: s for c, s in stocks.items() if c in universe}
     universe = load_stock_universe()
     snapshot = load_market_snapshot()
+    cn_index = load_cn_stock_index()
     csi300 = set(str(code).zfill(6) for code in universe.get("csi300", []))
     csi_all = set(str(code).zfill(6) for code in universe.get("all", []))
     notes = []
     if not csi300:
         notes.append("data/stock_universe.json lacks csi300; CSI300 filters are inactive.")
+    if as_of is not None:
+        notes.append(
+            f"PIT 时点 {as_of}：财报/价格/估值/分红已按当时可见切片；"
+            "但沪深300成分与质押用的是当前快照(无历史数据)，这两维仍有轻微前视。"
+        )
 
     min_cap_yi = safe_float(config.get("min_market_cap_yi")) or 0.0
     min_listing = safe_float(config.get("min_listing_years")) or 0.0
     require_csi300 = bool(config.get("require_csi300", True))
-    min_persistence = safe_float(config.get("min_csi300_persistence")) or 0.0
     require_high_drawdown = bool(config.get("require_high_drawdown", False))
     min_high_drawdown_pct = safe_float(config.get("min_high_drawdown_pct")) or 0.0
     exclude_st = bool(config.get("exclude_st", True))
@@ -832,33 +1047,42 @@ def build_long_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]],
         snap = snapshot.get(code, {})
         in_csi300 = code in csi300
         in_csi_all = bool(snap.get("in_csi_all")) or code in csi_all
-        age = listing_age_years(snap)
+        age = listing_age_years(snap, as_of)
         if min_listing and (age is None or age < min_listing):
             continue
         if require_csi300 and not in_csi300:
             continue
 
-        market_cap_cny = estimate_market_cap_cny(stock, snap)
-        cn_val = latest_valuation_from_cn(code)
-        if cn_val.get("market_cap"):
-            market_cap_yi = cn_val["market_cap"]
-            market_cap_cny = market_cap_yi * 1e8
+        cn_records = (cn_index.get(code) or {}).get("records", [])
+        base_price_rows = cn_records or stock.get("daily", {}).get("recent_daily", [])
+        hist_rows = price_rows_asof(base_price_rows, as_of)
+
+        if as_of is None:
+            market_cap_cny = estimate_market_cap_cny(stock, snap)
+            cn_val = latest_valuation_from_records(cn_records)
+            if cn_val.get("market_cap"):
+                market_cap_yi = cn_val["market_cap"]
+                market_cap_cny = market_cap_yi * 1e8
+            else:
+                market_cap_yi = market_cap_cny / 1e8 if market_cap_cny else None
         else:
+            market_cap_cny = pit_market_cap_cny(
+                code, stock, as_of, hist_rows=hist_rows, cn_records=cn_records
+            )
             market_cap_yi = market_cap_cny / 1e8 if market_cap_cny else None
         if min_cap_yi and (market_cap_yi is None or market_cap_yi < min_cap_yi):
             continue
 
-        high_drawdown_pct = historical_high_drawdown_pct(code, stock)
-        if require_high_drawdown and (
-                high_drawdown_pct is None or high_drawdown_pct < min_high_drawdown_pct
-        ):
-            continue
+        high_drawdown_pct = None
+        if require_high_drawdown:
+            high_drawdown_pct = historical_high_drawdown_pct(code, stock, as_of=as_of, hist_rows=hist_rows)
+            if high_drawdown_pct is None or high_drawdown_pct < min_high_drawdown_pct:
+                continue
 
         raw = compute_long_raw_factors(
-            code, stock, snap, in_csi300, in_csi_all, age, market_cap_cny, high_drawdown_pct
+            code, stock, snap, in_csi300, in_csi_all, age, market_cap_cny,
+            high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
         )
-        if raw["csi300_persistence"] < min_persistence:
-            continue
 
         industry = str(stock.get("pledge", {}).get("industry") or snap.get("pledge_industry") or "UNKNOWN")
         item = {
@@ -897,11 +1121,6 @@ def passes_long_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bo
     if min_listing and (listing_age is None or listing_age < min_listing):
         return False
 
-    min_persistence = safe_float(config.get("min_csi300_persistence")) or 0.0
-    persistence = safe_float(raw.get("csi300_persistence"))
-    if min_persistence and (persistence is None or persistence < min_persistence):
-        return False
-
     if bool(config.get("require_csi300", True)) and not raw.get("csi300_current"):
         return False
 
@@ -923,14 +1142,17 @@ def compute_long_raw_factors(
         age: Optional[float],
         market_cap_cny: Optional[float],
         high_drawdown_pct: Optional[float] = None,
+        as_of: Optional[str] = None,
+        hist_rows: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
-    daily_stats = stock.get("daily", {}).get("stats", {})
+    # PIT(as_of 给定)：财报只取截止 as_of 已公告可见的；as_of=None 时原样(实盘)。
     financials = stock.get("financials", {})
-    income = financials.get("income", [])
-    balance = financials.get("balance", [])
-    cashflow = financials.get("cashflow", [])
-    indicators = stock.get("indicators", {}).get("records", [])
-    roe_stats = stock.get("indicators", {}).get("roe_stats", {})
+    income = reports_available_asof(financials.get("income", []), as_of)
+    balance = reports_available_asof(financials.get("balance", []), as_of)
+    cashflow = reports_available_asof(financials.get("cashflow", []), as_of)
+    indicators = reports_available_asof(stock.get("indicators", {}).get("records", []), as_of)
+    # 实盘信任预算的 roe_stats；PIT 下置空，强制从过滤后 indicators 现算
+    roe_stats = stock.get("indicators", {}).get("roe_stats", {}) if as_of is None else {}
     latest_ind = indicators[0] if indicators else {}
 
     net_profit_ttm = compute_ttm(income, "net_profit")
@@ -944,10 +1166,15 @@ def compute_long_raw_factors(
 
     market_cap_yi = market_cap_cny / 1e8 if market_cap_cny else None
 
-    # 价格行为因子用全量历史日线（CN_stock 最长约10年）
-    hist_rows = price_history_rows(code, stock)
+    # 价格行为因子用历史日线（CN_stock 最长约10年）；PIT 下切到 as_of 之前
+    if hist_rows is None:
+        hist_rows = price_rows_asof(price_history_rows(code, stock), as_of)
     hist_closes = [safe_float(row.get("close")) for row in hist_rows]
     hist_closes = [c for c in hist_closes if c is not None and c > 0]
+    if high_drawdown_pct is None and len(hist_closes) >= 2:
+        peak_close = max(hist_closes)
+        if peak_close > 0:
+            high_drawdown_pct = (peak_close - hist_closes[-1]) / peak_close * 100.0
     reversal_1m = None
     momentum_12_1 = None
     dist_52w_high = None
@@ -1019,18 +1246,33 @@ def compute_long_raw_factors(
         if older is not None:
             leverage_trend = debt_values[0] - older
 
-    dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
     piotroski = piotroski_f_score(income, indicators, net_profit_ttm, op_cash_ttm, total_assets)
+
+    # 波动率/流动性/分红：实盘读文件快照；PIT 从切片日线 + 截止 as_of 的分红现算
+    if as_of is None:
+        daily_stats = stock.get("daily", {}).get("stats", {})
+        low_volatility = safe_float(daily_stats.get("volatility_annual"))
+        liquidity = first_not_none(
+            daily_stats.get("avg_daily_turnover_approx"), snapshot.get("turnover")
+        )
+        dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
+        dividend_consistency = 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0
+    else:
+        low_volatility = annualized_vol_from_rows(hist_rows)
+        liquidity = pit_liquidity(hist_rows, market_cap_cny)
+        price_asof = hist_closes[-1] if hist_closes else None
+        dividend_yield_5y = scale_ratio_to_pct(
+            dividend_yield(stock, years=5, as_of=as_of, price=price_asof)
+        )
+        dividend_consistency = 1.0 if consecutive_dividend_asof(stock, as_of) else 0.0
 
     return {
         "csi300_current": 1.0 if in_csi300 else 0.0,
         "csi300_persistence": persistence,
         "market_cap": market_cap_yi,
         "size_reversal": market_cap_yi,
-        "liquidity": first_not_none(
-            daily_stats.get("avg_daily_turnover_approx"), snapshot.get("turnover")
-        ),
-        "low_volatility": safe_float(daily_stats.get("volatility_annual")),
+        "liquidity": liquidity,
+        "low_volatility": low_volatility,
         "roe_mean": roe_mean,
         "roe_stability": roe_stability,
         "revenue_growth": scale_ratio_to_pct(compute_yoy_growth(income, "revenue")),
@@ -1039,7 +1281,7 @@ def compute_long_raw_factors(
         "net_margin": safe_float(latest_ind.get("net_margin")),
         "cashflow_quality": cash_quality,
         "dividend_yield_5y": dividend_yield_5y,
-        "dividend_consistency": 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0,
+        "dividend_consistency": dividend_consistency,
         "debt_safety": safe_float(latest_ind.get("asset_liability_ratio")),
         "pledge_safety": first_not_none(
             stock.get("pledge", {}).get("pledge_ratio"), snapshot.get("pledge_ratio")
@@ -1517,7 +1759,6 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     scoring_config["exclude_st"] = False
     scoring_config["min_market_cap_yi"] = 0
     scoring_config["min_listing_years"] = 0
-    scoring_config["min_csi300_persistence"] = 0
     scoring_config["require_csi300"] = False
     scoring_config["require_high_drawdown"] = False
     candidates, notes = build_long_candidates(scoring_config)
@@ -1754,4 +1995,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

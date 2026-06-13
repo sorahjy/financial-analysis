@@ -1,0 +1,169 @@
+<div class="page">
+  <header class="report-header">
+    <div>
+      <p class="eyebrow">financial-analysis</p>
+      <h1>基金量化指标报告</h1>
+    </div>
+    <p class="date">生成时间<strong>{{ report_view.generated_at }}</strong></p>
+  </header>
+
+  <div class="stat-grid">
+    <div class="stat-card">
+      <span>股票型基金</span>
+      <strong>{{ report_view.summary.equity_count }}</strong>
+    </div>
+    <div class="stat-card">
+      <span>债券型基金</span>
+      <strong>{{ report_view.summary.bond_count }}</strong>
+    </div>
+    <div class="stat-card">
+      <span>技术信号</span>
+      <strong>{{ report_view.summary.signal_count }}</strong>
+    </div>
+    <div class="stat-card signal-stat">
+      <span>买 / 卖 / 持有</span>
+      <strong><b class="buy-text">{{ report_view.summary.buy_count }}</b> / <b class="sell-text">{{ report_view.summary.sell_count }}</b> / {{ report_view.summary.hold_count }}</strong>
+    </div>
+  </div>
+
+  {% if report_view.manager_changes %}
+    <div class="status-banner alert">
+      近20天内以下基金经理发生变更：
+      <ul>
+        {% for item in report_view.manager_changes %}
+          <li>{{ item.code }} - {{ item.name }}</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% else %}
+    <div class="status-banner ok">近20天内列表中基金经理没有变更。</div>
+  {% endif %}
+
+  <div class="control-panel">
+    <div class="search-box">
+      <span class="search-icon">⌕</span>
+      <input id="fund-search" type="search" placeholder="搜索代码 / 名称 / 信号" autocomplete="off">
+    </div>
+    <div class="filter-group" aria-label="快速筛选">
+      <button type="button" class="filter-chip active" data-filter="all">全部</button>
+      <button type="button" class="filter-chip" data-filter="held">持仓</button>
+      <button type="button" class="filter-chip" data-filter="buy">买入</button>
+      <button type="button" class="filter-chip" data-filter="sell">卖出</button>
+    </div>
+    <div class="view-actions">
+      <button type="button" id="density-toggle" class="ghost-btn">紧凑</button>
+      <button type="button" id="top-button" class="ghost-btn">顶部</button>
+    </div>
+  </div>
+
+  {% for section in report_view.sections %}
+    <section class="report-section" data-section="{{ section.id }}">
+      <div class="section-head">
+        <h2>{{ section.title }}</h2>
+        <span><b class="visible-count">{{ section.total_count }}</b> / {{ section.total_count }} 只基金 · {{ section.benchmark_count }} 个基准</span>
+      </div>
+      <div class="table-wrapper">
+        <table class="metric-table" data-table-kind="metric">
+          <thead>
+            <tr>
+              <th class="sticky-col sticky-code"></th>
+              <th class="sticky-col sticky-name"></th>
+              <th></th>
+              {% for name in section.benchmark_names %}
+                <th colspan="{{ section.metric_count }}" class="benchmark-header">{{ name }}</th>
+              {% endfor %}
+            </tr>
+            <tr>
+              <th class="sticky-col sticky-code">代码</th>
+              <th class="sticky-col sticky-name">名字</th>
+              <th>管理规模(亿)</th>
+              {% for _name in section.benchmark_names %}
+                {% for label in report_view.period_labels %}
+                  <th>{{ label }}</th>
+                {% endfor %}
+              {% endfor %}
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in section.rows %}
+              <tr data-code="{{ row.code }}" data-name="{{ row.name }}" data-section="{{ section.id }}" data-held="{{ 1 if row.is_held else 0 }}">
+                <td class="sticky-col sticky-code code-cell{% if row.is_held %} held{% endif %}">{{ row.code }}</td>
+                <td class="sticky-col sticky-name name-cell">{{ row.name }}</td>
+                <td{% if row.asset_class %} class="{{ row.asset_class }}"{% endif %}>{{ row.total_asset }}</td>
+                {% for cells in row.benchmarks %}
+                  {% for cell in cells %}
+                    <td{% if cell[1] %} class="{{ cell[1] }}"{% endif %}>{{ cell[0] }}</td>
+                  {% endfor %}
+                {% endfor %}
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endfor %}
+
+  {% if report_view.signal_rows %}
+    <section class="report-section signal-section" data-section="signal">
+      <div class="section-head">
+        <h2>技术分析 - 多维买卖信号</h2>
+        <span><b class="visible-count">{{ report_view.signal_counts.total }}</b> / {{ report_view.signal_counts.total }} 只基金</span>
+      </div>
+      <div class="legend">
+        <span><svg width="20" height="10"><line x1="0" y1="5" x2="20" y2="5" stroke="#1890ff" stroke-width="1.5"/></svg> 净值</span>
+        <span><svg width="20" height="10"><line x1="0" y1="5" x2="20" y2="5" stroke="#faad14" stroke-width="1" stroke-dasharray="3,2"/></svg> MA5</span>
+        <span><svg width="20" height="10"><line x1="0" y1="5" x2="20" y2="5" stroke="#f5222d" stroke-width="1" stroke-dasharray="5,3"/></svg> MA20</span>
+        <span><svg width="20" height="10"><line x1="0" y1="5" x2="20" y2="5" stroke="#722ed1" stroke-width="1" stroke-dasharray="8,4"/></svg> MA60</span>
+        <span><svg width="20" height="10"><rect x="0" y="2" width="20" height="6" fill="#e6f0fa" opacity="0.7"/></svg> 布林带</span>
+        <span><svg width="14" height="12"><polygon points="7,1 2,11 12,11" fill="#f5222d" opacity="0.85"/></svg> 买入信号</span>
+        <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#52c41a" opacity="0.85"/></svg> 卖出信号</span>
+        <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#722ed1" opacity="0.85"/></svg> 止盈信号</span>
+      </div>
+      <p class="signal-note">{{ report_view.signal_note|safe }}</p>
+      <div class="table-wrapper">
+        <table class="signal-table">
+          <thead>
+            <tr>
+              <th>代码</th>
+              <th>名字</th>
+              <th>净值</th>
+              <th>近5年走势</th>
+              <th>MA(5/20)</th>
+              <th>RSI(14)</th>
+              <th>MACD</th>
+              <th>KDJ(交叉/J值)</th>
+              <th>布林带</th>
+              <th>ADX(14)</th>
+              <th>ATR%</th>
+              <th>百分位（近6年）</th>
+              <th>趋势60</th>
+              <th>评分</th>
+              <th>建议</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for row in report_view.signal_rows %}
+              <tr data-code="{{ row.code }}" data-name="{{ row.name }}" data-section="signal" data-held="{{ 1 if row.is_held else 0 }}" data-signal="{{ row.signal_state }}">
+                <td class="code-cell">{{ row.code }}</td>
+                <td class="name-cell">{{ row.name }}</td>
+                <td>{{ row.display.nav|safe }}</td>
+                <td class="chart-cell">{{ row.display.sparkline|safe }}</td>
+                <td>{{ row.display.ma|safe }}</td>
+                <td>{{ row.display.rsi|safe }}</td>
+                <td>{{ row.display.macd|safe }}</td>
+                <td>{{ row.display.kdj|safe }}</td>
+                <td>{{ row.display.boll|safe }}</td>
+                <td>{{ row.display.adx|safe }}</td>
+                <td>{{ row.display.atr|safe }}</td>
+                <td>{{ row.display.percentile|safe }}</td>
+                <td>{{ row.display.trend|safe }}</td>
+                <td>{{ row.display.score|safe }}</td>
+                <td>{{ row.display.advice|safe }}</td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </section>
+  {% endif %}
+</div>

@@ -1,0 +1,47 @@
+{% extends "base.html" %}
+
+{% block title %}基金报告 - financial-analysis{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="{{ url_for('static', filename='css/fund-report.css') }}">
+{% endblock %}
+
+{% block content %}
+<section class="fund-command-bar" data-fund-status>
+  <div class="fund-command-meta">
+    <span>数据基于 <b data-field="data-updated">{{ report.updated_at or signals.updated_at or "未生成" }}</b></span>
+    <span>任务 <b data-field="job-state">空闲</b></span>
+  </div>
+  <div class="action-row">
+    <button class="btn primary" type="button" data-post-url="{{ url_for('fund.refresh_fund_report') }}">刷新数据</button>
+  </div>
+</section>
+
+<section class="fund-job-log" data-fund-log hidden>
+  <div class="fund-job-log-head">
+    <div>
+      <span>运行日志</span>
+      <b data-field="job-command">未启动</b>
+    </div>
+    <span data-field="log-count">0 行</span>
+  </div>
+  <pre data-field="job-log">等待刷新任务输出...</pre>
+</section>
+
+<section class="fund-native-panel">
+  {% if report_view.exists %}
+    <div id="fund-native-report" class="fund-native">
+      {% include "fund/report_body.html" %}
+    </div>
+  {% else %}
+    <div class="empty-state">
+      <h2>报告尚未生成</h2>
+      <p>{{ report_view.error or "请先点击刷新数据按钮！首次运行花费时间会比较久请耐心等待..." }}</p>
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
+
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/fund-report.js') }}"></script>
+{% endblock %}

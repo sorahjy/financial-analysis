@@ -1,8 +1,8 @@
 # financial-analysis
 
-一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。
+一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1
+当前版本：v3.1.1
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -37,14 +37,16 @@
 
 ## 2. 功能概览
 
+所有模块统一在一个本地 Flask 工作台中运行：`python run.py --port 8765`。首页 `/` 是工作台入口，`/fund` 查看基金报告，`/stock` 进入 A 股策略台，数据抓取与策略计算仍由独立脚本完成（见 [7. 常用命令](#7-常用命令)）。
+
 | 模块 | 解决的问题 | 主要输出 |
 | --- | --- | --- |
-| 基金超额收益报告 | 对持仓基金和关注基金做跨周期超额收益比较，并提示基金经理变动 | `fund_report.html` |
+| 基金超额收益报告 | 对持仓基金和关注基金做跨周期超额收益比较，并提示基金经理变动 | `data/fund_report_data.json`（Flask `/fund` 页面渲染） |
 | 基金技术分析 | 结合 MA、RSI、MACD、KDJ、布林带、ADX、ATR、百分位和止盈逻辑生成买卖信号 | `data/signals.json` |
 | A 股长线策略 | 面向 2-5 年持有期，筛选质量、价值、盈利、低波、反转/动量等多因子候选 | `data/stock_advanced_strategy_results.json` |
 | A 股短线策略 | 面向 1-5 个交易日，围绕龙虎榜、游资席位、机构共振、价量和风控因子选股 | 同上 |
 | 参数搜索 | 对长线/短线策略做随机搜索和代理回测，写入优化后的默认参数 | `data/stock_strategy_optimized_config.json` |
-| 策略配置台 | 在本地网页中调参、运行、保存配置、查看入选股票和关键因子 | `http://127.0.0.1:8765` |
+| 统一 Flask 工作台 | 在本地网页中查看基金报告、调参运行 A 股策略、保存配置、查看入选股票和关键因子 | `python run.py --port 8765`（`/`、`/fund`、`/stock`） |
 | 游资雷达 | 实验性识别盘中拉升票和盘后潜伏吸筹票，并支持命中率验证 | `data/capital/hot_money_*.json` |
 
 ## 3. 快速开始
@@ -53,27 +55,9 @@
 pip install -r requirements.txt
 ```
 
-首次使用建议先刷新股票数据和默认参数：
+### 3.1 基金分析
 
-```bash
-python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
-python stock_strategy_optimizer.py --iterations 100
-python stock_strategy_dashboard.py --port 8765 --skip-refresh
-```
-
-后续直接使用以下命令启动本地服务即可，数据会自动刷新：
-
-```bash
-python stock_strategy_dashboard.py --port 8765
-```
-
-打开：
-
-```text
-http://127.0.0.1:8765
-```
-
-基金报告可以直接运行：
+基金分析报告可以直接运行：
 
 ```bash
 bash fund_run.sh
@@ -85,9 +69,32 @@ bash fund_run.sh
 FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
 ```
 
+### 3.2 A股策略平台
+
+首次使用建议先刷新股票数据和默认参数：
+
+```bash
+python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
+python stock_strategy_optimizer.py --iterations 200
+python run.py --port 8765
+```
+
+后续直接使用以下命令启动统一 Flask 工作台即可：
+
+```bash
+python run.py --port 8765
+```
+
+打开：
+
+```text
+http://127.0.0.1:8765
+```
+
+
 ## 4. 基金分析
 
-基金模块从天天基金等数据源抓取基金基础信息、历史净值和实时估算，生成一个可直接打开的 HTML 报告。报告重点不是单只基金的绝对涨跌，而是把基金与指定基准做多周期超额收益比较。
+基金模块从天天基金等数据源抓取基金基础信息、历史净值和实时估算，生成结构化报告数据 `data/fund_report_data.json`，由 Flask 工作台的 `/fund` 页面渲染。报告重点不是单只基金的绝对涨跌，而是把基金与指定基准做多周期超额收益比较。
 
 ### 4.1 能看什么
 
@@ -101,10 +108,9 @@ FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
 ### 4.2 相关文件
 
 - `funds.py`：配置基金列表、持仓列表和比较基准。
-- `fund_fetch_nav_history.py`：增量抓取历史净值。
-- `fund_fetch_realtime_estimate.py`：抓取实时估算。
+- `fund_fetch_data.py`：统一抓取历史净值和实时估算。
 - `fund_technical_analysis.py`：生成技术指标和买卖信号。
-- `fund_generate_output.py`：生成 `fund_report.html`。
+- `fund_generate_output.py`：生成 `data/fund_report_data.json`（HTML 由 Flask `/fund` 页面渲染）。
 - `fund_backtest.py`：基金买卖信号的回测逻辑。
 
 ## 5. A 股策略平台
@@ -133,14 +139,16 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 
 ### 5.3 参数搜索与可视化
 
-`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。v3.1 加强了长线 walk-forward 验证：使用多年日线数据做分折回测，按训练/验证折观察超额收益、胜率、最差折和稳健性，减少只靠近期样本过拟合。
+`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。组合等权收益减成本减同期 510310 沪深300ETF累计净值基准得到每折超额，折再奇偶切成训练/验证两半，选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、折数不足和验证折为负；有效折数过少的配置会出局，避免少数折的彩票式配置夺魁。
+
+> 注意：受本地约 10 年日线与 510310 基准覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 200 次，通常约 1 分钟内完成。
 
 Dashboard 支持：
 
 - 长线/短线 tabs 切换。
 - 调整硬过滤参数、因子权重、输出数量和最低分。
 - 运行策略、保存配置、重置参数。
-- 直接触发 100 次参数搜索，并查看后台搜索状态。
+- 直接触发 200 次参数搜索，并查看后台搜索状态。
 - 展示候选数、入选数、平均分、分数区间、数据覆盖率、筛选解释和主要因子贡献。
 
 ## 6. 游资雷达
@@ -197,12 +205,11 @@ python stock_data_refresh.py --mode capital-only --timeout 1800
 ### 7.3 股票策略
 
 ```bash
-python stock_strategy_dashboard.py --port 8765
-python stock_strategy_dashboard.py --port 8765 --skip-refresh
+python run.py --port 8765
 python stock_advanced_strategies.py --persist
 python stock_advanced_strategies.py --strategy long --json
 python stock_advanced_strategies.py --strategy short --json
-python stock_strategy_optimizer.py --iterations 100
+python stock_strategy_optimizer.py --iterations 200
 ```
 
 ### 7.4 验证
@@ -219,10 +226,10 @@ python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies
 
 | 文件 | 说明 |
 | --- | --- |
-| `fund_report.html` | 基金超额收益和技术信号报告 |
-| `stock_report.html` | 股票分析报告 |
+| `data/fund_report_data.json` | 基金超额收益和技术信号报告数据，由 Flask `/fund` 页面渲染（生成物，不入库） |
 | `data/signals.json` | 基金技术信号 |
 | `data/nav_history.json` / `data/nav_store.json` | 基金历史净值缓存 |
+| `data/realtime_estimate.json` | 基金实时估算缓存 |
 | `data/stock_advanced_strategy_results.json` | A 股长线/短线策略结果 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
 | `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数 |
@@ -235,10 +242,12 @@ python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies
 
 ```text
 .
+├── app/                           # Flask 统一工作台、路由、模板和静态资源
+├── run.py                         # Flask 本地启动入口
 ├── fund_*.py                     # 基金数据、技术分析、回测和报告生成
 ├── funds.py                      # 基金列表和基准配置
 ├── stock_advanced_strategies.py   # A 股长线/短线策略引擎
-├── stock_strategy_dashboard.py    # 本地策略配置台
+├── stock_strategy_dashboard.py    # 兼容旧命令的启动壳，委托给 run.py
 ├── stock_strategy_optimizer.py    # 参数搜索和代理回测
 ├── stock_data_refresh.py          # 股票数据刷新编排
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
@@ -307,8 +316,15 @@ python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies
 优化基金报告链路：移除 Excel 输出和 openpyxl 依赖，报告统一输出为 `fund_report.html`；增强 `fund_run.sh` 失败即停和境内数据源直连能力；基金净值、实时估值与天天基金爬虫增加重试、原子写入和空数据保护，避免失败数据覆盖历史结果；修正回测卖出份额、基金经理规模缺失展示、实时估算累计净值计算、百分位排名和短历史基金信号评估逻辑；移除重复的股票独立说明文档；同步刷新基金报告。
 
 #### Update v3.1  2026.6.13
-新增实验性游资雷达，支持盘中拉升扫描、盘后潜伏吸筹扫描、命中率验证和潜伏回放；扩展长线/短线因子库，引入更多质量、价值、反转、动量、换手、Piotroski F 分、龙虎榜买方主导和流通市值归一等因子；增强长线参数搜索的 walk-forward 训练/验证框架；Dashboard 新增后台参数搜索入口与状态查询；美化基金 HTML 报告主题、排版、表格留白和响应式滚动体验。
+新增实验性游资雷达，支持盘中拉升扫描、盘后潜伏吸筹扫描、命中率验证和潜伏回放；扩展长线/短线因子库，引入更多质量、价值、反转、动量、换手、Piotroski F 分、龙虎榜买方主导和流通市值归一等因子；将长线参数搜索升级为 Point-in-Time (PIT) walk-forward 回测（财报按法定披露截止日、价格/估值/分红按当时可见切片重算因子），消除前视偏差，并把财报历史加深到 10 年；Dashboard 新增后台参数搜索入口与状态查询；美化基金 HTML 报告主题、排版、表格留白和响应式滚动体验。
+
+#### Update v3.1.1  2026.6.13
+优化长线策略参数搜索与报告展示：510310 沪深300ETF 基准纳入股票数据刷新流程并扩展到近 12 年，长线默认输出数量固定为 10、默认搜索次数调整为 200，回测折起点间隔改为 30 个交易日，并生成每折组合走势与 510310 基准对比图；补充真实净值曲线最大回撤与基准最大回撤，`worst_fold_pct` 更名为 `worst_fold_excess_pct` 以避免与净值回撤混淆；移除“成分稳定分”硬过滤，仅保留沪深300稳定代理因子参与打分，避免与“必须当前沪深300”逻辑重叠；继续优化基金 HTML 报告的深色主题、筛选、排序和持仓过滤体验，移除强/弱超额筛选项并修复持仓筛选影响技术分析展示的问题。将基金报告与 A 股策略台统一到单一 Flask 工作台（`python run.py --port 8765`，路由 `/`、`/fund`、`/stock`），基金报告改为 `data/fund_report_data.json` 经 Flask 服务端渲染；清理迁移后的冗余——删除独立 HTML 报告链（`stock_generate_output.py` / `stock_report.html` / `stock_run.sh` / `fund_report.html`）与 `stock_crawl_top_800_data.py` 中已无消费者的回撤选股、选股回测代码（保留 510310 沪深300 ETF 基准），去重 `file_status`、合并 Flask 启动器、清理死配置，生成物 HTML 不再入库；基金净值与实时估值抓取脚本合并为单一 `fund_fetch_data.py`；新增 MIT LICENSE。
 
 ## 12. Acknowledgment
 
 感谢东方财富、新浪财经、腾讯财经、百度、同花顺、AkShare 以及相关公开数据源。爱您们，感恩！
+
+## 13. License
+
+本项目基于 [MIT License](LICENSE) 开源，详见仓库根目录的 `LICENSE` 文件。

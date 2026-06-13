@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}financial-analysis{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  {% block head %}{% endblock %}
+</head>
+<body>
+  <div class="app-shell">
+    <header class="app-topbar">
+      <a class="brand" href="{{ url_for('home.index') }}">financial-analysis</a>
+      <nav class="main-nav" aria-label="主导航">
+        <a href="{{ url_for('fund.fund_page') }}">基金报告</a>
+        <a href="{{ url_for('stock.stock_page') }}">A股策略</a>
+      </nav>
+    </header>
+    <main class="app-main">
+      {% block content %}{% endblock %}
+    </main>
+  </div>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

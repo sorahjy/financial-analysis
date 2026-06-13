@@ -27,7 +27,6 @@ if [ -d "$CACHE_DIR" ]; then
 fi
 
 scrapy crawl jijin
-python fund_fetch_nav_history.py
-python fund_fetch_realtime_estimate.py
+python fund_fetch_data.py
 python fund_technical_analysis.py
 python fund_generate_output.py

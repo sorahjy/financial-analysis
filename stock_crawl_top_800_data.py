@@ -10,8 +10,7 @@
 并发: 默认6线程，可通过 STOCK_THREAD_COUNT 环境变量调整
 
 附带:
-  - select_by_drawdown(): 高位回撤+市值+估值选股，结果供 stock_generate_output.py 出报告
-  - --backtest-drawdown: 上述选股的滚动超额收益回测（原 stock_backtest.py 并入）
+  - fetch_csi300_etf(): 爬取 510310 沪深300 ETF 累计净值作为基准，供数据刷新的基准对比
 """
 
 import json
@@ -19,7 +18,6 @@ import math
 import os
 import random
 import re
-import shutil
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -439,263 +437,59 @@ def process_stock(code, name, idx, total):
     )
 
 
-# ─── 选股分析 ─────────────────────────────────────────────────
-
-def _visual_width(s):
-    """字符串在终端的显示宽度：东亚全/宽字符计 2，其他计 1"""
-    import unicodedata
-    return sum(2 if unicodedata.east_asian_width(c) in ("F", "W") else 1 for c in str(s))
-
-
-def _pad_visual(s, width):
-    """按显示宽度在右侧补空格，使不同中英文长度的列能对齐"""
-    s = str(s)
-    return s + " " * max(0, width - _visual_width(s))
-
-
-def select_by_drawdown(start_time=None, max_drawdown_pct=40,
-                       min_market_cap=500, max_market_cap=None,
-                       max_pb=8, filter_negative_pe=True,
-                       print_details=True, persist=True):
-    """扫描 data/CN_stock/ 下所有股票，选出同时满足：
-       (1) [start_time-2年, start_time] 窗口内最高收盘价 → start_time 当日收盘价的
-           跌幅 > `max_drawdown_pct`
-       (2) 市值（亿元）区间 `(min_market_cap, max_market_cap)`；任一端为 None 表示不限
-       (3) PB < `max_pb`
-       (4) 若 `filter_negative_pe=True`，剔除 PE(TTM) 为负的股票
-       的股票；按跌幅降序打印 代码/名称/跌幅/市值/PE(TTM)/PB。
-
-    Args:
-        start_time: 窗口右端（'YYYY-MM-DD' 字符串或 datetime 对象），默认今天。
-        max_drawdown_pct: 跌幅阈值（百分比），默认 40。
-        min_market_cap: 市值下限（亿元），默认 500。None 表示不设下限。
-        max_market_cap: 市值上限（亿元），默认 None 表示不设上限。
-        max_pb: PB 上限，默认 8。PB 缺失的股票会被过滤掉。
-        filter_negative_pe: 默认 True，过滤 PE(TTM) 为负的股票。
-        print_details: 默认 True，在终端打印完整选股明细表；
-            False 时只打印新增/保留/删除的 diff 摘要。
-
-    Returns:
-        list[dict]: 命中股票列表，按跌幅从大到小排序。
-    """
-    if start_time is None:
-        start_time = datetime.now().strftime("%Y-%m-%d")
-    elif isinstance(start_time, datetime):
-        start_time = start_time.strftime("%Y-%m-%d")
-
-    window_start = (datetime.strptime(start_time, "%Y-%m-%d")
-                    - timedelta(days=365 * 2)).strftime("%Y-%m-%d")
-
-    selected = []
-    for fp in sorted(DATA_DIR.glob("CN_*.json")):
-        try:
-            with open(fp, encoding="utf-8") as f:
-                data = json.load(f)
-        except (json.JSONDecodeError, OSError):
-            continue
-
-        records = data.get("records", [])
-        window = [r for r in records if window_start <= r["date"] <= start_time]
-        closes = [r.get("close") for r in window if r.get("close") is not None]
-        if len(closes) < 2:
-            continue
-
-        # 窗口最高价 → 窗口末端价 的跌幅
-        peak = max(closes)
-        end_price = closes[-1]
-        if peak <= 0:
-            continue
-        dd_pct = (peak - end_price) / peak * 100
-
-        if dd_pct <= max_drawdown_pct:
-            continue
-
-        # 窗口内最新一条带 PE(TTM) / PB / market_cap 的记录（各字段独立取最新）
-        pe = pb = mc = None
-        for r in reversed(window):
-            if pe is None and r.get("pe_ttm") is not None:
-                pe = r["pe_ttm"]
-            if pb is None and r.get("pb") is not None:
-                pb = r["pb"]
-            if mc is None and r.get("market_cap") is not None:
-                mc = r["market_cap"]
-            if pe is not None and pb is not None and mc is not None:
-                break
-
-        # 市值区间过滤：下限/上限任一为 None 表示不限
-        if min_market_cap is not None and (mc is None or mc <= min_market_cap):
-            continue
-        if max_market_cap is not None and (mc is None or mc >= max_market_cap):
-            continue
-        # PB 过滤（缺失视为不合格）
-        if pb is None or pb >= max_pb:
-            continue
-        # 负 PE 过滤（缺失不过滤）
-        if filter_negative_pe and pe is not None and pe < 0:
-            continue
-
-        selected.append({
-            "code": data.get("symbol", ""),
-            "name": data.get("name", ""),
-            "drop_from_peak": round(dd_pct, 2),
-            "peak": round(peak, 2),
-            "end_price": round(end_price, 2),
-            "market_cap": mc,
-            "pe_ttm": pe,
-            "pb": pb,
-        })
-
-    selected.sort(key=lambda x: -x["drop_from_peak"])
-
-    # 回测等场景下禁用持久化与终端输出
-    if not persist:
-        return selected
-
-    out_fp = DATA_DIR / "selected_stocks.json"
-    backup_fp = DATA_DIR / "selected_stocks_old.json"
-    out_fp.parent.mkdir(parents=True, exist_ok=True)
-
-    # 读取旧选股并计算 diff
-    old_stocks = []
-    if out_fp.exists():
-        try:
-            with open(out_fp, encoding="utf-8") as f:
-                old_stocks = json.load(f).get("stocks", [])
-        except (json.JSONDecodeError, OSError):
-            old_stocks = []
-    old_by_code = {s.get("code", ""): s for s in old_stocks}
-    new_by_code = {s["code"]: s for s in selected}
-    old_codes = set(old_by_code)
-    new_codes = set(new_by_code)
-    added_codes = new_codes - old_codes
-    removed_codes = old_codes - new_codes
-    kept_codes = new_codes & old_codes
-
-    # 备份旧文件再写新文件
-    if out_fp.exists():
-        shutil.copy2(out_fp, backup_fp)
-
-    with open(out_fp, "w", encoding="utf-8") as f:
-        json.dump({
-            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "params": {
-                "start_time": start_time,
-                "window_start": window_start,
-                "max_drawdown_pct": max_drawdown_pct,
-                "min_market_cap": min_market_cap,
-                "max_market_cap": max_market_cap,
-                "max_pb": max_pb,
-                "filter_negative_pe": filter_negative_pe,
-            },
-            "count": len(selected),
-            "stocks": selected,
-        }, f, ensure_ascii=False, indent=2)
-
-    # 终端对齐输出
-    mc_desc_parts = []
-    if min_market_cap is not None:
-        mc_desc_parts.append(f"市值>{min_market_cap}亿")
-    if max_market_cap is not None:
-        mc_desc_parts.append(f"市值<{max_market_cap}亿")
-    mc_desc = " 且 ".join(mc_desc_parts) if mc_desc_parts else "市值不限"
-    pe_desc = " 且 排除负PE" if filter_negative_pe else ""
-    print("=" * 80)
-    print(f"  近2年高点→{start_time} 跌幅 > {max_drawdown_pct}% "
-          f"且 {mc_desc} 且 PB<{max_pb}{pe_desc} 的股票")
-    print(f"  窗口 {window_start} ~ {start_time} · 命中 {len(selected)} 只")
-    print("=" * 80)
-
-    # Diff 摘要（对比上次 selected_stocks.json）
-    print(
-        f"变化：新增 {len(added_codes)} · 保留 {len(kept_codes)} · 删除 {len(removed_codes)}"
-    )
-    if added_codes:
-        added_items = sorted(
-            (new_by_code[c] for c in added_codes),
-            key=lambda x: -x["drop_from_peak"],
-        )
-        print("  [新增]")
-        for s in added_items:
-            print(f"    + {s['code']} {s['name']}  跌幅 {s['drop_from_peak']:.2f}%")
-    if removed_codes:
-        removed_items = sorted(
-            (old_by_code[c] for c in removed_codes),
-            key=lambda x: -x.get("drop_from_peak", 0),
-        )
-        print("  [删除]")
-        for s in removed_items:
-            dd = s.get("drop_from_peak")
-            dd_s = f"{dd:.2f}%" if isinstance(dd, (int, float)) else "N/A"
-            print(f"    - {s.get('code','')} {s.get('name','')}  上次跌幅 {dd_s}")
-    print("-" * 80)
-
-    if print_details:
-        header = (
-            _pad_visual("代码", 8)
-            + _pad_visual("名称", 14)
-            + _pad_visual("跌幅%", 10)
-            + _pad_visual("市值(亿)", 14)
-            + _pad_visual("PE(TTM)", 12)
-            + _pad_visual("PB", 8)
-        )
-        print(header)
-        print("-" * 80)
-        for s in selected:
-            pe_s = f"{s['pe_ttm']:.2f}" if s["pe_ttm"] is not None else "N/A"
-            pb_s = f"{s['pb']:.2f}" if s["pb"] is not None else "N/A"
-            mc_s = f"{s['market_cap']:.2f}" if s["market_cap"] is not None else "N/A"
-            dd_s = f"{s['drop_from_peak']:.2f}"
-            line = (
-                _pad_visual(s["code"], 8)
-                + _pad_visual(s["name"], 14)
-                + _pad_visual(dd_s, 10)
-                + _pad_visual(mc_s, 14)
-                + _pad_visual(pe_s, 12)
-                + _pad_visual(pb_s, 8)
-            )
-            print(line)
-
-    return selected
-
-
-# ─── 选股策略超额收益回测（原 stock_backtest.py 并入）─────────
+# ─── 沪深300 ETF 基准 ─────────────────────────────────────────
 #
-# 流程：
-#   1. 用 510310（华泰柏瑞沪深300ETF）作为沪深300近似基准，爬近5年日频
-#      累计净值，持久化到 data/csi300_etf_nav.json。
-#   2. 在 [今天-3年, 今天-0.5年] 区间按 step_days 滚动取时间点 t，对每个 t
-#      调用 select_by_drawdown(start_time=t, persist=False) 拿到选股结果。
-#   3. 等权买入持有 hold_days 天，计算组合收益率、同期沪深300收益率、超额收益。
-#   4. 打印逐期明细并给出平均超额收益。
-#
-# 运行: python stock_crawl_top_800_data.py --backtest-drawdown
+# 用 510310（华泰柏瑞沪深300ETF）作为沪深300近似基准，爬近12年日频累计净值，
+# 持久化到 data/csi300_etf_nav.json。由 stock_data_refresh 的基准对比步骤调用。
 
 CSI300_ETF_CODE = "510310"
-CSI300_FILE = Path("data/csi300_etf_nav.json")
-
-BT_HOLD_DAYS = 182                     # 持有约半年
-BT_STEP_DAYS = 30                      # 回测时间点间隔（约每月1次）
-BT_LOOKBACK_MIN_DAYS = int(365 * 0.5)  # 最近端：半年前（留出持有期）
-BT_LOOKBACK_MAX_DAYS = 365 * 3         # 最远端：3年前
+CSI300_ETF_YEARS = 12
+CSI300_FILE = Path(__file__).resolve().parent / "data" / "csi300_etf_nav.json"
 
 
-def fetch_csi300_etf(years=5):
+def fetch_csi300_etf(years=CSI300_ETF_YEARS):
     """爬取 510310 近 N 年累计净值并持久化，返回 records 列表"""
     # 基金净值爬取/合并工具在 fund 侧，延迟导入避免常规爬取路径背上依赖
-    from fund_fetch_nav_history import fetch_range, merge_records as merge_nav_records
+    from fund_fetch_data import fetch_range, merge_records as merge_nav_records
 
     CSI300_FILE.parent.mkdir(parents=True, exist_ok=True)
 
     existing = []
     if CSI300_FILE.exists():
         with open(CSI300_FILE, encoding="utf-8") as f:
-            existing = json.load(f).get("records", [])
+            existing = [
+                r for r in json.load(f).get("records", [])
+                if isinstance(r, dict) and r.get("date")
+            ]
+            existing.sort(key=lambda r: r["date"])
 
     today = datetime.now().strftime("%Y-%m-%d")
     start = (datetime.now() - timedelta(days=365 * years + 10)).strftime("%Y-%m-%d")
 
-    safe_print(f"[沪深300] 爬取 {CSI300_ETF_CODE} {start} ~ {today} …")
-    rows = fetch_range(CSI300_ETF_CODE, start, today)
+    rows = []
+    if not existing:
+        safe_print(f"[沪深300] 首次爬取 {CSI300_ETF_CODE} {start} ~ {today} …")
+        rows.extend(fetch_range(CSI300_ETF_CODE, start, today))
+    else:
+        first_date = existing[0]["date"]
+        last_date = existing[-1]["date"]
+        if first_date > start:
+            before_first = (
+                datetime.strptime(first_date, "%Y-%m-%d") - timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            if start <= before_first:
+                safe_print(f"[沪深300] 补前段 {CSI300_ETF_CODE} {start} ~ {before_first} …")
+                rows.extend(fetch_range(CSI300_ETF_CODE, start, before_first))
+        if last_date < today:
+            after_last = (
+                datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
+            ).strftime("%Y-%m-%d")
+            if after_last <= today:
+                safe_print(f"[沪深300] 补后段 {CSI300_ETF_CODE} {after_last} ~ {today} …")
+                rows.extend(fetch_range(CSI300_ETF_CODE, after_last, today))
+        if not rows:
+            safe_print(f"[沪深300] 已覆盖 {CSI300_ETF_CODE} {first_date} ~ {last_date}")
+
     merged = merge_nav_records(existing, rows)
 
     if not merged:
@@ -704,6 +498,7 @@ def fetch_csi300_etf(years=5):
     with open(CSI300_FILE, "w", encoding="utf-8") as f:
         json.dump({
             "code": CSI300_ETF_CODE,
+            "target_years": years,
             "start_date": merged[0]["date"],
             "end_date": merged[-1]["date"],
             "records": merged,
@@ -711,139 +506,6 @@ def fetch_csi300_etf(years=5):
 
     safe_print(f"[沪深300] 共 {len(merged)} 条（{merged[0]['date']} ~ {merged[-1]['date']}）")
     return merged
-
-
-def _load_csi300_series():
-    """返回按日期排序的 [(date, nav_acc)]"""
-    with open(CSI300_FILE, encoding="utf-8") as f:
-        records = json.load(f)["records"]
-    series = []
-    for r in records:
-        try:
-            nav = float(r.get("nav_acc"))
-        except (TypeError, ValueError):
-            continue
-        series.append((r["date"], nav))
-    series.sort(key=lambda x: x[0])
-    return series
-
-
-_bt_stock_cache = {}
-
-
-def _load_stock_series(code, name):
-    """返回按日期排序的 [(date, close)]，带缓存。"""
-    key = (code, name)
-    if key in _bt_stock_cache:
-        return _bt_stock_cache[key]
-    fp = find_stock_file(code, name)
-    if fp is None:
-        _bt_stock_cache[key] = []
-        return []
-    with open(fp, encoding="utf-8") as f:
-        data = json.load(f)
-    series = []
-    for r in data.get("records", []):
-        c = r.get("close")
-        if c is not None:
-            series.append((r["date"], c))
-    series.sort(key=lambda x: x[0])
-    _bt_stock_cache[key] = series
-    return series
-
-
-def _price_on_or_before(series, target_date):
-    """series 是升序 [(date, value)]。返回 date<=target 的最后一条 value；没有则 None。"""
-    if not series:
-        return None
-    for d, v in reversed(series):
-        if d <= target_date:
-            return v
-    return None
-
-
-def _portfolio_return(selected, t_str, hold_end_str):
-    """等权组合在 [t_str, hold_end_str] 的收益率。返回 (ret, 有效数)"""
-    rets = []
-    for s in selected:
-        series = _load_stock_series(s["code"], s["name"])
-        p0 = _price_on_or_before(series, t_str)
-        p1 = _price_on_or_before(series, hold_end_str)
-        if p0 is None or p1 is None or p0 <= 0:
-            continue
-        rets.append(p1 / p0 - 1)
-    if not rets:
-        return None, 0
-    return sum(rets) / len(rets), len(rets)
-
-
-def _benchmark_return(series, t_str, hold_end_str):
-    p0 = _price_on_or_before(series, t_str)
-    p1 = _price_on_or_before(series, hold_end_str)
-    if p0 is None or p1 is None or p0 <= 0:
-        return None
-    return p1 / p0 - 1
-
-
-def backtest_drawdown(step_days=BT_STEP_DAYS, hold_days=BT_HOLD_DAYS):
-    """select_by_drawdown 选股的滚动超额收益回测（对比沪深300 ETF）。"""
-    fetch_csi300_etf(years=5)
-    csi = _load_csi300_series()
-
-    today = datetime.now().date()
-    t_start = today - timedelta(days=BT_LOOKBACK_MAX_DAYS)
-    t_end = today - timedelta(days=BT_LOOKBACK_MIN_DAYS)
-
-    print(
-        f"\n回测区间: {t_start} ~ {t_end} · "
-        f"步长 {step_days} 天 · 持有 {hold_days} 天\n"
-    )
-    print(
-        f"{'日期':<12}{'选股数':>6}{'有效数':>6}"
-        f"{'组合收益':>12}{'沪深300':>12}{'超额':>10}"
-    )
-    print("-" * 60)
-
-    excess_list = []
-    t = t_start
-    while t <= t_end:
-        t_str = t.strftime("%Y-%m-%d")
-        hold_end_str = (t + timedelta(days=hold_days)).strftime("%Y-%m-%d")
-
-        selected = select_by_drawdown(start_time=t_str, persist=False)
-        if not selected:
-            print(f"{t_str:<12}{'0':>6}{'-':>6}{'未选出':>12}")
-            t += timedelta(days=step_days)
-            continue
-
-        port_ret, n_eff = _portfolio_return(selected, t_str, hold_end_str)
-        bench_ret = _benchmark_return(csi, t_str, hold_end_str)
-
-        if port_ret is None or bench_ret is None:
-            print(f"{t_str:<12}{len(selected):>6}{n_eff:>6}{'价格缺失':>12}")
-            t += timedelta(days=step_days)
-            continue
-
-        excess = port_ret - bench_ret
-        excess_list.append(excess)
-        print(
-            f"{t_str:<12}{len(selected):>6}{n_eff:>6}"
-            f"{port_ret*100:>+11.2f}%{bench_ret*100:>+11.2f}%"
-            f"{excess*100:>+9.2f}%"
-        )
-        t += timedelta(days=step_days)
-
-    print("-" * 60)
-    if excess_list:
-        avg = sum(excess_list) / len(excess_list)
-        win = sum(1 for e in excess_list if e > 0)
-        print(
-            f"样本数 {len(excess_list)} · 胜率 {win}/{len(excess_list)} "
-            f"({win/len(excess_list)*100:.1f}%) · "
-            f"平均超额收益 {avg*100:+.2f}%"
-        )
-    else:
-        print("无有效样本")
 
 
 # ─── 主流程 ───────────────────────────────────────────────────
@@ -888,16 +550,6 @@ def main():
 
 
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="中证800历史数据爬取 / 回撤选股 / 选股回测")
-    parser.add_argument("--backtest-drawdown", action="store_true",
-                        help="只运行 select_by_drawdown 的滚动超额收益回测（原 stock_backtest.py）")
-    args = parser.parse_args()
-
-    if args.backtest_drawdown:
-        backtest_drawdown()
-    else:
-        failed_stocks = main()
-        select_by_drawdown()
-        if failed_stocks:
-            raise SystemExit(1)
+    failed_stocks = main()
+    if failed_stocks:
+        raise SystemExit(1)

@@ -1,0 +1,35 @@
+{% extends "base.html" %}
+
+{% block title %}工作台 - financial-analysis{% endblock %}
+
+{% block content %}
+<section class="page-head">
+  <div>
+    <p class="eyebrow">Workspace</p>
+    <h1>金融量化工作台</h1>
+  </div>
+</section>
+
+<section class="module-grid">
+  <a class="module-card" href="{{ url_for('fund.fund_page') }}">
+    <span class="module-type">基金</span>
+    <strong>技术分析报告</strong>
+    <dl>
+      <dt>报告</dt>
+      <dd>{{ fund_report.updated_at or "未生成" }}</dd>
+      <dt>大小</dt>
+      <dd>{{ fund_report.size_kb or "-" }} KB</dd>
+    </dl>
+  </a>
+  <a class="module-card" href="{{ url_for('stock.stock_page') }}">
+    <span class="module-type">股票</span>
+    <strong>A股策略配置台</strong>
+    <dl>
+      <dt>策略结果</dt>
+      <dd>{{ stock_result.updated_at or "未生成" }}</dd>
+      <dt>优化参数</dt>
+      <dd>{{ optimized_config.updated_at or "未生成" }}</dd>
+    </dl>
+  </a>
+</section>
+{% endblock %}

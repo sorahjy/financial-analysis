@@ -1,0 +1,72 @@
+<div class="app">
+    <aside>
+      <div class="side-sticky">
+        <div class="topbar">
+          <h1>A股策略配置台</h1>
+          <span id="status" class="status">启动中</span>
+        </div>
+        <div class="tabs">
+          <button id="tab-long" class="tab active" type="button">长线</button>
+          <button id="tab-short" class="tab" type="button">短线</button>
+        </div>
+        <div class="toolbar">
+          <button id="run" class="btn primary" type="button">运行</button>
+          <button id="save" class="btn" type="button">保存配置</button>
+          <button id="reset" class="btn" type="button">重置</button>
+          <button id="optimize" class="btn" type="button">搜索参数</button>
+          <button id="refresh-data" class="btn" type="button">刷新数据</button>
+          <label class="toggle"><input id="auto" type="checkbox" checked>实时</label>
+        </div>
+        <div class="data-refresh-meta">
+          <span>数据刷新</span>
+          <strong id="data-refresh-time">读取中</strong>
+        </div>
+        <div id="data-refresh-log-panel" class="refresh-log-panel" hidden>
+          <div class="refresh-log-head">
+            <strong>刷新日志</strong>
+            <span id="data-refresh-log-count">0 行</span>
+          </div>
+          <pre id="data-refresh-log">等待刷新任务输出...</pre>
+        </div>
+      </div>
+      <div class="side-body">
+        <h2>参数</h2>
+        <div id="params" class="grid"></div>
+        <div class="section-head">
+          <h2>因子权重</h2>
+          <span id="factor-count" class="count-pill"></span>
+        </div>
+        <div class="factor-tools">
+          <input id="factor-search" type="text" placeholder="搜索因子">
+          <select id="factor-group"></select>
+        </div>
+        <div class="factor-actions">
+          <button id="expand-factors" class="btn" type="button">展开分组</button>
+          <button id="collapse-factors" class="btn" type="button">折叠分组</button>
+        </div>
+        <div id="factors" class="factor-list"></div>
+      </div>
+    </aside>
+    <main>
+      <div class="topbar">
+        <div>
+          <h1 id="title">长线策略</h1>
+          <div id="subtitle" class="status"></div>
+        </div>
+        <div id="generated" class="status"></div>
+      </div>
+      <div id="metrics" class="cards"></div>
+      <div id="pool-rules" class="pool-rules"></div>
+      <div id="notes" class="notes"></div>
+      <div id="bars" class="score-visual"></div>
+      <div id="table" class="table-wrap"></div>
+    </main>
+  </div>
+  <div id="optimize-overlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="spinner"></div>
+      <div class="overlay-title">正在搜索参数…</div>
+      <div id="optimize-elapsed" class="overlay-sub">已耗时 0 秒</div>
+      <div class="overlay-sub">长线/短线各 200 次随机搜索回测（长线为 PIT 多年回测，较重），约需 1 分钟左右，请勿关闭页面</div>
+    </div>
+  </div>

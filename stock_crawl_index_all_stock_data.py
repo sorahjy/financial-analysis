@@ -36,6 +36,10 @@ CONS_FILE = DATA_DIR / "index_constituents.json"
 SNAPSHOT_FILE = DATA_DIR / "market_snapshot.json"
 UNIVERSE_FILE = DATA_DIR / "stock_universe.json"
 
+# 财报历史深度：10 年。PIT 回测要 join 多年日线，财报需同样深。
+FINANCIAL_YEARS = 10
+FINANCIAL_QUARTERS = FINANCIAL_YEARS * 4
+
 
 # 科技主题行业关键词（中证二级/三级行业），用于科技100指数筛选科技行业股票
 TECH_KEYWORDS = [
@@ -195,7 +199,7 @@ def fetch_financial_reports(stock_code):
         "net_profit": "净利润",
         "net_profit_parent": ["归属于母公司所有者的净利润", "归属于母公司的净利润"],
     }
-    result["income"] = _df_to_records(df_income, income_cols)[:20]  # 近5年(20个季度)
+    result["income"] = _df_to_records(df_income, income_cols)[:FINANCIAL_QUARTERS]  # 近10年(40个季度)
 
     time.sleep(0.3)
 
@@ -208,7 +212,7 @@ def fetch_financial_reports(stock_code):
         "total_assets_liabilities": ["负债和所有者权益(或股东权益)总计", "负债及股东权益总计"],
         "dev_expenditure": "开发支出",
     }
-    result["balance"] = _df_to_records(df_balance, balance_cols)[:20]
+    result["balance"] = _df_to_records(df_balance, balance_cols)[:FINANCIAL_QUARTERS]
 
     time.sleep(0.3)
 
@@ -219,14 +223,14 @@ def fetch_financial_reports(stock_code):
         "operating_cashflow_in": "经营活动现金流入小计",
         "operating_cashflow_out": "经营活动现金流出小计",
     }
-    result["cashflow"] = _df_to_records(df_cashflow, cashflow_cols)[:20]
+    result["cashflow"] = _df_to_records(df_cashflow, cashflow_cols)[:FINANCIAL_QUARTERS]
 
     return result
 
 
 def fetch_financial_indicators(symbol):
     """获取财务分析指标（ROE、增长率、每股净资产等）"""
-    start_year = str(datetime.now().year - 5)
+    start_year = str(datetime.now().year - FINANCIAL_YEARS)
     df = _retry_fetch(ak.stock_financial_analysis_indicator, symbol=symbol, start_year=start_year)
     # 按日期降序排列，最新在前
     df = df.iloc[::-1].reset_index(drop=True)
@@ -297,8 +301,8 @@ def fetch_dividend_history(symbol):
     )
 
     return {
-        "records": records[:20],
-        "yearly_dividends": {str(k): _safe_float(v) for k, v in sorted(yearly_dividends.items(), reverse=True)[:6]},
+        "records": records[:FINANCIAL_QUARTERS],
+        "yearly_dividends": {str(k): _safe_float(v) for k, v in sorted(yearly_dividends.items(), reverse=True)[:11]},
         "consecutive_3y_dividend": consecutive_3y,
     }
 
@@ -751,6 +755,75 @@ def pre_screen_candidates(snapshot):
 
 
 # ═══════════════════════════════════════════════════════════
+# 财报加深重爬（PIT 回测用，跳过日线）
+# ═══════════════════════════════════════════════════════════
+
+def _strip_proxy_env():
+    """STOCK_CRAWL_NO_PROXY=1 时绕过系统/环境变量代理直连境内接口。"""
+    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
+        return
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(var, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
+
+def _find_stock_data_file(code):
+    matches = sorted(OUTPUT_DIR.glob(f"CN_{code}_*.json"))
+    return matches[0] if matches else None
+
+
+def refetch_financials(codes=None, workers=8):
+    """只重拉三大报表+指标+分红(跳过日线)，把现有 stock_data 文件的财报加深到
+    FINANCIAL_YEARS 年。日线深度已在 data/CN_stock，这里不动，避免重爬慢接口。
+
+    codes=None 时取 data/CN_stock(有多年日线) ∩ data/stock_data 的交集——
+    正是 PIT 回测要 join 的股票池。
+    """
+    cn_dir = DATA_DIR / "CN_stock"
+    if codes is None:
+        cn_codes = ({fp.name.split("_")[1] for fp in cn_dir.glob("CN_*.json")}
+                    if cn_dir.exists() else set())
+        sd_codes = {fp.name.split("_")[1] for fp in OUTPUT_DIR.glob("CN_*.json")}
+        codes = sorted(cn_codes & sd_codes)
+    print(f"重拉财报到 {FINANCIAL_YEARS} 年(跳过日线): {len(codes)} 只 / {workers} 线程\n")
+
+    def _worker(code):
+        fp = _find_stock_data_file(code)
+        if fp is None:
+            return code, False, "无 stock_data 文件"
+        try:
+            with open(fp, encoding="utf-8") as f:
+                data = json.load(f)
+            data["financials"] = fetch_financial_reports(code)
+            data["indicators"] = fetch_financial_indicators(code)
+            data["dividends"] = fetch_dividend_history(code)
+            data["financials_refetched_at"] = datetime.now().isoformat()
+            with open(fp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            return code, True, ""
+        except Exception as e:
+            return code, False, str(e)
+
+    failed = []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker, c) for c in codes]
+        for i, fut in enumerate(as_completed(futures), 1):
+            code, ok, err = fut.result()
+            if not ok:
+                failed.append((code, err))
+            if i % 100 == 0:
+                print(f"  进度 {i}/{len(codes)} (失败 {len(failed)})")
+
+    print(f"\n完成: {len(codes) - len(failed)}/{len(codes)} 成功, {len(failed)} 失败")
+    for code, err in failed[:10]:
+        print(f"  ✗ {code}: {err}")
+    if len(failed) > 10:
+        print(f"  ... 其余 {len(failed) - 10} 个失败")
+
+
+# ═══════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════
 
@@ -762,7 +835,15 @@ def main():
                         help="限制爬取数量, 0=不限 (full模式默认20)")
     parser.add_argument("--workers", type=int, default=20,
                         help="并发线程数(默认20)")
+    parser.add_argument("--refetch-financials", action="store_true",
+                        help="只把已有 stock_data 的财报加深重拉到10年(跳过日线), 用于PIT回测")
     args = parser.parse_args()
+
+    _strip_proxy_env()
+
+    if args.refetch_financials:
+        refetch_financials(workers=max(args.workers, 1) if args.workers else 8)
+        return
 
     if args.mode == "full":
         limit = args.limit if args.limit > 0 else 20
