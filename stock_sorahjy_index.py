@@ -39,14 +39,6 @@ def load_all_stocks():
             with open(f, "r", encoding="utf-8") as fp:
                 all_stocks[code] = json.load(fp)
 
-    # 兼容旧格式 stock_data.json
-    sd_file = DATA_DIR / "stock_data.json"
-    if sd_file.exists():
-        with open(sd_file, "r", encoding="utf-8") as f:
-            for k, v in json.load(f).items():
-                if k not in all_stocks:
-                    all_stocks[k] = v
-
     print(f"共加载 {len(all_stocks)} 只股票数据")
     return all_stocks
 

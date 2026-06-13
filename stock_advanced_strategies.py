@@ -75,6 +75,7 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("csi300_current", "当前沪深300", "long", "指数约束", "现仍在沪深300成分池。", 2.0, "boolean"),
     FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、上市年限、中证大盘池近似长期稳定成分。", 1.6, "direct"),
     FactorSpec("market_cap", "总市值", "long", "规模流动性", "偏好大盘股。", 1.2, "percentile"),
+    FactorSpec("size_reversal", "小市值因子", "long", "规模流动性", "SMB代理：总市值越小得分越高，给中小盘优质股入场机会，与总市值因子由权重搜索博弈。", 0.5, "percentile", "low", missing_score=40),
     FactorSpec("liquidity", "日均成交额", "long", "规模流动性", "偏好交易容量更高的股票。", 0.6, "percentile"),
     FactorSpec("low_volatility", "低波动", "long", "风险", "年化波动率越低越好。", 0.8, "percentile", "low", missing_score=40),
     FactorSpec("roe_mean", "ROE均值", "long", "质量", "近年ROE均值。", 1.2, "percentile", missing_score=20),
@@ -86,14 +87,9 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("cashflow_quality", "现金流质量", "long", "质量", "经营现金流 / 净利润，1附近及以上更好。", 0.9, "bounded", "high", 0.0, 2.0, 35),
     FactorSpec("dividend_yield_5y", "五年股息率", "long", "股东回报", "近五年平均每股分红 / 当前股价。", 0.7, "percentile", missing_score=20),
     FactorSpec("dividend_consistency", "连续分红", "long", "股东回报", "近三年连续现金分红。", 0.5, "boolean"),
-    FactorSpec("pb_value", "PB估值", "long", "估值", "PB越低越有安全边际。", 0.5, "percentile", "low", missing_score=45),
-    FactorSpec("pe_value", "PE估值", "long", "估值", "正PE越低越好。", 0.4, "percentile", "low", missing_score=45),
     FactorSpec("debt_safety", "低负债率", "long", "风险", "资产负债率越低越好，银行等行业会由其他质量因子平衡。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("pledge_safety", "低质押", "long", "风险", "股权质押比例越低越好。", 0.4, "percentile", "low", missing_score=60),
-    FactorSpec("momentum_recent", "近期动量", "long", "价格", "近30个可得交易日收益。", 0.4, "percentile", missing_score=45),
-    FactorSpec("drawdown_control", "回撤控制", "long", "价格", "近30个可得交易日距高点回撤越小越好。", 0.4, "percentile", "low", missing_score=45),
     FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.5, "direct", missing_score=40),
-    FactorSpec("listing_age", "上市年限", "long", "稳定性", "上市越久，越接近穿越周期样本。", 0.3, "bounded", "high", 0.0, 15.0, 30),
     FactorSpec("book_to_market", "账面市值比", "long", "估值", "Fama-French HML 代理，净资产 / 市值。", 0.6, "percentile", missing_score=35),
     FactorSpec("earnings_yield", "盈利收益率", "long", "估值", "E/P，净利润TTM / 市值。", 0.7, "percentile", missing_score=35),
     FactorSpec("cashflow_yield", "现金流收益率", "long", "估值", "CF/P，经营现金流TTM / 市值。", 0.7, "percentile", missing_score=35),
@@ -101,40 +97,38 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("roa", "ROA", "long", "质量", "净利润TTM / 总资产。", 0.8, "percentile", missing_score=25),
     FactorSpec("operating_profitability", "经营盈利能力", "long", "质量", "营业利润代理 / 总资产。", 0.8, "percentile", missing_score=25),
     FactorSpec("gross_profit_assets", "毛利资产比", "long", "质量", "毛利TTM / 总资产，Novy-Marx 质量代理。", 0.7, "percentile", missing_score=25),
-    FactorSpec("asset_growth", "资产扩张", "long", "投资", "总资产同比增速，越保守越好。", 0.7, "percentile", "low", missing_score=45),
-    FactorSpec("equity_growth", "净资产扩张", "long", "投资", "净资产同比增速，过快扩张降权。", 0.4, "percentile", "low", missing_score=45),
-    FactorSpec("conservative_investment", "保守投资", "long", "投资", "低资产扩张的直接分。", 0.5, "direct", missing_score=45),
+    FactorSpec("asset_growth", "资产扩张", "long", "投资", "总资产同比增速，越保守越好（CMA投资因子）。", 0.7, "percentile", "low", missing_score=45),
     FactorSpec("accrual_quality", "低应计", "long", "质量", "净利润与经营现金流差额 / 总资产，越低越好。", 0.7, "percentile", "low", missing_score=45),
     FactorSpec("margin_stability", "利润率稳定", "long", "质量", "净利率波动越低越好。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("revenue_stability", "营收稳定", "long", "质量", "近年营收波动越低越好。", 0.4, "percentile", "low", missing_score=45),
     FactorSpec("leverage_trend", "杠杆改善", "long", "风险", "资产负债率趋势下降更好。", 0.4, "percentile", "low", missing_score=45),
-    FactorSpec("net_payout_proxy", "净派息代理", "long", "股东回报", "股息率 - 净资产扩张惩罚。", 0.5, "percentile", missing_score=35),
-    FactorSpec("shareholder_yield_quality", "股东回报质量", "long", "股东回报", "股息率与现金流质量合成。", 0.5, "direct", missing_score=35),
-    FactorSpec("momentum_reversal_balance", "动量反转平衡", "long", "价格", "近期动量不过热且回撤可控。", 0.4, "direct", missing_score=45),
-    FactorSpec("liquidity_stability", "流动性稳定", "long", "规模流动性", "成交额高且换手不过热。", 0.4, "direct", missing_score=40),
-    FactorSpec("quality_value_combo", "质量价值合成", "long", "复合", "ROE稳定、盈利收益率、现金流收益率合成。", 0.9, "direct", missing_score=35),
-    FactorSpec("conservative_formula", "保守公式", "long", "复合", "低波、动量、派息三因子合成。", 0.8, "direct", missing_score=35),
+    FactorSpec("reversal_1m", "一月反转", "long", "价格", "近20个交易日收益越低越好，A股短期反转效应（CH-4/CNE6）。", 0.6, "percentile", "low", missing_score=45),
+    FactorSpec("momentum_12_1", "12-1月动量", "long", "价格", "近一年剔除最近一月的经典动量，A股动量偏弱故默认低权重。", 0.3, "percentile", missing_score=45),
+    FactorSpec("dist_52w_high", "52周高点距离", "long", "价格", "现价/52周最高收盘价，George-Hwang 高点动量。", 0.4, "percentile", missing_score=45),
+    FactorSpec("reversal_long_term", "长期反转", "long", "价格", "近3年收益越低越好，长期输家组合溢价（CNE6长期反转）。", 0.4, "percentile", "low", missing_score=45),
+    FactorSpec("abnormal_turnover", "异常换手", "long", "规模流动性", "近20日均换手/近250日均换手，低换手溢价（CH-4 PMO情绪代理）。", 0.7, "percentile", "low", missing_score=45),
+    FactorSpec("piotroski_f", "PiotroskiF分", "long", "质量", "九项财务体检通过数按可得分量折算到0-9，经典质量打分。", 0.8, "bounded", "high", 0.0, 9.0, 35),
 ]
 
 
 SHORT_FACTORS: List[FactorSpec] = [
     FactorSpec("lhb_recent_count", "近期上榜次数", "short", "龙虎榜", "近期龙虎榜上榜次数。", 0.8, "percentile"),
-    FactorSpec("lhb_net_buy", "龙虎榜净买", "short", "龙虎榜", "近期龙虎榜净买额。", 1.0, "percentile"),
+    FactorSpec("lhb_net_buy", "龙虎榜净买", "short", "龙虎榜", "近期龙虎榜净买额，机构/主力净买入正向预测短期收益。", 1.0, "percentile"),
     FactorSpec("lhb_net_buy_pct", "净买占成交", "short", "龙虎榜", "净买额占成交比例峰值。", 0.9, "percentile"),
+    FactorSpec("lhb_buy_ratio", "龙虎榜买方主导", "short", "龙虎榜", "榜内买入额占龙虎榜成交额峰值，买方主导度。", 0.7, "percentile", missing_score=40),
+    FactorSpec("net_buy_to_float", "净买占流通比", "short", "龙虎榜", "窗口净买额/流通市值，资金推动力按体量归一。", 0.8, "percentile", missing_score=40),
+    FactorSpec("float_cap_small", "小流通盘", "short", "龙虎榜", "流通市值越小越易拉升，短线弹性因子。", 0.5, "percentile", "low", missing_score=40),
     FactorSpec("institution_buy_count", "机构买入次数", "short", "席位", "机构席位买入次数。", 0.5, "percentile"),
-    FactorSpec("institution_net_buy", "机构净买额", "short", "席位", "机构席位净买额。", 0.6, "percentile"),
+    FactorSpec("institution_net_buy", "机构净买额", "short", "席位", "机构席位净买额，实证对短期收益有正向预测力。", 0.7, "percentile"),
     FactorSpec("stat_lhb_count", "近月上榜频率", "short", "龙虎榜", "统计窗口内上榜次数。", 0.5, "percentile"),
     FactorSpec("stat_net_buy", "近月净买", "short", "龙虎榜", "统计窗口内龙虎榜净买。", 0.5, "percentile"),
     FactorSpec("hot_money_concurrent", "游资共振数", "short", "游资追踪", "同一窗口共买席位数。", 1.2, "percentile"),
-    FactorSpec("total_buyers", "总买方席位", "short", "游资追踪", "买方席位总数量。", 0.5, "percentile"),
     FactorSpec("weighted_hot_money", "席位加权分", "short", "游资追踪", "席位质量、金额与共振的加权结果。", 1.0, "percentile"),
     FactorSpec("buy_amount_total", "游资买入额", "short", "游资追踪", "跟踪席位合计买入金额。", 0.8, "percentile"),
     FactorSpec("known_hot_money_ratio", "知名游资占比", "short", "游资追踪", "已识别知名游资席位占比。", 0.7, "bounded", "high", 0.0, 1.0),
     FactorSpec("seat_diversity", "席位多样性", "short", "游资追踪", "不同营业部数量。", 0.5, "percentile"),
-    FactorSpec("repeat_seat_strength", "重复席位强度", "short", "游资追踪", "同一席位连续/多日参与强度。", 0.4, "percentile"),
     FactorSpec("recency", "上榜新鲜度", "short", "时效", "最近席位日期距快照日越近越好。", 0.7, "percentile", "low", missing_score=40),
     FactorSpec("best_window_tightness", "共振窗口紧凑", "short", "时效", "共振窗口跨度越短越好。", 0.5, "percentile", "low", missing_score=50),
-    FactorSpec("capital_score", "原始资金分", "short", "资金评分", "现有资金脚本给出的综合分。", 0.8, "percentile"),
     FactorSpec("resonance_score", "原共振分", "short", "资金评分", "现有龙虎榜共振评分。", 0.8, "direct", missing_score=40),
     FactorSpec("momentum_score", "短线动量", "short", "技术", "现有短线动量评分或技术形态。", 0.8, "direct", missing_score=40),
     FactorSpec("position_score", "短线位置", "short", "技术", "距高点/RSI等位置评分。", 0.6, "direct", missing_score=40),
@@ -152,17 +146,14 @@ SHORT_FACTORS: List[FactorSpec] = [
     FactorSpec("buy_concentration", "买额集中度", "short", "游资追踪", "单一席位买额占比，过散/过独都降权。", 0.5, "direct", missing_score=40),
     FactorSpec("known_hot_money_amount_ratio", "知名游资金额占比", "short", "游资追踪", "知名游资买入金额占跟踪买入额。", 0.7, "bounded", "high", 0.0, 1.0, 35),
     FactorSpec("hot_money_persistence", "游资持续性", "short", "游资追踪", "同席位多日重复出现。", 0.7, "direct", missing_score=35),
-    FactorSpec("seat_network_score", "席位网络分", "short", "游资追踪", "席位数量、重复、知名占比与金额合成。", 1.0, "direct", missing_score=35),
     FactorSpec("amount_per_buyer", "席位平均买额", "short", "游资追踪", "每个买方席位平均买入额。", 0.4, "percentile", missing_score=35),
     FactorSpec("event_recency_decay", "事件衰减分", "short", "时效", "按上榜距今自然日指数衰减。", 0.6, "direct", missing_score=40),
     FactorSpec("limit_up_heat", "涨停热度", "short", "技术", "近期涨停次数。", 0.4, "percentile", missing_score=35),
     FactorSpec("overheat_penalty", "过热惩罚", "short", "风控", "短期涨幅、连板、RSI过热综合扣分后得分。", 0.7, "direct", missing_score=45),
     FactorSpec("ma_distance", "均线乖离", "short", "技术", "距离MA20适中更好，过远降权。", 0.4, "direct", missing_score=45),
     FactorSpec("macd_strength", "MACD强度", "short", "技术", "DIF转强但不过热。", 0.3, "direct", missing_score=45),
-    FactorSpec("alpha_price_volume_1", "价量Alpha1", "short", "价量Alpha", "涨幅与量比的短周期合成。", 0.5, "direct", missing_score=40),
-    FactorSpec("alpha_price_volume_2", "价量Alpha2", "short", "价量Alpha", "换手、MA乖离和RSI的进攻合成。", 0.5, "direct", missing_score=40),
-    FactorSpec("alpha_reversal_1", "短反Alpha", "short", "价量Alpha", "短期冲高后不过热的反转/延续平衡。", 0.4, "direct", missing_score=40),
-    FactorSpec("dragon_tiger_composite", "龙虎榜综合", "short", "复合", "净买、原因、席位网络和风控合成。", 1.1, "direct", missing_score=35),
+    FactorSpec("alpha_price_volume_1", "价量Alpha1", "short", "价量Alpha", "涨幅与量比的短周期合成（WorldQuant式价量交互）。", 0.5, "direct", missing_score=40),
+    FactorSpec("alpha_reversal_1", "短反Alpha", "short", "价量Alpha", "当日涨幅甜区与过热约束的反转/延续平衡。", 0.4, "direct", missing_score=40),
 ]
 
 
@@ -174,14 +165,14 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
-        "top_n": 30,
+        "top_n": 12,
         "min_score": 60,
-        "min_market_cap_yi": 800,
-        "min_listing_years": 8,
-        "require_csi300": True,
-        "min_csi300_persistence": 65,
+        "min_market_cap_yi": 100,
+        "min_listing_years": 5,
+        "require_csi300": False,
+        "min_csi300_persistence": 45,
         "require_high_drawdown": False,
-        "min_high_drawdown_pct": 30,
+        "min_high_drawdown_pct": 40,
         "exclude_st": True,
         "hold_years_min": 2,
         "hold_years_max": 5,
@@ -189,7 +180,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "short": {
         "enabled": True,
-        "top_n": 30,
+        "top_n": 8,
         "min_score": 55,
         "hold_days_min": 1,
         "hold_days_max": 5,
@@ -456,17 +447,6 @@ def listing_age_years(snapshot: Optional[Dict[str, Any]]) -> Optional[float]:
     return max(0.0, (datetime.now() - date).days / 365.25)
 
 
-def recent_return_and_drawdown(rows: List[Dict[str, Any]]) -> Tuple[Optional[float], Optional[float]]:
-    closes = [safe_float(row.get("close")) for row in rows or []]
-    closes = [c for c in closes if c is not None and c > 0]
-    if len(closes) < 2:
-        return None, None
-    ret = closes[-1] / closes[0] - 1
-    peak = max(closes)
-    dd = (peak - closes[-1]) / peak if peak > 0 else None
-    return ret, dd
-
-
 def high_to_latest_drawdown_pct(rows: List[Dict[str, Any]]) -> Optional[float]:
     closes = [safe_float(row.get("close")) for row in rows or []]
     closes = [c for c in closes if c is not None and c > 0]
@@ -512,6 +492,45 @@ def yoy_from_latest_and_annual(records: List[Dict[str, Any]], field: str) -> Opt
     if latest is None or base is None or abs(base) < 1e-9:
         return None
     return (latest - base) / abs(base)
+
+
+def piotroski_f_score(
+        income: List[Dict[str, Any]],
+        indicators: List[Dict[str, Any]],
+        net_profit_ttm: Optional[float],
+        op_cash_ttm: Optional[float],
+        total_assets: Optional[float],
+) -> Optional[float]:
+    """Piotroski F-Score 的本地可计算子集（折算到满分9）。
+
+    九项中可用本地数据核验七项：ROA>0、经营现金流>0、现金流>净利润(低应计)、
+    ROE同比改善、负债率同比下降、毛利率同比改善、资产周转率同比改善；
+    发行新股与流动比率两项缺数据。可得分量不足5项返回 None。
+    """
+    checks: List[bool] = []
+    roa = safe_ratio(net_profit_ttm, total_assets)
+    if roa is not None:
+        checks.append(roa > 0)
+    if op_cash_ttm is not None:
+        checks.append(op_cash_ttm > 0)
+    if op_cash_ttm is not None and net_profit_ttm is not None:
+        checks.append(op_cash_ttm > net_profit_ttm)
+    roe_y = annual_values(indicators, "roe", limit=2)
+    if len(roe_y) >= 2:
+        checks.append(roe_y[0] > roe_y[1])
+    debt_y = annual_values(indicators, "asset_liability_ratio", limit=2)
+    if len(debt_y) >= 2:
+        checks.append(debt_y[0] < debt_y[1])
+    gm_y = annual_values(indicators, "gross_margin", limit=2)
+    if len(gm_y) >= 2:
+        checks.append(gm_y[0] > gm_y[1])
+    rev_y = annual_values(income, "revenue", limit=2)
+    assets_y = annual_values(indicators, "total_assets", limit=2)
+    if len(rev_y) >= 2 and len(assets_y) >= 2 and assets_y[0] and assets_y[1]:
+        checks.append(rev_y[0] / assets_y[0] > rev_y[1] / assets_y[1])
+    if len(checks) < 5:
+        return None
+    return round(sum(checks) / len(checks) * 9.0, 3)
 
 
 def pct_volatility(values: Iterable[Any]) -> Optional[float]:
@@ -607,10 +626,7 @@ def _load_cn_stock_index_cached(fingerprint: int) -> Dict[str, Dict[str, Any]]:
 
 
 def load_fundamental_stocks() -> Dict[str, Dict[str, Any]]:
-    fingerprint = _dir_fingerprint(STOCK_DATA_DIR, "CN_*.json") ^ hash(
-        _file_signature(DATA_DIR / "stock_data.json")
-    )
-    return _load_fundamental_stocks_cached(fingerprint)
+    return _load_fundamental_stocks_cached(_dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"))
 
 
 @lru_cache(maxsize=1)
@@ -624,12 +640,6 @@ def _load_fundamental_stocks_cached(fingerprint: int) -> Dict[str, Dict[str, Any
                 continue
             code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
             stocks[code] = data
-    legacy = load_json_optional(DATA_DIR / "stock_data.json", {})
-    if isinstance(legacy, dict):
-        for code, data in legacy.items():
-            code = str(code).zfill(6)
-            if code not in stocks and isinstance(data, dict):
-                stocks[code] = data
     return stocks
 
 
@@ -922,19 +932,6 @@ def compute_long_raw_factors(
     indicators = stock.get("indicators", {}).get("records", [])
     roe_stats = stock.get("indicators", {}).get("roe_stats", {})
     latest_ind = indicators[0] if indicators else {}
-    cn_val = latest_valuation_from_cn(code)
-
-    price = safe_float(daily_stats.get("latest_close")) or safe_float(snapshot.get("price"))
-    bvps = safe_float(latest_ind.get("bvps_adjusted"))
-    eps = first_not_none(latest_ind.get("eps_diluted"), latest_ind.get("eps_adjusted"))
-    pb = cn_val.get("pb")
-    if pb is None and price and bvps and bvps > 0:
-        pb = price / bvps
-    pe = cn_val.get("pe_ttm")
-    if pe is None and price and eps and eps > 0:
-        pe = price / eps
-    if pe is not None and pe <= 0:
-        pe = None
 
     net_profit_ttm = compute_ttm(income, "net_profit")
     revenue_ttm = compute_ttm(income, "revenue")
@@ -945,9 +942,35 @@ def compute_long_raw_factors(
     if op_cash_ttm is not None and net_profit_ttm is not None and abs(net_profit_ttm) > 1e-9:
         cash_quality = op_cash_ttm / abs(net_profit_ttm)
 
-    recent_rows = combined_recent_rows(code, stock)
-    recent_ret, drawdown = recent_return_and_drawdown(recent_rows)
     market_cap_yi = market_cap_cny / 1e8 if market_cap_cny else None
+
+    # 价格行为因子用全量历史日线（CN_stock 最长约10年）
+    hist_rows = price_history_rows(code, stock)
+    hist_closes = [safe_float(row.get("close")) for row in hist_rows]
+    hist_closes = [c for c in hist_closes if c is not None and c > 0]
+    reversal_1m = None
+    momentum_12_1 = None
+    dist_52w_high = None
+    reversal_long_term = None
+    if len(hist_closes) >= 21:
+        reversal_1m = hist_closes[-1] / hist_closes[-21] - 1
+    if len(hist_closes) >= 250:
+        momentum_12_1 = hist_closes[-21] / hist_closes[-250] - 1
+    if len(hist_closes) >= 120:
+        window = hist_closes[-250:]
+        peak = max(window)
+        dist_52w_high = hist_closes[-1] / peak if peak > 0 else None
+    if len(hist_closes) >= 750:
+        reversal_long_term = hist_closes[-1] / hist_closes[-750] - 1
+
+    hist_turnovers = [safe_float(row.get("turnover_rate")) for row in hist_rows]
+    recent_to = [t for t in hist_turnovers[-20:] if t is not None and t > 0]
+    base_to = [t for t in hist_turnovers[-250:] if t is not None and t > 0]
+    abnormal_turnover = None
+    if len(recent_to) >= 10 and len(base_to) >= 60:
+        base_avg = sum(base_to) / len(base_to)
+        if base_avg > 1e-9:
+            abnormal_turnover = (sum(recent_to) / len(recent_to)) / base_avg
 
     roe_values = [safe_float(row.get("roe")) for row in indicators]
     roe_values = [v for v in roe_values if v is not None]
@@ -982,7 +1005,6 @@ def compute_long_raw_factors(
     operating_profitability = safe_ratio(operating_profit, total_assets)
     gross_profit_assets = safe_ratio(gross_profit_ttm, total_assets)
     asset_growth = yoy_from_latest_and_annual(indicators, "total_assets")
-    equity_growth = yoy_from_latest_and_annual(balance, "total_equity_parent")
     accrual_quality = None
     if net_profit_ttm is not None and op_cash_ttm is not None and total_assets:
         accrual_quality = (net_profit_ttm - op_cash_ttm) / total_assets
@@ -998,37 +1020,13 @@ def compute_long_raw_factors(
             leverage_trend = debt_values[0] - older
 
     dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
-    net_payout_proxy = None
-    if dividend_yield_5y is not None:
-        net_payout_proxy = dividend_yield_5y - max(0.0, scale_ratio_to_pct(equity_growth) or 0.0) * 0.15
-
-    shareholder_yield_quality = average_score(
-        bounded_linear(dividend_yield_5y, 0.0, 8.0),
-        bounded_linear(cash_quality, 0.0, 1.5),
-    )
-    momentum_reversal_balance = average_score(
-        sweetspot_score(scale_ratio_to_pct(recent_ret), -5.0, 18.0, -25.0, 45.0),
-        bounded_linear(scale_ratio_to_pct(drawdown), 0.0, 30.0, reverse=True),
-    )
-    liquidity_stability = average_score(
-        bounded_linear(safe_float(daily_stats.get("avg_daily_turnover_approx")) or safe_float(snapshot.get("turnover")), 5e7, 5e9),
-        bounded_linear(safe_float(snapshot.get("volume")), 1e6, 5e8),
-    )
-    quality_value_combo = average_score(
-        bounded_linear(roe_stability, 0.0, 20.0),
-        bounded_linear(scale_ratio_to_pct(earnings_yield), -2.0, 12.0),
-        bounded_linear(scale_ratio_to_pct(cashflow_yield), -2.0, 12.0),
-    )
-    conservative_formula = average_score(
-        bounded_linear(safe_float(daily_stats.get("volatility_annual")), 0.08, 0.45, reverse=True),
-        sweetspot_score(scale_ratio_to_pct(recent_ret), -3.0, 20.0, -25.0, 50.0),
-        bounded_linear(dividend_yield_5y, 0.0, 7.0),
-    )
+    piotroski = piotroski_f_score(income, indicators, net_profit_ttm, op_cash_ttm, total_assets)
 
     return {
         "csi300_current": 1.0 if in_csi300 else 0.0,
         "csi300_persistence": persistence,
         "market_cap": market_cap_yi,
+        "size_reversal": market_cap_yi,
         "liquidity": first_not_none(
             daily_stats.get("avg_daily_turnover_approx"), snapshot.get("turnover")
         ),
@@ -1042,16 +1040,13 @@ def compute_long_raw_factors(
         "cashflow_quality": cash_quality,
         "dividend_yield_5y": dividend_yield_5y,
         "dividend_consistency": 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0,
-        "pb_value": pb,
-        "pe_value": pe,
         "debt_safety": safe_float(latest_ind.get("asset_liability_ratio")),
         "pledge_safety": first_not_none(
             stock.get("pledge", {}).get("pledge_ratio"), snapshot.get("pledge_ratio")
         ),
-        "momentum_recent": scale_ratio_to_pct(recent_ret),
-        "drawdown_control": scale_ratio_to_pct(drawdown),
         "historical_high_drawdown": high_drawdown_pct,
         "industry_leadership": None,
+        # listing_age 不再是打分因子，但 min_listing_years 硬过滤仍读取它
         "listing_age": age,
         "book_to_market": book_to_market,
         "earnings_yield": scale_ratio_to_pct(earnings_yield),
@@ -1061,18 +1056,16 @@ def compute_long_raw_factors(
         "operating_profitability": scale_ratio_to_pct(operating_profitability),
         "gross_profit_assets": scale_ratio_to_pct(gross_profit_assets),
         "asset_growth": scale_ratio_to_pct(asset_growth),
-        "equity_growth": scale_ratio_to_pct(equity_growth),
-        "conservative_investment": bounded_linear(scale_ratio_to_pct(asset_growth), -10.0, 35.0, reverse=True),
         "accrual_quality": accrual_quality,
         "margin_stability": margin_stability,
         "revenue_stability": revenue_stability,
         "leverage_trend": leverage_trend,
-        "net_payout_proxy": net_payout_proxy,
-        "shareholder_yield_quality": shareholder_yield_quality,
-        "momentum_reversal_balance": momentum_reversal_balance,
-        "liquidity_stability": liquidity_stability,
-        "quality_value_combo": quality_value_combo,
-        "conservative_formula": conservative_formula,
+        "reversal_1m": scale_ratio_to_pct(reversal_1m),
+        "momentum_12_1": scale_ratio_to_pct(momentum_12_1),
+        "dist_52w_high": dist_52w_high,
+        "reversal_long_term": scale_ratio_to_pct(reversal_long_term),
+        "abnormal_turnover": abnormal_turnover,
+        "piotroski_f": piotroski,
     }
 
 
@@ -1196,7 +1189,7 @@ def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
 def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     pick = data.get("pick") or {}
     scored = data.get("scored") or {}
-    signals = pick.get("signals") or {}
+    signals = pick.get("signals") or scored.get("signals") or {}
     lhb = signals.get("lhb") or {}
     inst = signals.get("inst") or {}
     stat = signals.get("stat") or {}
@@ -1254,12 +1247,6 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     amount_per_buyer = safe_ratio(
         total_buy_est, first_not_none(scored.get("total_buyers"), len(seat_counts) or None)
     )
-    network_score = average_score(
-        bounded_linear(concurrent, 1.0, 5.0),
-        bounded_linear(len(seat_counts) if seat_counts else None, 1.0, 8.0),
-        bounded_linear(known_amount_ratio, 0.0, 0.6),
-        persistence_score,
-    )
     limit_up_count = first_not_none(
         tech.get("recent_limit_up"), scores.get("consecutive_limit_up")
     )
@@ -1276,22 +1263,10 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
         sweetspot_score(chg_5d, 2.0, 12.0, -8.0, 28.0),
         sweetspot_score(vol_ratio, 1.1, 3.2, 0.4, 6.0),
     )
-    alpha_pv2 = average_score(
-        sweetspot_score(turnover_today, 4.0, 22.0, 0.0, 45.0),
-        ma_distance,
-        rsi_score,
-    )
     alpha_rev1 = average_score(
         sweetspot_score(chg_today, -3.0, 7.5, -10.0, 15.0),
         overheat,
         bounded_linear(safe_float(scores.get("consecutive_limit_up")), 0.0, 4.0, reverse=True),
-    )
-    dragon_tiger_composite = average_score(
-        reason_strength,
-        network_score,
-        institution_combo,
-        event_decay,
-        overheat,
     )
 
     return {
@@ -1300,22 +1275,20 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
         ),
         "lhb_net_buy": safe_float(lhb.get("total_net_buy")),
         "lhb_net_buy_pct": safe_float(lhb.get("max_net_pct")),
+        "lhb_buy_ratio": safe_float(lhb.get("max_buy_ratio")),
+        "net_buy_to_float": safe_float(lhb.get("net_buy_to_float_pct")),
+        "float_cap_small": safe_float(lhb.get("float_cap")),
         "institution_buy_count": safe_float(inst.get("inst_buy_count")),
         "institution_net_buy": safe_float(inst.get("inst_net_buy")),
         "stat_lhb_count": safe_float(stat.get("stat_count")),
         "stat_net_buy": safe_float(stat.get("stat_net_buy")),
         "hot_money_concurrent": concurrent,
-        "total_buyers": first_not_none(
-            scored.get("total_buyers"), follower_count if follower_count else None
-        ),
         "weighted_hot_money": first_not_none(scored.get("weighted_score"), scores.get("total")),
         "buy_amount_total": safe_float(scored.get("buy_amount_total")),
         "known_hot_money_ratio": known_count / len(followers) if followers else None,
         "seat_diversity": len(seat_counts) if seat_counts else None,
-        "repeat_seat_strength": max(seat_counts.values()) if seat_counts else None,
         "recency": recency_days,
         "best_window_tightness": best_window_span,
-        "capital_score": first_not_none(pick.get("score"), scores.get("total")),
         "resonance_score": safe_float(scores.get("resonance")),
         "momentum_score": first_not_none(scores.get("momentum"), tech_momentum_score(tech)),
         "position_score": safe_float(scores.get("position")),
@@ -1333,7 +1306,6 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
         "buy_concentration": buy_concentration,
         "known_hot_money_amount_ratio": known_amount_ratio,
         "hot_money_persistence": persistence_score,
-        "seat_network_score": network_score,
         "amount_per_buyer": amount_per_buyer,
         "event_recency_decay": event_decay,
         "limit_up_heat": limit_up_count,
@@ -1341,9 +1313,7 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
         "ma_distance": ma_distance,
         "macd_strength": macd_strength,
         "alpha_price_volume_1": alpha_pv1,
-        "alpha_price_volume_2": alpha_pv2,
         "alpha_reversal_1": alpha_rev1,
-        "dragon_tiger_composite": dragon_tiger_composite,
     }
 
 

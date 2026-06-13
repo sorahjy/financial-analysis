@@ -273,6 +273,7 @@ def mirror_capital_outputs() -> Dict[str, Any]:
                 "score": scores.get("total"),
                 "scores": scores,
                 "followers": item.get("followers", []),
+                "signals": item.get("signals"),
             }
         )
     write_json(

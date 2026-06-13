@@ -5,7 +5,7 @@
   --mode full    全量爬取: 中证全指+全A股合并 → 逐只爬取详细数据
   --mode staged  分步粗筛(默认): 先获取全市场快照做粗筛, 再只爬通过粗筛的股票
 
-使用 stock_fetch_data.py 中的数据获取函数，爬取：
+爬取内容（数据获取底层函数见本文件「单股数据获取」段，原 stock_fetch_data.py 已并入）：
   - 日频行情、财务报表、财务指标、分红历史、质押比例
 
 特性：
@@ -20,26 +20,21 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import argparse
 import json
+import math
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
+from pathlib import Path
 
 import akshare as ak
+import numpy as np
 import pandas as pd
 
-from stock_fetch_data import (
-    fetch_daily_price,
-    fetch_financial_reports,
-    fetch_financial_indicators,
-    fetch_dividend_history,
-    _safe_float,
-    _retry_fetch,
-    DATA_DIR,
-)
-
+DATA_DIR = Path(__file__).parent / "data"
 OUTPUT_DIR = DATA_DIR / "stock_data"
 CONS_FILE = DATA_DIR / "index_constituents.json"
 SNAPSHOT_FILE = DATA_DIR / "market_snapshot.json"
+UNIVERSE_FILE = DATA_DIR / "stock_universe.json"
 
 
 # 科技主题行业关键词（中证二级/三级行业），用于科技100指数筛选科技行业股票
@@ -58,8 +53,298 @@ def is_bse_stock(code: str) -> bool:
 
 
 # ═══════════════════════════════════════════════════════════
+# 单股数据获取（原 stock_fetch_data.py 并入）
+# ═══════════════════════════════════════════════════════════
+
+MAX_RETRIES = 3
+
+
+def _retry_fetch(func, *args, retries=MAX_RETRIES, **kwargs):
+    """带重试的数据获取，应对连接不稳定"""
+    for attempt in range(retries):
+        try:
+            return func(*args, **kwargs)
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(2 ** attempt + 1)
+            else:
+                raise
+
+
+def _safe_float(val):
+    """将值转为 float，NaN/None 转为 None（方便 JSON 序列化）"""
+    if val is None:
+        return None
+    try:
+        f = float(val)
+        return None if (math.isnan(f) or math.isinf(f)) else round(f, 6)
+    except (ValueError, TypeError):
+        return None
+
+
+def _df_to_records(df, cols_map, date_col="报告日"):
+    """从 DataFrame 中提取指定列，转为 list of dict。
+    cols_map 的值可以是字符串或字符串列表（按优先级尝试多个列名）。
+    """
+    records = []
+    for _, row in df.iterrows():
+        rec = {}
+        date_val = str(row[date_col])
+        # 将 '20251231' 格式转为 '2025-12-31'
+        if len(date_val) == 8 and date_val.isdigit():
+            rec["date"] = f"{date_val[:4]}-{date_val[4:6]}-{date_val[6:8]}"
+        else:
+            rec["date"] = str(date_val)[:10]
+        for new_key, old_col in cols_map.items():
+            candidates = old_col if isinstance(old_col, list) else [old_col]
+            val = None
+            for col_name in candidates:
+                if col_name in df.columns:
+                    val = _safe_float(row[col_name])
+                    break
+            rec[new_key] = val
+        records.append(rec)
+    return records
+
+
+def fetch_daily_price(symbol, years=1):
+    """获取近 N 年日频行情，计算波动率和日均成交额
+    优先使用腾讯接口(稳定)，回退到东方财富接口
+    """
+    end_date = datetime.now().strftime("%Y%m%d")
+    start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
+
+    # 确定腾讯接口需要的 symbol 前缀
+    tx_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
+
+    try:
+        df = _retry_fetch(
+            ak.stock_zh_a_hist_tx,
+            symbol=tx_symbol, start_date=start_date, end_date=end_date
+        )
+        # 腾讯接口: date, open, close, high, low, amount(成交量,手)
+        close_prices = df["close"].astype(float)
+        daily_returns = close_prices.pct_change().dropna()
+        # amount 是成交量(手)，近似成交额 = 成交量 * 100 * 收盘价
+        df["turnover_approx"] = df["amount"].astype(float) * 100 * close_prices
+
+        stats = {
+            "trading_days": len(df),
+            "avg_daily_volume": _safe_float(df["amount"].astype(float).mean()),
+            "avg_daily_turnover_approx": _safe_float(df["turnover_approx"].mean()),
+            "volatility_annual": _safe_float(daily_returns.std() * np.sqrt(252)),
+            "volatility_daily_std": _safe_float(daily_returns.std()),
+            "latest_close": _safe_float(close_prices.iloc[-1]),
+            "start_date": str(df["date"].iloc[0])[:10],
+            "end_date": str(df["date"].iloc[-1])[:10],
+        }
+
+        recent = []
+        for _, row in df.tail(30).iterrows():
+            recent.append({
+                "date": str(row["date"])[:10],
+                "close": _safe_float(row["close"]),
+                "volume": _safe_float(row["amount"]),
+                "change_pct": _safe_float(
+                    (row["close"] - row["open"]) / row["open"] * 100 if row["open"] else None
+                ),
+            })
+
+    except Exception:
+        df = _retry_fetch(
+            ak.stock_zh_a_hist,
+            symbol=symbol, period="daily",
+            start_date=start_date, end_date=end_date, adjust="qfq"
+        )
+        close_prices = df["收盘"].astype(float)
+        daily_returns = close_prices.pct_change().dropna()
+
+        stats = {
+            "trading_days": len(df),
+            "avg_daily_turnover": _safe_float(df["成交额"].astype(float).mean()),
+            "volatility_annual": _safe_float(daily_returns.std() * np.sqrt(252)),
+            "volatility_daily_std": _safe_float(daily_returns.std()),
+            "latest_close": _safe_float(close_prices.iloc[-1]),
+            "start_date": str(df["日期"].iloc[0])[:10],
+            "end_date": str(df["日期"].iloc[-1])[:10],
+        }
+
+        recent = []
+        for _, row in df.tail(30).iterrows():
+            recent.append({
+                "date": str(row["日期"])[:10],
+                "close": _safe_float(row["收盘"]),
+                "turnover": _safe_float(row["成交额"]),
+                "change_pct": _safe_float(row["涨跌幅"]),
+            })
+
+    return {"stats": stats, "recent_daily": recent}
+
+
+def fetch_financial_reports(stock_code):
+    """获取三大财务报表（利润表、资产负债表、现金流量表）"""
+    result = {}
+
+    # 利润表
+    df_income = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="利润表")
+    income_cols = {
+        "revenue": ["营业总收入", "营业收入"],  # 银行股用"营业收入"
+        "operating_cost": ["营业总成本", "营业支出"],  # 银行股用"营业支出"
+        "cost_of_revenue": "营业成本",
+        "rd_expense": "研发费用",
+        "net_profit": "净利润",
+        "net_profit_parent": ["归属于母公司所有者的净利润", "归属于母公司的净利润"],
+    }
+    result["income"] = _df_to_records(df_income, income_cols)[:20]  # 近5年(20个季度)
+
+    time.sleep(0.3)
+
+    # 资产负债表
+    df_balance = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="资产负债表")
+    balance_cols = {
+        "total_equity_parent": ["归属于母公司股东权益合计", "归属于母公司股东的权益"],
+        "minority_equity": "少数股东权益",
+        "total_equity": ["所有者权益(或股东权益)合计", "负债及股东权益总计"],
+        "total_assets_liabilities": ["负债和所有者权益(或股东权益)总计", "负债及股东权益总计"],
+        "dev_expenditure": "开发支出",
+    }
+    result["balance"] = _df_to_records(df_balance, balance_cols)[:20]
+
+    time.sleep(0.3)
+
+    # 现金流量表
+    df_cashflow = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="现金流量表")
+    cashflow_cols = {
+        "operating_cashflow_net": "经营活动产生的现金流量净额",
+        "operating_cashflow_in": "经营活动现金流入小计",
+        "operating_cashflow_out": "经营活动现金流出小计",
+    }
+    result["cashflow"] = _df_to_records(df_cashflow, cashflow_cols)[:20]
+
+    return result
+
+
+def fetch_financial_indicators(symbol):
+    """获取财务分析指标（ROE、增长率、每股净资产等）"""
+    start_year = str(datetime.now().year - 5)
+    df = _retry_fetch(ak.stock_financial_analysis_indicator, symbol=symbol, start_year=start_year)
+    # 按日期降序排列，最新在前
+    df = df.iloc[::-1].reset_index(drop=True)
+
+    indicator_cols = {
+        "roe": "净资产收益率(%)",
+        "roe_weighted": "加权净资产收益率(%)",
+        "eps_diluted": "摊薄每股收益(元)",
+        "eps_adjusted": "每股收益_调整后(元)",
+        "eps_deducted": "扣除非经常性损益后的每股收益(元)",
+        "bvps_adjusted": "每股净资产_调整后(元)",
+        "ocfps": "每股经营性现金流(元)",
+        "gross_margin": "销售毛利率(%)",
+        "net_margin": "销售净利率(%)",
+        "revenue_growth": "主营业务收入增长率(%)",
+        "net_profit_growth": "净利润增长率(%)",
+        "net_assets_growth": "净资产增长率(%)",
+        "total_assets": "总资产(元)",
+        "deducted_net_profit": "扣除非经常性损益后的净利润(元)",
+        "dividend_payout_ratio": "股息发放率(%)",
+        "asset_liability_ratio": "资产负债率(%)",
+    }
+
+    records = _df_to_records(df, indicator_cols, date_col="日期")
+
+    # 提取 ROE 序列（用于计算 ROE 均值-标准差因子）
+    roe_series = [r["roe"] for r in records if r["roe"] is not None]
+    roe_stats = {}
+    if roe_series:
+        roe_stats = {
+            "mean": _safe_float(np.mean(roe_series)),
+            "std": _safe_float(np.std(roe_series)),
+            "count": len(roe_series),
+        }
+
+    return {"records": records, "roe_stats": roe_stats}
+
+
+def fetch_dividend_history(symbol):
+    """获取分红历史"""
+    df = _retry_fetch(ak.stock_history_dividend_detail, symbol=symbol, indicator="分红")
+
+    records = []
+    for _, row in df.iterrows():
+        rec = {
+            "announce_date": str(row["公告日期"])[:10] if pd.notna(row["公告日期"]) else None,
+            "bonus_shares": _safe_float(row["送股"]),
+            "transfer_shares": _safe_float(row["转增"]),
+            "dividend_per_10": _safe_float(row["派息"]),  # 每10股派息(元)
+            "progress": str(row["进度"]) if pd.notna(row["进度"]) else None,
+            "ex_date": str(row["除权除息日"])[:10] if pd.notna(row["除权除息日"]) else None,
+        }
+        records.append(rec)
+
+    # 计算近3年是否连续分红
+    current_year = datetime.now().year
+    yearly_dividends = {}
+    for r in records:
+        if r["announce_date"] and r["dividend_per_10"] and r["dividend_per_10"] > 0:
+            year = int(r["announce_date"][:4])
+            if year not in yearly_dividends:
+                yearly_dividends[year] = 0
+            yearly_dividends[year] += r["dividend_per_10"]
+
+    consecutive_3y = all(
+        (current_year - i) in yearly_dividends
+        for i in range(1, 4)
+    )
+
+    return {
+        "records": records[:20],
+        "yearly_dividends": {str(k): _safe_float(v) for k, v in sorted(yearly_dividends.items(), reverse=True)[:6]},
+        "consecutive_3y_dividend": consecutive_3y,
+    }
+
+
+# ═══════════════════════════════════════════════════════════
 # 公共工具
 # ═══════════════════════════════════════════════════════════
+
+def fetch_index_constituents(symbol):
+    """获取指数全量成分股, 返回 {code: name}。
+
+    优先中证官网接口 index_stock_cons_csindex(全量下载)；失败时回退
+    新浪接口 index_stock_cons —— 注意新浪分页对大样本指数(如中证全指
+    约5000只)只返回部分成分, 仅作兜底。
+    """
+    try:
+        df = _retry_fetch(ak.index_stock_cons_csindex, symbol=symbol)
+        cons = {
+            str(row["成分券代码"]).zfill(6): str(row["成分券名称"])
+            for _, row in df.iterrows()
+        }
+        if cons:
+            return cons
+    except Exception as e:
+        print(f"  [WARN] 中证官网成分接口失败({symbol}): {e}, 回退新浪接口(可能不全)")
+    df = _retry_fetch(ak.index_stock_cons, symbol=symbol)
+    return {
+        str(row["品种代码"]).zfill(6): str(row["品种名称"])
+        for _, row in df.iterrows()
+    }
+
+
+def save_stock_universe(csi300_map, csi_all_map):
+    """写 data/stock_universe.json, 供 stock_advanced_strategies.py 的
+    沪深300硬过滤(require_csi300)与 csi300_current/csi300_persistence 因子使用。"""
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": "akshare index_stock_cons_csindex",
+        "csi300": sorted(csi300_map),
+        "all": sorted(csi_all_map),
+    }
+    with open(UNIVERSE_FILE, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+    print(f"  股票池已保存: {UNIVERSE_FILE} (csi300={len(csi300_map)}, all={len(csi_all_map)})")
+
 
 def fetch_pledge_data_bulk():
     """一次性获取全市场质押数据"""
@@ -201,13 +486,12 @@ def get_full_universe():
 
     # 1. 中证全指 (红利低波100 + 科技100 的样本空间)
     print("获取中证全指成分股(000985)...")
-    df_all = _retry_fetch(ak.index_stock_cons, symbol="000985")
-    for _, row in df_all.iterrows():
-        code = row["品种代码"]
+    csi_all_map = fetch_index_constituents("000985")
+    for code, name in csi_all_map.items():
         if is_bse_stock(code):
             continue
-        stocks[code] = {"name": row["品种名称"], "source": "中证全指"}
-    print(f"  中证全指: {len(df_all)} 只")
+        stocks[code] = {"name": name, "source": "中证全指"}
+    print(f"  中证全指: {len(csi_all_map)} 只")
 
     # 2. 全A股 (中金300 的样本空间 = 沪深A股, 上市>500日, 非ST)
     #    中证全指已包含大部分, 补充未覆盖的
@@ -315,13 +599,18 @@ def get_market_snapshot():
                 pass
     print(f"  深证: {len(df_sz)} 只")
 
-    # 4. 中证全指成分股列表
+    # 4. 中证全指 + 沪深300 成分股列表(官网全量接口)
     print("获取中证全指成分股列表(000985)...")
-    df_csi = _retry_fetch(ak.index_stock_cons, symbol="000985")
-    csi_all_set = set(df_csi["品种代码"].tolist())
+    csi_all_map = fetch_index_constituents("000985")
+    csi_all_set = set(csi_all_map)
     for code in spot_map:
         spot_map[code]["in_csi_all"] = code in csi_all_set
     print(f"  中证全指: {len(csi_all_set)} 只")
+
+    print("获取沪深300成分股列表(000300)...")
+    csi300_map = fetch_index_constituents("000300")
+    print(f"  沪深300: {len(csi300_map)} 只")
+    save_stock_universe(csi300_map, csi_all_map)
 
     # 5. 质押数据 (含行业分类, 用于科技100的风险筛选和行业判断)
     print("获取质押数据...")

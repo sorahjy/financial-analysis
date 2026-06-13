@@ -42,6 +42,7 @@ from stock_advanced_strategies import (
     load_fundamental_stocks,
     load_stock_universe,
     passes_long_hard_filters,
+    price_history_rows,
     rerank_scored,
     safe_float,
 )
@@ -49,7 +50,15 @@ from stock_advanced_strategies import (
 
 OUTPUT_FILE = DATA_DIR / "stock_strategy_optimization.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
-LONG_BACKTEST_ANCHORS = [20, 15, 10, 7, 5]
+
+# 长线 walk-forward 回测参数：利用 data/CN_stock 的多年日线，
+# 每隔约半年取一折，持有约 1 年 / 2 年（交易日）。
+LONG_HOLD_CHOICES = [250, 500]
+LONG_FOLD_STEP_TD = 125
+LONG_MAX_LOOKBACK_TD = 2400
+LONG_COST = 0.004          # 单折买卖往返成本（佣金+冲击的粗略值）
+LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
+LONG_MIN_BM_SAMPLES = 30   # 一折内至少几只沪深300成员有数据才算基准
 RESEARCH_BASIS = [
     "Fama-French: size, value, profitability, investment; plus momentum/reversal sorts from the Kenneth French data library.",
     "Barra/MSCI-style families: size, value, momentum, volatility, liquidity, growth, leverage and quality.",
@@ -85,6 +94,109 @@ def pct_return_from_rows(rows: List[Dict[str, Any]], entry_idx: int, hold_days: 
 def recent_series_map() -> Dict[str, List[Dict[str, Any]]]:
     stocks = load_fundamental_stocks()
     return {code: combined_recent_rows(code, stock) for code, stock in stocks.items()}
+
+
+def full_series_map() -> Dict[str, List[Dict[str, Any]]]:
+    """长线回测用全量历史日线（CN_stock 优先，最长约10年；缺失回退近段数据）。"""
+    stocks = load_fundamental_stocks()
+    return {code: price_history_rows(code, stock) for code, stock in stocks.items()}
+
+
+def long_anchor_offsets(hold_td: int) -> List[int]:
+    """折锚点：距最新交易日的偏移（交易日数），保证持有期之后仍有出场价。"""
+    return list(range(hold_td + 1, LONG_MAX_LOOKBACK_TD, LONG_FOLD_STEP_TD))
+
+
+def benchmark_fold_returns(
+    series: Dict[str, List[Dict[str, Any]]],
+    hold_td: int,
+    offsets: List[int],
+) -> Dict[int, float]:
+    """每折的沪深300等权基准收益；成员价格样本太少的折直接丢弃。"""
+    csi300 = set(str(code).zfill(6) for code in load_stock_universe().get("csi300", []))
+    by_offset: Dict[int, float] = {}
+    for offset in offsets:
+        vals = []
+        for code in csi300:
+            ret = pct_return_from_rows(series.get(code) or [], -offset, hold_td)
+            if ret is not None:
+                vals.append(ret)
+        if len(vals) >= LONG_MIN_BM_SAMPLES:
+            by_offset[offset] = mean(vals)
+    return by_offset
+
+
+def long_walkforward_excess(
+    picks: List[Dict[str, Any]],
+    series: Dict[str, List[Dict[str, Any]]],
+    hold_td: int,
+    bm_by_offset: Dict[int, float],
+) -> List[Tuple[int, float]]:
+    """逐折计算组合等权收益 - 成本 - 同期沪深300等权基准，返回 [(offset, excess)]。
+
+    个股在某折缺历史（停牌/上市晚/本地无深历史）则跳过该股；
+    有效持仓不足 LONG_MIN_VALID_PICKS 的折整体丢弃，避免小样本噪音。
+    """
+    pairs: List[Tuple[int, float]] = []
+    for offset in sorted(bm_by_offset):
+        rets = []
+        for pick in picks:
+            ret = pct_return_from_rows(series.get(pick["code"]) or [], -offset, hold_td)
+            if ret is not None:
+                rets.append(ret)
+        if len(rets) < LONG_MIN_VALID_PICKS:
+            continue
+        pairs.append((offset, mean(rets) - LONG_COST - bm_by_offset[offset]))
+    return pairs
+
+
+def split_fold_pairs(pairs: List[Tuple[int, float]]) -> Tuple[List[Tuple[int, float]], List[Tuple[int, float]]]:
+    """按折序奇偶交替切训练/验证：选参只看训练折，验证折用于过拟合检查。"""
+    train = [pair for idx, pair in enumerate(pairs) if idx % 2 == 0]
+    val = [pair for idx, pair in enumerate(pairs) if idx % 2 == 1]
+    return train, val
+
+
+def long_fold_summary(pairs: List[Tuple[int, float]], hold_td: int) -> Dict[str, Any]:
+    if not pairs:
+        return {"folds": 0}
+    excess = [e for _, e in pairs]
+    ann = 250.0 / hold_td
+    vol = pstdev(excess) if len(excess) > 1 else 0.0
+    return {
+        "folds": len(excess),
+        "hold_td": hold_td,
+        "avg_excess_pct": round(mean(excess) * 100, 3),
+        "avg_excess_ann_pct": round(mean(excess) * ann * 100, 3),
+        "hit_rate": round(sum(1 for e in excess if e > 0) / len(excess) * 100, 2),
+        "ir": round(mean(excess) / vol, 3) if vol > 1e-9 else None,
+        "worst_fold_pct": round(min(excess) * 100, 3),
+    }
+
+
+def long_fold_objective(pairs: List[Tuple[int, float]], hold_td: int) -> Optional[float]:
+    """稳健型目标：中位数超额为主、均值为辅，重奖胜率、重罚最差折。
+
+    纯均值目标会选出"少数折暴赚、多数折跑输"的彩票型配置，
+    与长线稳健复利的定位不符。
+    """
+    if not pairs:
+        return None
+    excess = sorted(e for _, e in pairs)
+    n = len(excess)
+    ann = 250.0 / hold_td
+    median = excess[n // 2] if n % 2 else (excess[n // 2 - 1] + excess[n // 2]) / 2.0
+    mean_e = mean(excess)
+    hit = sum(1 for e in excess if e > 0) / n
+    vol = pstdev(excess) if n > 1 else 0.0
+    ir = mean_e / vol if vol > 1e-9 else 0.0
+    worst = excess[0]
+    return (
+        (median * 0.6 + mean_e * 0.4) * ann * 100
+        + hit * 15.0
+        + ir * 2.0
+        + min(0.0, worst * 100) * 0.1
+    )
 
 
 def score_long_candidates(
@@ -152,47 +264,6 @@ def summarize_returns(returns: List[float], benchmark: List[float]) -> Dict[str,
         "sharpe_like": round(avg_ret / vol, 4) if vol > 1e-9 else None,
         "max_drawdown": round(max_dd * 100, 4),
     }
-
-
-def benchmark_returns(
-    series: Dict[str, List[Dict[str, Any]]],
-    hold_days: int,
-    anchors: Iterable[int],
-) -> List[float]:
-    csi300 = set(str(code).zfill(6) for code in load_stock_universe().get("csi300", []))
-    out = []
-    for anchor in anchors:
-        fold_returns = []
-        for code in csi300:
-            rows = series.get(code) or []
-            ret = pct_return_from_rows(rows, -anchor, hold_days)
-            if ret is not None:
-                fold_returns.append(ret)
-        if fold_returns:
-            out.append(mean(fold_returns))
-    return out
-
-
-def long_price_backtest(
-    picks: List[Dict[str, Any]],
-    series: Dict[str, List[Dict[str, Any]]],
-    hold_days: int,
-    fold_bm: Optional[List[float]] = None,
-) -> Dict[str, Any]:
-    anchors = LONG_BACKTEST_ANCHORS
-    returns = []
-    if fold_bm is None:
-        fold_bm = benchmark_returns(series, hold_days, anchors)
-    for anchor in anchors:
-        fold_returns = []
-        for pick in picks:
-            rows = series.get(pick["code"]) or []
-            ret = pct_return_from_rows(rows, -anchor, hold_days)
-            if ret is not None:
-                fold_returns.append(ret)
-        if fold_returns:
-            returns.append(mean(fold_returns) - 0.003)
-    return summarize_returns(returns, fold_bm)
 
 
 def short_actual_backtest(
@@ -294,14 +365,15 @@ def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["long"])
     cfg["weights"] = mutate_weights(rng, cfg["weights"], [f.key for f in LONG_FACTORS], iteration)
     if iteration > 0:
-        cfg["top_n"] = rng.choice([8, 10, 15, 20, 25, 30, 40])
+        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 12
         cfg["min_score"] = rng.choice([45, 50, 55, 58, 60, 63, 66, 70])
-        cfg["min_market_cap_yi"] = rng.choice([300, 500, 800, 1000, 1500, 2000])
-        cfg["min_listing_years"] = rng.choice([3, 5, 8, 10, 12])
-        cfg["min_csi300_persistence"] = rng.choice([55, 60, 65, 70, 75, 80])
-        cfg["require_csi300"] = rng.random() < 0.82
+        # 市值下限放开到100亿，让中盘股（中证500档）有入池机会
+        cfg["min_market_cap_yi"] = rng.choice([100, 200, 300, 500, 800])
+        cfg["min_listing_years"] = rng.choice([2, 3, 5, 8, 10])
+        cfg["min_csi300_persistence"] = rng.choice([0, 25, 40, 50, 60])
+        cfg["require_csi300"] = rng.random() < 0.25
         cfg["require_high_drawdown"] = rng.random() < 0.25
-        cfg["min_high_drawdown_pct"] = rng.choice([20, 25, 30, 35, 40, 50])
+        # min_high_drawdown_pct 不参与搜索，固定用 DEFAULT_CONFIG 的 40
     return cfg
 
 
@@ -309,7 +381,7 @@ def random_short_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["short"])
     cfg["weights"] = mutate_weights(rng, cfg["weights"], [f.key for f in SHORT_FACTORS], iteration)
     if iteration > 0:
-        cfg["top_n"] = rng.choice([2, 3, 5, 8, 10, 15, 20, 30])
+        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 8
         cfg["min_score"] = rng.choice([35, 40, 45, 50, 55, 60, 65, 70])
         cfg["min_lhb_count"] = rng.choice([1, 2, 3, 4])
         cfg["min_hot_money_concurrent"] = rng.choice([0, 1, 2, 3])
@@ -332,28 +404,28 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "top_n": 80,
     })
     broad, notes = build_long_candidates(broad_cfg)
-    series = recent_series_map()
-    anchors = LONG_BACKTEST_ANCHORS
-    bm_cache: Dict[int, List[float]] = {}
+    series = full_series_map()
+    bm_cache: Dict[int, Dict[int, float]] = {}
     best = None
     trace = []
     for i in range(iterations):
         cfg = random_long_config(rng, i)
         picks = score_long_candidates(broad, cfg)
-        hold_days = rng.choice([5, 7, 10, 12]) if i else 10
-        if hold_days not in bm_cache:
-            bm_cache[hold_days] = benchmark_returns(series, hold_days, anchors)
-        summary = long_price_backtest(picks, series, hold_days=hold_days, fold_bm=bm_cache[hold_days])
-        fallback = (mean([p["score"] for p in picks]) if picks else -999.0) * 0.03
-        objective = objective_from_summary(summary, fallback_quality=fallback)
-        if not picks:
-            objective = -999.0
+        hold_td = rng.choice(LONG_HOLD_CHOICES) if i else LONG_HOLD_CHOICES[0]
+        if hold_td not in bm_cache:
+            bm_cache[hold_td] = benchmark_fold_returns(series, hold_td, long_anchor_offsets(hold_td))
+        pairs = long_walkforward_excess(picks, series, hold_td, bm_cache[hold_td])
+        train_pairs, val_pairs = split_fold_pairs(pairs)
+        train_obj = long_fold_objective(train_pairs, hold_td)
+        objective = -999.0 if (not picks or train_obj is None) else train_obj
         row = {
             "iteration": i + 1,
             "objective": round(objective, 5),
-            "hold_days_proxy": hold_days,
+            "hold_td": hold_td,
             "selected_count": len(picks),
-            "summary": summary,
+            "summary": long_fold_summary(pairs, hold_td),
+            "train_summary": long_fold_summary(train_pairs, hold_td),
+            "val_summary": long_fold_summary(val_pairs, hold_td),
             "top_codes": [p["code"] for p in picks[:5]],
             "config": cfg,
         }
@@ -366,7 +438,8 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "iterations": iterations,
         "candidate_count": len(broad),
         "notes": notes + [
-            "Long price backtest uses available recent local daily samples, not a true 2-5 year history.",
+            "Walk-forward 回测：近10年每约半年一折，持有250/500交易日，组合等权收益-成本-沪深300等权基准；选参只看训练折（奇偶切分），验证折结果存于 val_summary 供过拟合检查。",
+            "因子原始值取自当前财务/快照数据，对历史折存在前视偏差；中证800之外的小票本地多缺深历史，无法参与多年回测。",
         ],
         "best": best,
         "top_iterations": sorted(trace, key=lambda x: x["objective"], reverse=True)[:10],

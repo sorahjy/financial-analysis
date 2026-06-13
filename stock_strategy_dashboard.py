@@ -12,8 +12,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import Any, Dict
 
 from stock_advanced_strategies import (
@@ -22,7 +25,77 @@ from stock_advanced_strategies import (
     invalidate_dir_fingerprints,
     run_strategies,
 )
-from stock_data_refresh import REFRESH_REPORT_FILE, load_json, refresh_before_server
+from stock_data_refresh import (
+    REFRESH_REPORT_FILE,
+    load_json,
+    refresh_before_server,
+    resolve_python,
+)
+
+
+ROOT = Path(__file__).resolve().parent
+
+# 页面"搜索参数"按钮触发的后台任务状态；同一时间只允许一个搜索在跑。
+OPTIMIZE_LOCK = threading.Lock()
+OPTIMIZE_STATE: Dict[str, Any] = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "ok": None,
+    "error": "",
+    "elapsed_sec": None,
+}
+
+
+def _run_optimizer_job() -> None:
+    started = time.time()
+    cmd = [resolve_python(), "-B", "stock_strategy_optimizer.py", "--iterations", "100"]
+    ok = False
+    error = ""
+    try:
+        completed = subprocess.run(
+            cmd, cwd=str(ROOT), capture_output=True, text=True, timeout=1800
+        )
+        ok = completed.returncode == 0
+        if not ok:
+            tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+            error = " | ".join(tail[-3:]) if tail else f"exit={completed.returncode}"
+    except subprocess.TimeoutExpired:
+        error = "参数搜索超时(1800秒)"
+    except OSError as exc:
+        error = str(exc)
+    if ok:
+        # 优化器写入了新的 optimized config 与策略结果，强制下次访问重新扫描
+        invalidate_dir_fingerprints()
+    with OPTIMIZE_LOCK:
+        OPTIMIZE_STATE.update(
+            running=False,
+            finished_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            ok=ok,
+            error=error,
+            elapsed_sec=round(time.time() - started, 1),
+        )
+
+
+def start_optimizer_job() -> bool:
+    with OPTIMIZE_LOCK:
+        if OPTIMIZE_STATE["running"]:
+            return False
+        OPTIMIZE_STATE.update(
+            running=True,
+            started_at=time.strftime("%Y-%m-%d %H:%M:%S"),
+            finished_at=None,
+            ok=None,
+            error="",
+            elapsed_sec=None,
+        )
+    threading.Thread(target=_run_optimizer_job, daemon=True).start()
+    return True
+
+
+def optimizer_state_snapshot() -> Dict[str, Any]:
+    with OPTIMIZE_LOCK:
+        return dict(OPTIMIZE_STATE)
 
 
 HTML = r"""<!doctype html>
@@ -211,6 +284,65 @@ HTML = r"""<!doctype html>
       align-items: center;
       gap: 8px;
       min-height: 34px;
+    }
+    .field.disabled label {
+      color: #b6c0cf;
+    }
+    input[type="number"]:disabled {
+      background: #f1f5f9;
+      color: #94a3b8;
+      border-style: dashed;
+      cursor: not-allowed;
+    }
+    .dep-hint {
+      color: #94a3b8;
+      font-size: 11px;
+      line-height: 1.3;
+    }
+    .overlay {
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(246, 247, 249, 0.82);
+      backdrop-filter: blur(2px);
+    }
+    .overlay[hidden] {
+      display: none;
+    }
+    .overlay-card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      box-shadow: var(--shadow);
+      padding: 26px 34px;
+      display: grid;
+      gap: 10px;
+      justify-items: center;
+      text-align: center;
+      max-width: 360px;
+    }
+    .overlay-title {
+      font-size: 15px;
+      font-weight: 700;
+    }
+    .overlay-sub {
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .spinner {
+      width: 34px;
+      height: 34px;
+      border: 4px solid #dbe3ee;
+      border-top-color: var(--blue);
+      border-radius: 50%;
+      animation: spin 0.9s linear infinite;
+    }
+    @keyframes spin {
+      to { transform: rotate(360deg); }
     }
     .factor-tools {
       display: grid;
@@ -595,6 +727,7 @@ HTML = r"""<!doctype html>
           <button id="run" class="btn primary" type="button">运行</button>
           <button id="save" class="btn" type="button">保存配置</button>
           <button id="reset" class="btn" type="button">重置</button>
+          <button id="optimize" class="btn" type="button">搜索参数</button>
           <label class="toggle"><input id="auto" type="checkbox" checked>实时</label>
         </div>
       </div>
@@ -631,6 +764,14 @@ HTML = r"""<!doctype html>
       <div id="table" class="table-wrap"></div>
     </main>
   </div>
+  <div id="optimize-overlay" class="overlay" hidden>
+    <div class="overlay-card">
+      <div class="spinner"></div>
+      <div class="overlay-title">正在搜索参数…</div>
+      <div id="optimize-elapsed" class="overlay-sub">已耗时 0 秒</div>
+      <div class="overlay-sub">长线/短线各 100 次随机搜索回测，约需 1-2 分钟，请勿关闭页面</div>
+    </div>
+  </div>
   <script>
     let config = null;
     let registry = null;
@@ -640,6 +781,8 @@ HTML = r"""<!doctype html>
     let factorSearch = "";
     let factorGroup = "all";
     let factorGroupsExpanded = true;
+    let optimizeTimer = null;
+    let optimizeStartedAt = null;
 
     const $ = (id) => document.getElementById(id);
     const status = (text) => { $("status").textContent = text; };
@@ -671,6 +814,7 @@ HTML = r"""<!doctype html>
       }
       bindEvents();
       renderControls();
+      await resumeOptimizeIfRunning();
       await runNow();
     }
 
@@ -683,6 +827,8 @@ HTML = r"""<!doctype html>
         status("已保存");
       };
       $("reset").onclick = async () => {
+        const msg = "是否真的要重置为默认搜索参数？当前页面配置会被清空。";
+        if (!window.confirm(msg)) return;
         localStorage.removeItem("stockStrategyConfig");
         try {
           const payload = await fetchConfig();
@@ -706,6 +852,77 @@ HTML = r"""<!doctype html>
       };
       $("expand-factors").onclick = () => setFactorGroupsOpen(true);
       $("collapse-factors").onclick = () => setFactorGroupsOpen(false);
+      $("optimize").onclick = startOptimize;
+    }
+
+    async function startOptimize() {
+      const msg = "将对长线/短线各运行 100 次参数搜索回测"
+        + "（相当于 python stock_strategy_optimizer.py --iterations 100），"
+        + "约需 1-2 分钟，期间页面将锁定。确定开始吗？";
+      if (!window.confirm(msg)) return;
+      try {
+        const resp = await fetch("/api/optimize", {method: "POST"});
+        const payload = await resp.json();
+        if (!resp.ok) throw new Error(payload.error || "启动失败");
+      } catch (err) {
+        status("失败");
+        $("table").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+        return;
+      }
+      showOptimizeOverlay();
+    }
+
+    function showOptimizeOverlay() {
+      optimizeStartedAt = Date.now();
+      $("optimize-overlay").hidden = false;
+      status("搜索参数中");
+      clearInterval(optimizeTimer);
+      optimizeTimer = setInterval(pollOptimizeStatus, 3000);
+    }
+
+    async function pollOptimizeStatus() {
+      $("optimize-elapsed").textContent = `已耗时 ${Math.round((Date.now() - optimizeStartedAt) / 1000)} 秒`;
+      let state;
+      try {
+        const resp = await fetch("/api/optimize/status");
+        state = await resp.json();
+      } catch (err) {
+        return; // 网络抖动，下一轮再试
+      }
+      if (state.running) return;
+      clearInterval(optimizeTimer);
+      optimizeTimer = null;
+      $("optimize-overlay").hidden = true;
+      if (state.ok) {
+        // 旧的本地保存配置会覆盖新搜出的默认参数，搜索成功后直接作废
+        localStorage.removeItem("stockStrategyConfig");
+        try {
+          const payload = await fetchConfig();
+          config = payload.config;
+          registry = payload.factors;
+        } catch (err) {
+          status("失败");
+          $("table").innerHTML = `<div class="empty">${esc(err.message)}</div>`;
+          return;
+        }
+        renderControls();
+        await runNow();
+        status(`参数已更新(${state.elapsed_sec ?? "?"}s)`);
+      } else {
+        status("搜索失败");
+        $("table").innerHTML = `<div class="empty">参数搜索失败: ${esc(state.error || "未知错误")}</div>`;
+      }
+    }
+
+    async function resumeOptimizeIfRunning() {
+      // 页面中途刷新时，若后台搜索仍在跑，恢复遮罩与轮询
+      try {
+        const resp = await fetch("/api/optimize/status");
+        const state = await resp.json();
+        if (state.running) showOptimizeOverlay();
+      } catch (err) {
+        /* 状态接口异常不阻塞页面初始化 */
+      }
     }
 
     function switchStrategy(name) {
@@ -745,9 +962,9 @@ HTML = r"""<!doctype html>
           ["min_market_cap_yi", "市值下限(亿)", "number", 0, 5000, 50],
           ["min_listing_years", "上市年限", "number", 0, 20, 1],
           ["min_csi300_persistence", "成分稳定分", "number", 0, 100, 1],
-          ["min_high_drawdown_pct", "高点至今跌幅(%)", "number", 0, 95, 1],
           ["require_csi300", "必须当前沪深300", "checkbox"],
-          ["require_high_drawdown", "历史最高点至今跌幅达到", "checkbox"],
+          ["require_high_drawdown", "高点回撤过滤", "checkbox"],
+          ["min_high_drawdown_pct", "高点至今跌幅下限(%)", "number", 0, 95, 1, "require_high_drawdown"],
           ["exclude_st", "排除ST", "checkbox"]
         ];
       }
@@ -764,18 +981,29 @@ HTML = r"""<!doctype html>
     function renderParams() {
       const box = $("params");
       box.innerHTML = "";
-      for (const [key, label, type, min, max, step] of paramSchema()) {
+      const schema = paramSchema();
+      const labelByKey = Object.fromEntries(schema.map((row) => [row[0], row[1]]));
+      for (const [key, label, type, min, max, step, dependsOn] of schema) {
         const field = document.createElement("div");
         field.className = "field";
         if (type === "checkbox") {
           field.innerHTML = `<label>${esc(label)}</label><div class="checkrow"><input id="p-${key}" type="checkbox"><span>${esc(label)}</span></div>`;
           const input = field.querySelector("input");
           input.checked = Boolean(config[active][key]);
-          input.onchange = () => updateParam(key, input.checked);
+          input.onchange = () => {
+            updateParam(key, input.checked);
+            renderParams(); // 同步依赖此开关的输入框禁用状态
+          };
         } else {
-          field.innerHTML = `<label for="p-${key}">${esc(label)}</label><input id="p-${key}" type="number" min="${min}" max="${max}" step="${step}">`;
+          const enabled = !dependsOn || Boolean(config[active][dependsOn]);
+          const hint = dependsOn
+            ? `<small class="dep-hint">勾选「${esc(labelByKey[dependsOn] || dependsOn)}」后生效</small>`
+            : "";
+          field.innerHTML = `<label for="p-${key}">${esc(label)}</label><input id="p-${key}" type="number" min="${min}" max="${max}" step="${step}">${hint}`;
+          if (!enabled) field.classList.add("disabled");
           const input = field.querySelector("input");
           input.value = config[active][key];
+          input.disabled = !enabled;
           input.oninput = () => {
             const v = Number(input.value);
             if (input.value === "" || Number.isNaN(v)) return;
@@ -815,17 +1043,22 @@ HTML = r"""<!doctype html>
               <strong>${esc(group)}</strong>
               <span>${factors.length} 个</span>
             </span>
-            <span class="count-pill">权重 ${fmt(groupWeightSum(factors), 2)}</span>
+            <span class="count-pill group-weight" data-group="${esc(group)}">权重 ${fmt(groupWeightSum(factors), 2)}</span>
           </summary>
           <div class="factor-group-body">${factors.map((factor) => factorRow(factor)).join("")}</div>
         </details>
       `).join("");
+      const updateGroupPill = (group) => {
+        const pill = box.querySelector(`.group-weight[data-group="${CSS.escape(group)}"]`);
+        if (pill) pill.textContent = `权重 ${fmt(groupWeightSum(groups[group] || []), 2)}`;
+      };
       for (const factor of visibleFactors) {
         const range = $(`w-${factor.key}`);
         const num = $(`n-${factor.key}`);
         const setWeight = (value) => {
           const v = Math.max(0, Math.min(3, Number(value)));
           config[active].weights[factor.key] = v;
+          updateGroupPill(factor.group);
           scheduleRun();
           return v;
         };
@@ -932,19 +1165,13 @@ HTML = r"""<!doctype html>
     function renderMetrics(section) {
       const diag = section.diagnostics || {};
       const range = diag.score_range || ["--", "--"];
-      const counts = latest.factor_counts || {
-        long: latest.long?.factor_count ?? "--",
-        short: latest.short?.factor_count ?? "--",
-        total: latest.factor_total ?? "--"
-      };
       $("metrics").innerHTML = [
         ["候选", section.candidate_count],
         ["入选", section.selected_count],
         [active === "long" ? "长线因子" : "短线因子", section.factor_count],
         ["均分", diag.avg_score ?? "--"],
         ["分数区间", `${range[0]} / ${range[1]}`],
-        ["数据覆盖", diag.avg_data_quality === undefined ? "--" : `${fmt(diag.avg_data_quality * 100, 1)}%`],
-        ["因子分布", `长线 ${counts.long} / 短线 ${counts.short}`]
+        ["数据覆盖", diag.avg_data_quality === undefined ? "--" : `${fmt(diag.avg_data_quality * 100, 1)}%`]
       ].map(([label, value]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join("");
     }
 
@@ -973,7 +1200,7 @@ HTML = r"""<!doctype html>
         ["ST过滤", cfg.exclude_st ? "剔除名称包含 ST、*ST 或 S 前缀的股票" : "不过滤ST股票，风险只进入结果提示"],
         ["沪深300", cfg.require_csi300 ? "必须是当前沪深300成分股" : "不强制当前成分股，成分稳定性只参与打分"],
         ["成分稳定", `成分稳定分不低于 ${fmt(cfg.min_csi300_persistence, 0)}，历史快照不足时使用当前成员、核心池与上市年限代理`],
-        ["历史回撤", cfg.require_high_drawdown ? `可用历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `不启用硬过滤；当前阈值预设为 ${fmt(cfg.min_high_drawdown_pct, 0)}%`],
+        ["历史回撤", cfg.require_high_drawdown ? `已启用：历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `未启用：勾选「高点回撤过滤」后，才会按跌幅下限 ${fmt(cfg.min_high_drawdown_pct, 0)}% 硬过滤`],
         ["市值门槛", `总市值不低于 ${fmt(cfg.min_market_cap_yi, 0)} 亿元`],
         ["上市年限", `上市时间不低于 ${fmt(cfg.min_listing_years, 0)} 年`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
@@ -1091,9 +1318,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if self.path == "/api/health":
             self.send_json({"ok": True, "refresh": load_json(REFRESH_REPORT_FILE, {})})
             return
+        if self.path == "/api/optimize/status":
+            self.send_json(optimizer_state_snapshot())
+            return
         self.send_error(404, "Not found")
 
     def do_POST(self) -> None:
+        if self.path == "/api/optimize":
+            if start_optimizer_job():
+                self.send_json({"started": True})
+            else:
+                self.send_json({"error": "参数搜索已在运行中"}, status=409)
+            return
         if self.path != "/api/run":
             self.send_error(404, "Not found")
             return

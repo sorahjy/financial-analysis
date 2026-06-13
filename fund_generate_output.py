@@ -438,16 +438,42 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
         BOND_HIGHLIGHT_RED, BOND_HIGHLIGHT_GREEN)
 
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
+    signal_counts = {'buy': 0, 'sell': 0, 'hold': 0, 'total': 0}
+    if signals:
+        signal_counts['buy'] = sum(1 for s in signals.values() if s.get('overall') == '买入')
+        signal_counts['sell'] = sum(1 for s in signals.values() if s.get('overall') == '卖出')
+        signal_counts['hold'] = sum(1 for s in signals.values() if s.get('overall') == '持有')
+        signal_counts['total'] = len(signals)
+
+    summary_html = f'''
+    <div class="stat-grid">
+        <div class="stat-card">
+            <span>股票型基金</span>
+            <strong>{len(equity_rows)}</strong>
+        </div>
+        <div class="stat-card">
+            <span>债券型基金</span>
+            <strong>{len(bond_rows)}</strong>
+        </div>
+        <div class="stat-card">
+            <span>技术信号</span>
+            <strong>{signal_counts["total"]}</strong>
+        </div>
+        <div class="stat-card signal-stat">
+            <span>买 / 卖 / 持有</span>
+            <strong><b class="buy-text">{signal_counts["buy"]}</b> / <b class="sell-text">{signal_counts["sell"]}</b> / {signal_counts["hold"]}</strong>
+        </div>
+    </div>'''
 
     def render_table(title, compare_index, rows):
         benchmark_names = [tmp_data[idx][1] if idx in tmp_data else idx for idx in compare_index]
         n_benchmarks = len(compare_index)
-        header1 = '<tr><th></th><th></th><th></th>'
+        header1 = '<tr><th class="sticky-col sticky-code"></th><th class="sticky-col sticky-name"></th><th></th>'
         for name in benchmark_names:
             header1 += f'<th colspan="{TOT_METRIC}" class="benchmark-header">{esc(name)}</th>'
         header1 += '</tr>'
 
-        header2 = '<tr><th>代码</th><th>名字</th><th>管理规模(亿)</th>'
+        header2 = '<tr><th class="sticky-col sticky-code">代码</th><th class="sticky-col sticky-name">名字</th><th>管理规模(亿)</th>'
         for _ in range(n_benchmarks):
             for label in PERIOD_LABELS:
                 header2 += f'<th>{esc(label)}</th>'
@@ -455,11 +481,13 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
 
         body = ''
         for row in rows:
-            code_class = ' class="held"' if row['is_held'] else ''
+            code_classes = ['sticky-col', 'sticky-code', 'code-cell']
+            if row['is_held']:
+                code_classes.append('held')
             asset_cls = f' class="{row["asset_class"]}"' if row['asset_class'] else ''
             body += '<tr>'
-            body += f'<td{code_class}>{esc(row["code"])}</td>'
-            body += f'<td>{esc(row["name"])}</td>'
+            body += f'<td class="{" ".join(code_classes)}">{esc(row["code"])}</td>'
+            body += f'<td class="sticky-col sticky-name name-cell">{esc(row["name"])}</td>'
             body += f'<td{asset_cls}>{esc(row["total_asset"])}</td>'
             for cells in row['benchmarks']:
                 for val, css in cells:
@@ -468,20 +496,25 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             body += '</tr>\n'
 
         return f'''
-        <h2>{title}</h2>
-        <div class="table-wrapper">
-        <table>
-            <thead>{header1}{header2}</thead>
-            <tbody>{body}</tbody>
-        </table>
-        </div>'''
+        <section class="report-section">
+            <div class="section-head">
+                <h2>{title}</h2>
+                <span>{len(rows)} 只基金 · {n_benchmarks} 个基准</span>
+            </div>
+            <div class="table-wrapper">
+                <table class="metric-table">
+                    <thead>{header1}{header2}</thead>
+                    <tbody>{body}</tbody>
+                </table>
+            </div>
+        </section>'''
 
     manager_html = ''
     if change_manager:
         items = ''.join(f'<li>{esc(code)} - {esc(name)}</li>' for code, name in change_manager)
-        manager_html = f'<div class="alert">近20天内以下基金经理发生变更：<ul>{items}</ul></div>'
+        manager_html = f'<div class="status-banner alert">近20天内以下基金经理发生变更：<ul>{items}</ul></div>'
     else:
-        manager_html = '<div class="ok">近20天内列表中基金经理没有变更。</div>'
+        manager_html = '<div class="status-banner ok">近20天内列表中基金经理没有变更。</div>'
 
     # 技术分析板块
     signal_html = ''
@@ -504,7 +537,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             # 净值列：如果有估算数据，追加显示
             nav_display = esc(sig.get('latest_nav', ''))
             if sig.get('estimated') and sig.get('latest_nav'):
-                nav_display += f'<br><small style="color:#1890ff">估值</small>'
+                nav_display += '<br><small class="estimate-label">估值</small>'
 
             # 建议列：追加估算时间
             gztime = sig.get('gztime', '')
@@ -521,17 +554,17 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             j_s = sig.get('j_score', 0)
             boll_s = sig.get('boll_score', 0)
 
-            force_note = '<br><small style="color:#722ed1">触发止盈</small>' if sig.get('is_force_sell') else ''
+            force_note = '<br><small class="force-label">触发止盈</small>' if sig.get('is_force_sell') else ''
             filter_reason = sig.get('filter_reason', '')
-            filter_note = f'<br><small style="color:#fa8c16">{esc(filter_reason)}</small>' if filter_reason else ''
+            filter_note = f'<br><small class="filter-label">{esc(filter_reason)}</small>' if filter_reason else ''
             if sig.get('is_force_sell'):
                 overall_badge = '<span class="signal-badge badge-force-sell">止盈信号</span>'
             else:
                 overall_badge = render_signal_badge(sig['overall'])
 
             signal_rows += f'''<tr>
-                <td>{esc(code)}</td>
-                <td>{esc(name)}</td>
+                <td class="code-cell">{esc(code)}</td>
+                <td class="name-cell">{esc(name)}</td>
                 <td>{nav_display}</td>
                 <td class="chart-cell">{sparkline}</td>
                 <td>{render_signal_badge(sig['ma_signal'], ma_s)}</td>
@@ -559,7 +592,7 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
             <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#52c41a" opacity="0.85"/></svg> 卖出信号</span>
             <span><svg width="14" height="12"><polygon points="7,11 2,1 12,1" fill="#722ed1" opacity="0.85"/></svg> 止盈信号</span>
         </div>
-        <p class="signal-note">ADX&ge;25=趋势行情（MA/MACD权重&times;{ADX_WEIGHT}，MA60趋势&plusmn;{TREND_60_SCORE}），ADX&lt;25=震荡行情（RSI/布林权重&times;{ADX_WEIGHT}，MA60趋势=0），KDJ固定权重&times;1 | 综合建议: 评分 &ge;+{BUY_SIGNAL} 买入, &le;{SELL_SIGNAL} 卖出 | 买卖信号经历史去重(变动需超{round(CONSEC_CHANGE_PCT * 100)}%)、百分位过滤(买&gt;{BUY_PERCENTILE_CAP}%/卖&lt;{SELL_PERCENTILE_FLOOR}%无效) | {'净值涨幅&gt;' + str(round((FORCE_TAKE_PROFIT - 1) * 100)) + '%触发<span style="color:#722ed1">止盈信号</span>' if FORCE_TAKE_PROFIT_ENABLED else '止盈信号已关闭'} | ATR/百分位仅展示</p>
+        <p class="signal-note">ADX&ge;25=趋势行情（MA/MACD权重&times;{ADX_WEIGHT}，MA60趋势&plusmn;{TREND_60_SCORE}），ADX&lt;25=震荡行情（RSI/布林权重&times;{ADX_WEIGHT}，MA60趋势=0），KDJ固定权重&times;1 | 综合建议: 评分 &ge;+{BUY_SIGNAL} 买入, &le;{SELL_SIGNAL} 卖出 | 买卖信号经历史去重(变动需超{round(CONSEC_CHANGE_PCT * 100)}%)、百分位过滤(买&gt;{BUY_PERCENTILE_CAP}%/卖&lt;{SELL_PERCENTILE_FLOOR}%无效) | {'净值涨幅&gt;' + str(round((FORCE_TAKE_PROFIT - 1) * 100)) + '%触发<span class="force-label">止盈信号</span>' if FORCE_TAKE_PROFIT_ENABLED else '止盈信号已关闭'} | ATR/百分位仅展示</p>
         <div class="table-wrapper">
         <table class="signal-table">
             <thead>
@@ -582,79 +615,320 @@ def generate_html(tmp_data, equity_config, bond_config, change_manager, signals=
 <title>基金量化指标报告</title>
 <style>
     * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-    body {{ font-family: -apple-system, "Microsoft YaHei", sans-serif; background: #f5f7fa; color: #333; padding: 20px; }}
-    h1 {{ text-align: center; margin: 20px 0 5px; font-size: 24px; }}
-    .date {{ text-align: center; color: #888; margin-bottom: 20px; font-size: 14px; }}
-    h2 {{ margin: 30px 0 10px; padding-left: 10px; border-left: 4px solid #1890ff; font-size: 18px; }}
-    .table-wrapper {{ overflow-x: auto; margin-bottom: 20px; }}
-    table {{ border-collapse: collapse; font-size: 13px; white-space: nowrap; min-width: 100%; }}
-    th, td {{ border: 1px solid #d9d9d9; padding: 6px 10px; text-align: center; }}
-    thead th {{ background: #fafafa; font-weight: 600; position: sticky; top: 0; }}
-    .benchmark-header {{ background: #e6f7ff; color: #1890ff; }}
-    tbody tr:hover {{ background: #f0f5ff; }}
-    td.red {{ background: #fff1f0; color: #cf1322; }}
-    td.green {{ background: #f6ffed; color: #389e0d; }}
-    td.held {{ background: #f9f0ff; color: #722ed1; font-weight: 600; }}
-    .alert {{ margin: 20px 0; padding: 12px 16px; background: #fff2e8; border: 1px solid #ffbb96; border-radius: 4px; color: #d4380d; }}
-    .alert ul {{ margin: 8px 0 0 20px; }}
-    .ok {{ margin: 20px 0; padding: 12px 16px; background: #f6ffed; border: 1px solid #b7eb8f; border-radius: 4px; color: #389e0d; }}
+    :root {{
+        --bg: #f4f6f8;
+        --surface: #ffffff;
+        --surface-soft: #f8fafc;
+        --surface-tint: #eef6ff;
+        --ink: #1f2937;
+        --muted: #64748b;
+        --line: #d8e0ea;
+        --line-soft: #e8edf3;
+        --blue: #2563eb;
+        --cyan: #0e7490;
+        --green: #15803d;
+        --green-soft: #edf8f1;
+        --red: #b91c1c;
+        --red-soft: #fff1f1;
+        --amber: #b45309;
+        --amber-soft: #fff7ed;
+        --purple: #6d28d9;
+        --purple-soft: #f5f0ff;
+        --shadow: 0 12px 28px rgba(15, 23, 42, 0.08);
+    }}
+    body {{
+        min-width: 1100px;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
+        background: var(--bg);
+        color: var(--ink);
+        padding: 0;
+        font-size: 13px;
+        line-height: 1.45;
+    }}
+    .page {{
+        width: 90%;
+        margin: 0 auto;
+        padding: 0;
+    }}
+    .report-header {{
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 20px;
+        padding: 2px 0 18px;
+        border-bottom: 1px solid var(--line);
+    }}
+    .eyebrow {{
+        margin-bottom: 5px;
+        color: var(--cyan);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0;
+        text-transform: uppercase;
+    }}
+    h1 {{
+        margin: 0;
+        font-size: 28px;
+        line-height: 1.15;
+        font-weight: 760;
+        color: #172033;
+    }}
+    .date {{
+        color: var(--muted);
+        font-size: 12px;
+        text-align: right;
+        white-space: nowrap;
+    }}
+    .date strong {{
+        display: block;
+        margin-top: 4px;
+        color: var(--ink);
+        font-size: 15px;
+        font-weight: 700;
+    }}
+    .stat-grid {{
+        display: grid;
+        grid-template-columns: repeat(4, minmax(150px, 1fr));
+        gap: 12px;
+        margin: 18px 0;
+    }}
+    .stat-card {{
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        padding: 13px 15px;
+        box-shadow: 0 6px 16px rgba(15, 23, 42, 0.04);
+    }}
+    .stat-card span {{
+        display: block;
+        margin-bottom: 5px;
+        color: var(--muted);
+        font-size: 12px;
+    }}
+    .stat-card strong {{
+        font-size: 23px;
+        line-height: 1;
+        font-weight: 760;
+        color: var(--ink);
+    }}
+    .stat-card b {{
+        font-weight: 760;
+    }}
+    .buy-text {{ color: var(--red); }}
+    .sell-text {{ color: var(--green); }}
+    .status-banner {{
+        margin: 16px 0 22px;
+        padding: 12px 14px;
+        border-radius: 8px;
+        font-weight: 650;
+    }}
+    .status-banner ul {{ margin: 8px 0 0 20px; font-weight: 500; }}
+    .alert {{ background: var(--amber-soft); border: 1px solid #fed7aa; color: var(--amber); }}
+    .ok {{ background: var(--green-soft); border: 1px solid #bbf7d0; color: var(--green); }}
+    .report-section {{ margin-top: 24px; }}
+    .section-head {{
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 14px;
+        margin-bottom: 10px;
+    }}
+    h2 {{
+        margin: 0;
+        font-size: 18px;
+        line-height: 1.25;
+        color: #172033;
+    }}
+    .section-head span {{
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+    }}
+    .table-wrapper {{
+        overflow: auto;
+        max-height: 72vh;
+        margin-bottom: 22px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--surface);
+        box-shadow: var(--shadow);
+    }}
+    table {{
+        border-collapse: separate;
+        border-spacing: 0;
+        white-space: nowrap;
+        min-width: 100%;
+        font-variant-numeric: tabular-nums;
+    }}
+    th, td {{
+        border-right: 1px solid var(--line-soft);
+        border-bottom: 1px solid var(--line-soft);
+        padding: 8px 10px;
+        text-align: center;
+        background: var(--surface);
+    }}
+    th:last-child, td:last-child {{ border-right: 0; }}
+    thead th {{
+        background: var(--surface-soft);
+        color: #334155;
+        font-size: 12px;
+        font-weight: 700;
+        position: sticky;
+        z-index: 4;
+    }}
+    thead tr:first-child th {{ top: 0; }}
+    thead tr:nth-child(2) th {{ top: 35px; }}
+    .benchmark-header {{
+        background: var(--surface-tint);
+        color: var(--blue);
+        border-bottom-color: #bfdbfe;
+    }}
+    tbody tr:nth-child(even) td {{ background: #fbfcfe; }}
+    tbody tr:hover td {{ background: #f3f8ff; }}
+    .sticky-col {{
+        position: sticky;
+        z-index: 3;
+        background: var(--surface);
+    }}
+    thead .sticky-col {{
+        z-index: 6;
+        background: var(--surface-soft);
+    }}
+    tbody tr:nth-child(even) .sticky-col {{ background: #fbfcfe; }}
+    tbody tr:hover .sticky-col {{ background: #f3f8ff; }}
+    .sticky-code {{
+        left: 0;
+        width: 90px;
+        min-width: 90px;
+        max-width: 90px;
+    }}
+    .sticky-name {{
+        left: 90px;
+        width: 230px;
+        min-width: 230px;
+        max-width: 230px;
+        text-align: left;
+        box-shadow: 1px 0 0 var(--line);
+    }}
+    .code-cell {{ font-weight: 700; color: #334155; }}
+    .name-cell {{
+        overflow: hidden;
+        text-overflow: ellipsis;
+    }}
+    td.red {{
+        background: var(--red-soft) !important;
+        color: var(--red);
+        font-weight: 700;
+    }}
+    td.green {{
+        background: var(--green-soft) !important;
+        color: var(--green);
+        font-weight: 700;
+    }}
+    td.held {{
+        background: var(--purple-soft) !important;
+        color: var(--purple);
+        font-weight: 800;
+    }}
 
     /* 技术分析样式 */
+    .signal-table {{ min-width: 1780px; }}
     .signal-table td {{ vertical-align: middle; }}
-    .chart-cell {{ padding: 4px !important; }}
+    .signal-table thead tr:first-child th {{ top: 0; }}
+    .chart-cell {{ padding: 6px !important; }}
+    .chart-cell svg {{ display: block; margin: 0 auto; }}
     .signal-badge {{
-        display: inline-block; padding: 2px 8px; border-radius: 10px;
-        font-size: 11px; font-weight: 600; color: #fff; margin: 1px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        min-width: 46px;
+        padding: 3px 8px;
+        border-radius: 999px;
+        font-size: 11px;
+        font-weight: 700;
+        color: #fff;
+        margin: 1px;
     }}
-    .badge-buy {{ background: #f5222d; }}
-    .badge-sell {{ background: #52c41a; }}
-    .badge-hold {{ background: #8c8c8c; }}
-    .badge-force-sell {{ background: #722ed1; }}
-    .trend-bull {{ color: #cf1322; font-weight: 600; font-size: 12px; }}
-    .trend-bear {{ color: #389e0d; font-weight: 600; font-size: 12px; }}
-    .trend-neutral {{ color: #8c8c8c; font-size: 12px; }}
+    .badge-buy {{ background: var(--red); }}
+    .badge-sell {{ background: var(--green); }}
+    .badge-hold {{ background: #64748b; }}
+    .badge-force-sell {{ background: var(--purple); }}
+    .trend-bull {{ color: var(--red); font-weight: 700; font-size: 12px; }}
+    .trend-bear {{ color: var(--green); font-weight: 700; font-size: 12px; }}
+    .trend-neutral {{ color: var(--muted); font-size: 12px; }}
     .rsi-bar {{
-        position: relative; width: 110px; height: 18px;
-        background: #f0f0f0; border-radius: 9px; overflow: hidden;
+        position: relative; width: 116px; height: 20px;
+        background: #edf2f7; border-radius: 999px; overflow: hidden;
+        border: 1px solid #d8e0ea;
         display: inline-block; vertical-align: middle;
     }}
-    .rsi-fill {{ height: 100%; border-radius: 9px; }}
+    .rsi-fill {{ height: 100%; border-radius: 999px; opacity: 0.82; }}
     .rsi-label {{
         position: absolute; top: 0; left: 0; right: 0;
         text-align: center; font-size: 11px; line-height: 18px;
-        color: #333; font-weight: 500;
+        color: #172033; font-weight: 650;
     }}
-    .rsi-na {{ color: #bbb; font-size: 12px; }}
+    .rsi-na {{ color: #94a3b8; font-size: 12px; }}
     .score-bar {{
-        position: relative; width: 80px; height: 18px;
-        background: #f0f0f0; border-radius: 9px; overflow: hidden;
+        position: relative; width: 92px; height: 20px;
+        background: #edf2f7; border-radius: 999px; overflow: hidden;
+        border: 1px solid #d8e0ea;
         display: inline-block; vertical-align: middle;
     }}
-    .score-fill {{ height: 100%; border-radius: 9px; }}
+    .score-fill {{ height: 100%; border-radius: 999px; opacity: 0.82; }}
     .score-label {{
         position: absolute; top: 0; left: 0; right: 0;
         text-align: center; font-size: 11px; line-height: 18px;
-        color: #333; font-weight: 600;
+        color: #172033; font-weight: 750;
     }}
-    .dd-high {{ color: #cf1322; font-weight: 600; }}
-    .dd-mid {{ color: #fa8c16; font-weight: 500; }}
-    .dd-low {{ color: #389e0d; }}
+    .dd-high {{ color: var(--red); font-weight: 700; }}
+    .dd-mid {{ color: var(--amber); font-weight: 650; }}
+    .dd-low {{ color: var(--green); font-weight: 650; }}
     .legend {{
-        margin: 10px 0; display: flex; gap: 16px; align-items: center;
-        font-size: 13px; color: #666; flex-wrap: wrap;
+        margin: 10px 0;
+        display: flex;
+        gap: 12px 18px;
+        align-items: center;
+        font-size: 12px;
+        color: var(--muted);
+        flex-wrap: wrap;
     }}
     .legend span {{ display: flex; align-items: center; gap: 4px; }}
-    .signal-note {{ font-size: 12px; color: #999; margin: 4px 0 12px; }}
-    small {{ color: #999; font-size: 11px; }}
+    .signal-note {{
+        max-width: 1280px;
+        font-size: 12px;
+        color: var(--muted);
+        margin: 4px 0 12px;
+    }}
+    .estimate-label {{ color: var(--blue); }}
+    .force-label {{ color: var(--purple); font-weight: 700; }}
+    .filter-label {{ color: var(--amber); }}
+    small {{ color: var(--muted); font-size: 11px; }}
+    @media (max-width: 900px) {{
+        body {{ min-width: 760px; }}
+        .page {{ width: 90%; padding: 0; }}
+        .report-header {{ align-items: flex-start; flex-direction: column; }}
+        .date {{ text-align: left; }}
+        .stat-grid {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+        h1 {{ font-size: 24px; }}
+    }}
 </style>
 </head>
 <body>
-<h1>基金量化指标报告</h1>
-<p class="date">生成时间：{today}</p>
-{manager_html}
-{render_table("股票型基金（中高风险）", equity_compare, equity_rows)}
-{render_table("债券型基金（中低风险）", bond_compare, bond_rows)}
-{signal_html}
+<div class="page">
+    <header class="report-header">
+        <div>
+            <p class="eyebrow">financial-analysis</p>
+            <h1>基金量化指标报告</h1>
+        </div>
+        <p class="date">生成时间<strong>{today}</strong></p>
+    </header>
+    {summary_html}
+    {manager_html}
+    {render_table("股票型基金（中高风险）", equity_compare, equity_rows)}
+    {render_table("债券型基金（中低风险）", bond_compare, bond_rows)}
+    {signal_html}
+</div>
 </body>
 </html>'''
 
