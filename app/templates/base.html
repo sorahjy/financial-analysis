@@ -5,6 +5,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{% block title %}financial-analysis{% endblock %}</title>
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/fund-report.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/stock-dashboard.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -21,5 +23,9 @@
     </main>
   </div>
   {% block scripts %}{% endblock %}
+  <script src="{{ url_for('static', filename='js/fund-report.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/stock-dashboard.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/app-navigation.js') }}"></script>
+  <script type="module" src="{{ url_for('static', filename='vendor/live2d-widget/autoload.js') }}"></script>
 </body>
 </html>

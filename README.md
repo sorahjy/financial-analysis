@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.1
+当前版本：v3.1.1.post1
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -252,6 +252,7 @@ python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies
 ├── stock_data_refresh.py          # 股票数据刷新编排
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
 ├── stock_hot_money_radar.py       # 游资拉升/潜伏雷达
+├── app/static/vendor/live2d-widget # 本地化 Live2D 小组件运行时资源
 ├── tests/                         # 核心逻辑和股票策略单测
 ├── img/                           # README 和说明文档展示图
 └── data/                          # 本地缓存、策略结果和刷新报告
@@ -320,6 +321,9 @@ python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies
 
 #### Update v3.1.1  2026.6.13
 优化长线策略参数搜索与报告展示：510310 沪深300ETF 基准纳入股票数据刷新流程并扩展到近 12 年，长线默认输出数量固定为 10、默认搜索次数调整为 200，回测折起点间隔改为 30 个交易日，并生成每折组合走势与 510310 基准对比图；补充真实净值曲线最大回撤与基准最大回撤，`worst_fold_pct` 更名为 `worst_fold_excess_pct` 以避免与净值回撤混淆；移除“成分稳定分”硬过滤，仅保留沪深300稳定代理因子参与打分，避免与“必须当前沪深300”逻辑重叠；继续优化基金 HTML 报告的深色主题、筛选、排序和持仓过滤体验，移除强/弱超额筛选项并修复持仓筛选影响技术分析展示的问题。将基金报告与 A 股策略台统一到单一 Flask 工作台（`python run.py --port 8765`，路由 `/`、`/fund`、`/stock`），基金报告改为 `data/fund_report_data.json` 经 Flask 服务端渲染；清理迁移后的冗余——删除独立 HTML 报告链（`stock_generate_output.py` / `stock_report.html` / `stock_run.sh` / `fund_report.html`）与 `stock_crawl_top_800_data.py` 中已无消费者的回撤选股、选股回测代码（保留 510310 沪深300 ETF 基准），去重 `file_status`、合并 Flask 启动器、清理死配置，生成物 HTML 不再入库；基金净值与实时估值抓取脚本合并为单一 `fund_fetch_data.py`；新增 MIT LICENSE。
+
+#### Update v3.1.1.post1  2026.6.14
+优化股票部分爬虫逻辑，降低爬取时间。小幅优化游资雷达逻辑，开发中。重构 Flask 页面逻辑，新增 Live2D 小组件。
 
 ## 12. Acknowledgment
 

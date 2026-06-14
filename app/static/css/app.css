@@ -252,6 +252,126 @@ input {
   word-break: break-word;
 }
 
+.fund-editor-modal {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(15, 23, 42, 0.44);
+  backdrop-filter: blur(5px);
+}
+
+.fund-editor-modal[hidden] {
+  display: none;
+}
+
+.fund-editor-dialog {
+  width: min(1180px, 96vw);
+  height: min(760px, 88vh);
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 24px 70px rgba(15, 23, 42, 0.24);
+}
+
+.fund-editor-head,
+.fund-editor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--panel-soft);
+}
+
+.fund-editor-actions {
+  border-top: 1px solid var(--line);
+  border-bottom: 0;
+}
+
+.fund-editor-head h2 {
+  margin: 0;
+  font-size: 16px;
+  line-height: 1.25;
+}
+
+.fund-editor-head p,
+.fund-editor-actions span {
+  margin: 4px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.python-editor {
+  position: relative;
+  min-height: 0;
+  overflow: hidden;
+  background: #0f172a;
+}
+
+.python-editor textarea,
+.python-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 16px 18px;
+  overflow: auto;
+  border: 0;
+  outline: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  tab-size: 4;
+  white-space: pre;
+}
+
+.python-editor textarea {
+  z-index: 2;
+  resize: none;
+  color: transparent;
+  background: transparent;
+  caret-color: #e2e8f0;
+}
+
+.python-editor textarea::selection {
+  background: rgba(96, 165, 250, 0.34);
+}
+
+.python-highlight {
+  z-index: 1;
+  color: #dbeafe;
+  pointer-events: none;
+}
+
+.python-highlight code {
+  display: block;
+  min-width: max-content;
+}
+
+.py-comment {
+  color: #64748b;
+  font-style: italic;
+}
+
+.py-string {
+  color: #86efac;
+}
+
+.py-keyword {
+  color: #93c5fd;
+  font-weight: 700;
+}
+
+.py-number {
+  color: #fbbf24;
+}
+
 .module-grid,
 .status-grid {
   display: grid;
@@ -391,4 +511,5 @@ input {
   .app-main {
     width: min(100% - 24px, 1480px);
   }
+
 }

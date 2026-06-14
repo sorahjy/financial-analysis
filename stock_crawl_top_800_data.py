@@ -30,7 +30,8 @@ import pandas as pd
 DATA_DIR = Path("data/CN_stock")
 MAX_YEARS = 10
 MAX_RETRIES = 3
-DEFAULT_THREAD_COUNT = 6
+DEFAULT_THREAD_COUNT = 6   # 不要调高：>6 易被东财/百度等境内接口限流甚至跑挂
+VALUATION_FRESH_DAYS = 7   # 最近一条估值在该天数内则跳过重抓（百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略）
 
 
 def _env_int(name, default, minimum=1, maximum=None):
@@ -347,8 +348,8 @@ def attach_valuation(records, val_by_date):
 
 def _decide_valuation_period(records, today):
     """决定估值拉取策略：
-      - None    : 最后一条（end_date）已有完整估值字段 → 跳过
-      - "近一年": 估值落后 ≤300 天
+      - None    : 最后一条已有完整估值，或最近一条估值在 VALUATION_FRESH_DAYS 天内 → 跳过
+      - "近一年": 估值落后 (VALUATION_FRESH_DAYS, 300] 天
       - "近五年": 首次 / 估值缺失 / 落后过多（百度接口最远可取 5 年）
     """
     if not records:
@@ -374,6 +375,10 @@ def _decide_valuation_period(records, today):
     except ValueError:
         return "近五年"
 
+    # 估值足够新则跳过重抓：百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略；
+    # 超过阈值后再批量回补，不影响历史估值序列密度与优化器的 PIT 回测。
+    if gap_days <= VALUATION_FRESH_DAYS:
+        return None
     return "近一年" if gap_days <= 300 else "近五年"
 
 

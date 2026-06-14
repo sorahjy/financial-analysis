@@ -26,7 +26,7 @@ import akshare as ak
 
 KLINE_LOOKBACK = 60      # 取最近 60 个交易日（足够算 MA20 / RSI / 距高点）
 MAX_RETRIES = 3
-THREAD_COUNT = 6
+THREAD_COUNT = 6         # 不要调高：>6 易被龙虎榜/K线接口限流甚至跑挂
 DATA_DIR = Path("data/capital")
 KNOWN_SEAT_TOP_N = 100   # 营业部排行前 N 标记为高活跃/知名席位
 

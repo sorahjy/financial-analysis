@@ -204,6 +204,35 @@ def fetch_big_deals():
     return out
 
 
+def fetch_main_capital_flow(indicator="今日"):
+    """东财全市场个股资金分级（一个请求）→ {code: {main_net, main_ratio, small_net}}。
+    indicator: "今日"(拉升用) / "5日" / "10日"(潜伏吸筹用)。main=主力(超大+大单)净额，
+    small=小单净额；用于 ①「主力进散户出」背离判断。
+    需代理关闭直连(东财 push2)；失败返回 {}（① 背离分项自动降级为 0）。"""
+    df = _retry(ak.stock_individual_fund_flow_rank, indicator=indicator)
+    out = {}
+    if df is None or getattr(df, "empty", True):
+        return out
+    cols = list(df.columns)
+    find = lambda key: next((c for c in cols if key in c), None)
+    code_col = find("代码")
+    main_net_col = find("主力净流入-净额") or find("主力净流入")
+    main_ratio_col = find("主力净流入-净占比") or find("主力净流入净占比")
+    small_net_col = find("小单净流入-净额") or find("小单净流入")
+    if not code_col or not main_net_col:
+        return out
+    for _, row in df.iterrows():
+        code = _norm_code(row.get(code_col))
+        if not code:
+            continue
+        out[code] = {
+            "main_net": _num(row.get(main_net_col)),
+            "main_ratio": _parse_pct(row.get(main_ratio_col)) if main_ratio_col else None,
+            "small_net": _num(row.get(small_net_col)) if small_net_col else None,
+        }
+    return out
+
+
 def fetch_limit_pool():
     """涨停池（取最近一个有数据的交易日）→ {code: 封板行为字段}"""
     for back in range(6):
@@ -225,6 +254,7 @@ def fetch_limit_pool():
                 "first_seal_time": str(row.get("首次封板时间", ""))[:8],
                 "break_times": int(_num(row.get("炸板次数"))),
                 "consecutive": int(_num(row.get("连板数"))),
+                "industry": str(row.get("所属行业", "")).strip(),
             }
         return out, date
     return {}, None
@@ -250,84 +280,218 @@ def load_seat_memory():
     return memory
 
 
+# ─── ③ 板块共振：个股→行业映射（东财主源 / 新浪回退 / 本地缓存）──
+
+INDUSTRY_MAP_FILE = DATA_DIR / "industry_map.json"
+INDUSTRY_MAP_TTL_DAYS = 7   # 行业归属变化极慢，缓存长期复用，摊薄建映射的请求量
+
+
+def _build_industry_map_em():
+    """东财行业成分遍历 → {code: 行业名}（与涨停池"所属行业"同口径）。失败返回 {}。"""
+    names = _retry(ak.stock_board_industry_name_em)
+    if names is None or names.empty:
+        return {}
+    col = "板块名称" if "板块名称" in names.columns else names.columns[1]
+    mapping = {}
+    for ind in names[col].dropna().tolist():
+        cons = _retry(ak.stock_board_industry_cons_em, symbol=str(ind))
+        if cons is None or cons.empty:
+            continue
+        code_col = next((c for c in cons.columns if "代码" in c), None)
+        if not code_col:
+            continue
+        for raw in cons[code_col]:
+            code = _norm_code(raw)
+            if code:
+                mapping[code] = str(ind)
+        time.sleep(0.15)
+    return mapping
+
+
+def _build_industry_map_sina():
+    """新浪板块成分遍历 → {code: 行业名}（新浪口径，作东财不可用时的回退）。失败返回 {}。"""
+    spot = _retry(ak.stock_sector_spot, indicator="行业")
+    if spot is None or spot.empty or "label" not in spot.columns:
+        return {}
+    name_col = "板块" if "板块" in spot.columns else spot.columns[1]
+    mapping = {}
+    for label, ind in zip(spot["label"], spot[name_col]):
+        det = _retry(ak.stock_sector_detail, sector=str(label))
+        if det is None or det.empty:
+            continue
+        code_col = "code" if "code" in det.columns else next(
+            (c for c in det.columns if "代码" in c or c == "symbol"), None)
+        if not code_col:
+            continue
+        for raw in det[code_col]:
+            code = _norm_code(raw)
+            if code:
+                mapping[code] = str(ind)
+        time.sleep(0.15)
+    return mapping
+
+
+def build_industry_map(force=False):
+    """个股→行业 映射：东财主源 + 新浪回退 + 本地缓存(TTL内复用) + 旧缓存兜底。
+
+    返回 (mapping{code:行业名}, source)。两源口径不同（东财与涨停池一致；新浪为新浪分类），
+    缓存里记 source 供上层判断板块热度该用哪套口径。
+    """
+    if not force:
+        try:
+            with open(INDUSTRY_MAP_FILE, encoding="utf-8") as f:
+                cached = json.load(f)
+            fetched = datetime.strptime(cached.get("fetched", "2000-01-01"), "%Y-%m-%d")
+            if (datetime.now() - fetched).days <= INDUSTRY_MAP_TTL_DAYS and cached.get("map"):
+                return cached["map"], cached.get("source", "cache")
+        except (OSError, json.JSONDecodeError, ValueError):
+            pass
+
+    mapping, source = _build_industry_map_em(), "eastmoney"
+    if not mapping:
+        print("  [行业映射] 东财不可用，回退新浪...")
+        mapping, source = _build_industry_map_sina(), "sina"
+
+    if mapping:
+        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with open(INDUSTRY_MAP_FILE, "w", encoding="utf-8") as f:
+            json.dump({"fetched": datetime.now().strftime("%Y-%m-%d"),
+                       "source": source, "map": mapping}, f, ensure_ascii=False)
+        print(f"  [行业映射] {source} 建成 {len(mapping)} 只，缓存 {INDUSTRY_MAP_TTL_DAYS} 天")
+        return mapping, source
+
+    # 两源都失败 → 过期旧缓存兜底
+    try:
+        with open(INDUSTRY_MAP_FILE, encoding="utf-8") as f:
+            cached = json.load(f)
+        if cached.get("map"):
+            print("  [行业映射] 实时源全失败，沿用旧缓存")
+            return cached["map"], cached.get("source", "stale-cache")
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {}, None
+
+
 # ─── 评分 ─────────────────────────────────────────────────────
 
-def score_candidate(code, flow, alerts, deals, pool, memory, float_rank_pct):
-    """返回 (score 0-100, reasons, parts)。各分项为启发式权重，实验性质。"""
+def score_candidate(code, flow, alerts, deals, pool, memory, float_rank_pct,
+                    capital=None, resonance_ctx=None):
+    """返回 (score 0-100, reasons, parts)。各分项为启发式权重，实验性质。
+    100分重配：攻28 + 背14 + 封22 + 小16 + 共10 + 忆10。"""
     reasons = []
     parts = {}
 
-    # 1) 资金攻击 (0-40)：异动事件 + 大单净买 + 净流入占比
+    # 1) 资金攻击 (0-28)：异动事件 + 大单净买 + 净流入占比
     alert_pts = 0.0
     if alerts:
         for cat, cnt in alerts["events"].items():
             alert_pts += ALERT_CATEGORIES[cat] * min(cnt, 3)
         top_events = "、".join(f"{c}×{n}" for c, n in alerts["events"].most_common(2))
         reasons.append(top_events)
-    alert_pts = min(alert_pts, 25.0)
+    alert_pts = min(alert_pts, 18.0)
 
     deal_pts = 0.0
     if deals and (deals["buy_cnt"] + deals["sell_cnt"]) >= 2:
-        deal_pts = max(0.0, deals["net_ratio"]) * 10.0
+        deal_pts = max(0.0, deals["net_ratio"]) * 8.0
         if deals["net_ratio"] >= 0.3:
             reasons.append(f"大单净买{deals['net_ratio'] * 100:.0f}%")
 
     inflow_pts = 0.0
     if flow["amount"] > 0 and flow["net_inflow"] > 0:
         inflow_ratio = flow["net_inflow"] / flow["amount"]
-        inflow_pts = min(inflow_ratio / 0.20, 1.0) * 5.0
-    parts["attack"] = round(min(alert_pts + deal_pts + inflow_pts, 40.0), 1)
+        inflow_pts = min(inflow_ratio / 0.20, 1.0) * 4.0
+    parts["attack"] = round(min(alert_pts + deal_pts + inflow_pts, 28.0), 1)
 
-    # 2) 涨停行为 (0-25)
+    # 2) 主力-散户背离 (0-14)：主力净占比 + 主力进散户出 (①，东财分级资金)
+    div_pts = 0.0
+    if capital:
+        main_net = capital.get("main_net")
+        main_ratio = capital.get("main_ratio")
+        small_net = capital.get("small_net")
+        if main_ratio is not None:
+            div_pts += min(max(main_ratio, 0.0) / 10.0, 1.0) * 8.0
+            if main_ratio >= 3.0:
+                reasons.append(f"主力净占比{main_ratio:.1f}%")
+        if main_net is not None and small_net is not None:
+            if main_net > 0 and small_net < 0:
+                div_pts += 6.0
+                reasons.append("主力进散户出")
+            elif main_net < 0 and small_net > 0:
+                div_pts = 0.0  # 主力出散户接=派发，背离分清零
+                reasons.append("⚠主力出散户进")
+    parts["divergence"] = round(min(div_pts, 14.0), 1)
+
+    # 3) 涨停行为 (0-22)
     seal_pts = 0.0
     if pool:
         if pool["float_cap"] > 0 and pool["seal_amount"] > 0:
             seal_ratio = pool["seal_amount"] / pool["float_cap"]
-            seal_pts += min(seal_ratio / 0.08, 1.0) * 12.0
+            seal_pts += min(seal_ratio / 0.08, 1.0) * 11.0
             if seal_ratio >= 0.02:
                 reasons.append(f"封单/流通{seal_ratio * 100:.1f}%")
         first = pool["first_seal_time"].replace(":", "")
         if first and first <= "100000":
-            seal_pts += 8.0
+            seal_pts += 7.0
             reasons.append(f"首封{first[:2]}:{first[2:4]}")
         elif first and first <= "133000":
             seal_pts += 4.0
         if pool["break_times"] == 0:
-            seal_pts += 5.0
+            seal_pts += 4.0
         else:
             seal_pts -= pool["break_times"] * 2.0
             reasons.append(f"炸板{pool['break_times']}次")
-        consec_bonus = {1: 5.0, 2: 4.0, 3: 2.0}
+        consec_bonus = {1: 4.0, 2: 3.0, 3: 2.0}
         seal_pts += consec_bonus.get(pool["consecutive"], 0.0)
         if pool["consecutive"] >= 1:
             reasons.append(f"{pool['consecutive']}连板")
-    parts["seal"] = round(max(0.0, min(seal_pts, 25.0)), 1)
+    parts["seal"] = round(max(0.0, min(seal_pts, 22.0)), 1)
 
-    # 3) 小票弹性 (0-20)：流通市值越小越高 + 换手甜区
-    size_pts = (1.0 - float_rank_pct) * 12.0
+    # 4) 小票弹性 (0-16)：流通市值越小越高 + 换手甜区
+    size_pts = (1.0 - float_rank_pct) * 10.0
     turnover = flow.get("turnover_pct")
     if turnover is not None:
         if 8.0 <= turnover <= 25.0:
-            size_pts += 8.0
+            size_pts += 6.0
         elif 4.0 <= turnover < 8.0 or 25.0 < turnover <= 35.0:
-            size_pts += 4.0
-    parts["size"] = round(min(size_pts, 20.0), 1)
+            size_pts += 3.0
+    parts["size"] = round(min(size_pts, 16.0), 1)
     if flow.get("float_cap_est"):
         reasons.append(f"流通约{flow['float_cap_est'] / 1e8:.0f}亿")
 
-    # 4) 席位记忆 (0-15)：游资回头客
+    # 5) 板块共振 (0-10)：所属行业涨停潮 + 候选扎堆 (③)
+    res_pts = 0.0
+    if resonance_ctx:
+        ind = (resonance_ctx.get("industry_map") or {}).get(code)
+        if ind:
+            zt = (resonance_ctx.get("zt_counter") or {}).get(ind, 0)
+            cd = (resonance_ctx.get("cand_counter") or {}).get(ind, 0)
+            if zt >= 3:
+                res_pts += 6.0
+            elif zt == 2:
+                res_pts += 4.0
+            elif zt == 1:
+                res_pts += 2.0
+            if cd >= 4:
+                res_pts += 4.0
+            elif cd >= 2:
+                res_pts += 2.0
+            if res_pts > 0:
+                reasons.append(f"{ind}板块涨停{zt}/候选{cd}")
+    parts["resonance"] = round(min(res_pts, 10.0), 1)
+
+    # 6) 席位记忆 (0-10)：游资回头客
     mem_pts = 0.0
     if memory:
         if memory["seats"] >= 2:
-            mem_pts += 8.0
-        elif memory["seats"] >= 1:
             mem_pts += 5.0
-        mem_pts += min(memory["known"], 3) * 2.5
+        elif memory["seats"] >= 1:
+            mem_pts += 3.0
+        mem_pts += min(memory["known"], 3) * 1.5
         if memory["known"] > 0:
             reasons.append(f"知名席位{memory['known']}个近期买过")
         elif memory["seats"] > 0:
             reasons.append("追踪席位近期买过")
-    parts["memory"] = round(min(mem_pts, 15.0), 1)
+    parts["memory"] = round(min(mem_pts, 10.0), 1)
 
     score = sum(parts.values())
     return round(score, 1), reasons, parts
@@ -346,6 +510,10 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
     print(f"  涨停池({pool_date}): {len(pool_map)} 只")
     memory_map = load_seat_memory()
     print(f"  席位记忆: {len(memory_map)} 只")
+    capital_map = fetch_main_capital_flow()
+    print(f"  主力分级资金: {len(capital_map)} 只")
+    industry_map, ind_src = build_industry_map()
+    print(f"  行业映射({ind_src}): {len(industry_map)} 只")
 
     # 候选 = 有进攻信号的票（异动 ∪ 涨停池 ∪ 大单净买 ∪ 席位记忆），再做小票过滤
     candidate_codes = set(alerts_map) | set(pool_map) | set(memory_map)
@@ -382,6 +550,15 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
         idx = sum(1 for v in caps if v <= value)
         return idx / len(caps)
 
+    # 板块共振上下文：涨停池各行业涨停数 + 候选池同行业扎堆数
+    zt_counter = Counter(d["industry"] for d in pool_map.values() if d.get("industry"))
+    cand_counter = Counter()
+    for cand_code, _flow in candidates:
+        ind = industry_map.get(cand_code)
+        if ind:
+            cand_counter[ind] += 1
+    resonance_ctx = {"industry_map": industry_map, "zt_counter": zt_counter, "cand_counter": cand_counter}
+
     picks = []
     for code, flow in candidates:
         score, reasons, parts = score_candidate(
@@ -389,6 +566,7 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
             alerts_map.get(code), deals_map.get(code),
             pool_map.get(code), memory_map.get(code),
             cap_rank(flow["float_cap_est"]),
+            capital=capital_map.get(code), resonance_ctx=resonance_ctx,
         )
         picks.append({
             "code": code,
@@ -411,12 +589,13 @@ def print_picks(picks, candidate_count):
     print()
     print("=" * 110)
     print(f"  游资买入雷达（实验） · 候选 {candidate_count} → Top {len(picks)}"
-          f" · 攻/封/小/忆 = 资金攻击/涨停行为/小票弹性/席位记忆")
+          f" · 攻/背/封/小/共/忆 = 资金攻击/主力背离/涨停行为/小票弹性/板块共振/席位记忆")
     print("=" * 110)
     header = (
         _pad_visual("代码", 8) + _pad_visual("名称", 12) + _pad_visual("现价", 8)
         + _pad_visual("涨幅%", 8) + _pad_visual("流通亿", 8) + _pad_visual("总分", 7)
-        + _pad_visual("攻", 6) + _pad_visual("封", 6) + _pad_visual("小", 6) + _pad_visual("忆", 6)
+        + _pad_visual("攻", 6) + _pad_visual("背", 6) + _pad_visual("封", 6)
+        + _pad_visual("小", 6) + _pad_visual("共", 6) + _pad_visual("忆", 6)
         + "理由"
     )
     print(header)
@@ -430,8 +609,10 @@ def print_picks(picks, candidate_count):
             + _pad_visual(f"{p['float_cap_yi']:.0f}" if p["float_cap_yi"] else "-", 8)
             + _pad_visual(f"{p['score']:.1f}", 7)
             + _pad_visual(f"{p['parts']['attack']:.0f}", 6)
+            + _pad_visual(f"{p['parts']['divergence']:.0f}", 6)
             + _pad_visual(f"{p['parts']['seal']:.0f}", 6)
             + _pad_visual(f"{p['parts']['size']:.0f}", 6)
+            + _pad_visual(f"{p['parts']['resonance']:.0f}", 6)
             + _pad_visual(f"{p['parts']['memory']:.0f}", 6)
             + " | ".join(p["reasons"])
         )
@@ -622,6 +803,26 @@ def analyze_kline_shape(records, code):
     }, None
 
 
+def ambush_divergence_pts(capital, cap=14.0):
+    """① 主力-散户背离分（潜伏用多日分级资金）。返回 (pts, reason)。
+    无数据→(0,'')；主力进散户出→加分；主力出散户进→清零并告警。"""
+    if not capital:
+        return 0.0, ""
+    main_net, main_ratio, small_net = (
+        capital.get("main_net"), capital.get("main_ratio"), capital.get("small_net"))
+    pts, reason = 0.0, ""
+    if main_ratio is not None:
+        pts += min(max(main_ratio, 0.0) / 8.0, 1.0) * 8.0   # 吸筹期主力占比阈值低于拉升
+    if main_net is not None and small_net is not None:
+        if main_net > 0 and small_net < 0:
+            pts += 6.0
+            reason = f"10日主力进散户出({main_ratio:.1f}%)" if main_ratio is not None else "10日主力进散户出"
+        elif main_net < 0 and small_net > 0:
+            pts = 0.0
+            reason = "⚠10日主力出散户进"
+    return round(min(pts, cap), 1), reason
+
+
 def score_ambush(flow5, flow10, flow20, float_cap, shape, lhb_info, memory, as_of=None):
     """潜伏分（不含筹码分项，户数在终选阶段补充）。返回 (score, reasons, parts)。
 
@@ -708,8 +909,8 @@ def ambush_scan(args):
     flow_now = fetch_ths_flow()
     flow5 = fetch_ths_flow_rank("5日排行")
     flow10 = fetch_ths_flow_rank("10日排行")
-    flow20 = fetch_ths_flow_rank("20日排行")
-    print(f"  即时/5日/10日/20日资金流: {len(flow_now)}/{len(flow5)}/{len(flow10)}/{len(flow20)} 只")
+    # 20日资金分项改由终选阶段的 A/D 代理提供（与 ambush_backtest 口径一致），不再单独抓同花顺20日排行
+    print(f"  即时/5日/10日资金流: {len(flow_now)}/{len(flow5)}/{len(flow10)} 只")
     lhb_hist = fetch_lhb_recent_dates(days=90)
     print(f"  近90日龙虎榜: {len(lhb_hist)} 只")
     memory = load_seat_memory()
@@ -744,21 +945,27 @@ def ambush_scan(args):
 
     survivors = []
     rejects = Counter()
-    for idx, (_, code, now, f5, f10, float_cap) in enumerate(finalists, 1):
+    for idx, (_, code, now, _f5_ths, _f10_ths, _cap_pre) in enumerate(finalists, 1):
         data = fetch_stock_data(code, now["name"])
         if not data or not data.get("records"):
             rejects["K线获取失败"] += 1
             continue
-        shape, why = analyze_kline_shape(data["records"], code)
-        if shape is None:
-            rejects[why] += 1
+        records = data["records"]
+        # 终选用与 ambush_backtest 一致的 A/D 代理口径，在"当前收盘"时点重算入选门槛与资金分项。
+        # 同花顺"主动净额"会漏掉主力挂买盘接砸盘/对倒式的被动吸筹，A/D（收盘日内位置×成交额）能抓到；
+        # 同时让实盘打分口径 = 已回测验证过的口径（消除实盘/回测口径裂缝）。
+        reason_box = []
+        gate = ambush_gate_check(records, len(records) - 1, code, now["name"],
+                                 args.min_float_cap, args.max_float_cap, reason_out=reason_box)
+        if gate is None:
+            rejects[reason_box[0] if reason_box else "未知"] += 1
             continue
         score, reasons, parts = score_ambush(
-            f5, f10, flow20.get(code), float_cap, shape,
+            gate["flow5"], gate["flow10"], gate["flow20"],
+            gate["float_cap"], gate["shape"],
             lhb_hist.get(code), memory.get(code),
         )
-        # 入选新鲜度：用已拉取的K线回看前3个交易日是否同样满足潜伏指纹(A/D口径)
-        records = data["records"]
+        # 入选新鲜度：回看前3个交易日是否同样满足潜伏指纹(同一 A/D 口径)
         streak = 1
         for back in range(1, 4):
             if ambush_gate_check(records, len(records) - 1 - back, code, now["name"],
@@ -775,9 +982,9 @@ def ambush_scan(args):
         survivors.append({
             "code": code,
             "name": now["name"],
-            "price": now["price"],
-            "chg5_pct": f5["chg_pct"],
-            "float_cap_yi": round(float_cap / 1e8, 1),
+            "price": gate["price"],
+            "chg5_pct": gate["flow5"]["chg_pct"],
+            "float_cap_yi": round(gate["float_cap"] / 1e8, 1),
             "score": score,
             "parts": parts,
             "reasons": reasons,
@@ -787,6 +994,28 @@ def ambush_scan(args):
             print(f"    K线进度 {idx}/{len(finalists)}")
     if rejects:
         print("  形态过滤剔除:", "、".join(f"{k}×{v}" for k, v in rejects.most_common()))
+
+    # 附加 ① 主力背离(10日分级资金) + ③ 板块共振(同行业潜伏扎堆)。
+    # 实盘专属实时维度，ambush_backtest 不含——这两项无历史快照、回放不了，
+    # 不进核心 score_ambush 以保持回测口径纯净。
+    capital_map = fetch_main_capital_flow(indicator="10日")
+    industry_map, ind_src = build_industry_map()
+    print(f"  主力分级资金(10日): {len(capital_map)} 只 · 行业映射({ind_src}): {len(industry_map)} 只")
+    cand_counter = Counter(
+        industry_map.get(p["code"]) for p in survivors if industry_map.get(p["code"]))
+    for p in survivors:
+        div, dreason = ambush_divergence_pts(capital_map.get(p["code"]))
+        p["parts"]["divergence"] = div
+        p["score"] = round(p["score"] + div, 1)
+        if dreason:
+            p["reasons"].append(dreason)
+        ind = industry_map.get(p["code"])
+        cd = cand_counter.get(ind, 0) if ind else 0
+        res = 4.0 if cd >= 4 else (2.0 if cd >= 2 else 0.0)   # 潜伏只看同行业吸筹扎堆（不用涨停潮）
+        p["parts"]["resonance"] = res
+        p["score"] = round(p["score"] + res, 1)
+        if res > 0:
+            p["reasons"].append(f"{ind}板块{cd}只潜伏扎堆")
 
     # 股东户数（筹码集中）只查中期排名靠前的，控制请求量
     survivors.sort(key=lambda p: -p["score"])
@@ -824,13 +1053,13 @@ def print_ambush(picks, candidate_count):
     print()
     print("=" * 112)
     print(f"  潜伏雷达（实验·吸筹阶段） · 资金背离候选 {candidate_count} → Top {len(picks)}"
-          f" · 潜/形/筹/忆/鲜 = 资金潜入/吸筹形态/筹码集中/试盘痕迹/入选新鲜度")
+          f" · 潜/背/形/筹/共/忆/鲜 = 资金潜入/主力背离/吸筹形态/筹码集中/板块共振/试盘痕迹/入选新鲜度")
     print("=" * 112)
     header = (
         _pad_visual("代码", 8) + _pad_visual("名称", 12) + _pad_visual("现价", 8)
         + _pad_visual("5日%", 8) + _pad_visual("流通亿", 8) + _pad_visual("总分", 7)
-        + _pad_visual("潜", 6) + _pad_visual("形", 6) + _pad_visual("筹", 6) + _pad_visual("忆", 6)
-        + _pad_visual("鲜", 6)
+        + _pad_visual("潜", 6) + _pad_visual("背", 6) + _pad_visual("形", 6) + _pad_visual("筹", 6)
+        + _pad_visual("共", 6) + _pad_visual("忆", 6) + _pad_visual("鲜", 6)
         + "理由"
     )
     print(header)
@@ -844,14 +1073,17 @@ def print_ambush(picks, candidate_count):
             + _pad_visual(f"{p['float_cap_yi']:.0f}", 8)
             + _pad_visual(f"{p['score']:.1f}", 7)
             + _pad_visual(f"{p['parts']['inflow']:.0f}", 6)
+            + _pad_visual(f"{p['parts'].get('divergence', 0):.0f}", 6)
             + _pad_visual(f"{p['parts']['shape']:.0f}", 6)
             + _pad_visual(f"{p['parts']['holder']:.0f}", 6)
+            + _pad_visual(f"{p['parts'].get('resonance', 0):.0f}", 6)
             + _pad_visual(f"{p['parts']['trail']:.0f}", 6)
             + _pad_visual(f"{p['parts'].get('freshness', 0):+.0f}", 6)
             + " | ".join(p["reasons"])
         )
     print("=" * 112)
     print("注: 潜伏≠马上启动，可能横盘数周；已硬剔除近10日涨停/涨幅>12%/60日涨幅>50%的票。")
+    print("注: 背/共为实盘实时维度，--ambush-backtest 回测不含（无历史快照）。")
     print("注: 实验性推断；隔几天用 --ambush-verify 回看前向收益验证。")
 
 
@@ -1039,36 +1271,42 @@ def _fetch_gdhs_cached(code, max_age_days=7):
     return rows
 
 
-def ambush_gate_check(records, idx, code, name, min_cap_yi, max_cap_yi):
+def ambush_gate_check(records, idx, code, name, min_cap_yi, max_cap_yi, reason_out=None):
     """潜伏指纹门槛（时点 idx 收盘后口径），实盘回看与回测回放共用。
 
     通过返回 {flow5, flow10, flow20, float_cap, shape, price}；任一门槛不过返回 None。
     资金口径为 A/D 代理（实盘当日入选门槛走同花顺净额，回看历史只能用代理）。
+    reason_out: 可选 list，传入时把"未通过的关卡"写进去（默认 None=行为不变，回测调用不受影响）。
     """
-    if idx is None or idx < 60 or idx >= len(records):
+    def _fail(reason):
+        if reason_out is not None:
+            reason_out.append(reason)
         return None
+
+    if idx is None or idx < 60 or idx >= len(records):
+        return _fail("历史不足60日")
     past = records[: idx + 1]
     price = past[-1]["close"]
     if not (2.0 <= price <= 80.0):
-        return None
+        return _fail("价格区间外(2~80)")
     if _is_small_board_excluded(code, name):
-        return None
+        return _fail("排除板块(北交/ST/次新)")
     turnover, amount = past[-1]["turnover_rate"], past[-1]["amount"]
     float_cap = amount / (turnover / 100.0) if turnover and turnover >= 0.5 and amount > 0 else None
     if not float_cap or not (min_cap_yi * 1e8 <= float_cap <= max_cap_yi * 1e8):
-        return None
+        return _fail("市值区间外/换手过低")
     in5, in10, in20 = _ad_flow(past, 5), _ad_flow(past, 10), _ad_flow(past, 20)
     if in5 <= 0 or in10 <= 0:
-        return None
+        return _fail("A/D资金非净流入")
     chg5 = (price / past[-6]["close"] - 1) * 100 if past[-6]["close"] > 0 else None
     chg10 = (price / past[-11]["close"] - 1) * 100 if past[-11]["close"] > 0 else None
     if chg5 is None or not (-5.0 <= chg5 <= 10.0):
-        return None
+        return _fail("5日涨幅超界(吸筹需-5~10%)")
     if chg10 is not None and chg10 > 15.0:
-        return None
+        return _fail("10日涨幅>15%")
     shape, _why = analyze_kline_shape(past[-60:], code)
     if shape is None:
-        return None
+        return _fail(f"形态:{_why}")
     return {
         "flow5": {"net_inflow": in5, "chg_pct": chg5},
         "flow10": {"net_inflow": in10, "chg_pct": chg10},
@@ -1287,6 +1525,127 @@ def ambush_backtest(args):
     print(f"\n  → 已落盘 {AMBUSH_BACKTEST_FILE}")
 
 
+# ─── 分项有效性分析（IC，离线读回测产物，不联网）──────────────
+#
+# 读 ambush_backtest.json，对每个评分分项算与前向收益的 Spearman 秩相关(IC)，
+# 量化"哪个信号真的领先于主力拉升"，用于砍无效因子 / 数据驱动重配权重。
+# 纯离线、纯计算；需先跑过一次 --ambush-backtest 产出数据。
+
+def _rankdata(values):
+    """平均秩(1-based)，并列取平均。"""
+    order = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    i = 0
+    while i < len(values):
+        j = i
+        while j + 1 < len(values) and values[order[j + 1]] == values[order[i]]:
+            j += 1
+        avg_rank = (i + j) / 2.0 + 1.0
+        for k in range(i, j + 1):
+            ranks[order[k]] = avg_rank
+        i = j + 1
+    return ranks
+
+
+def _pearson(xs, ys):
+    n = len(xs)
+    if n < 3:
+        return None
+    mx, my = sum(xs) / n, sum(ys) / n
+    sx = sum((x - mx) ** 2 for x in xs)
+    sy = sum((y - my) ** 2 for y in ys)
+    if sx <= 0 or sy <= 0:
+        return None
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return cov / (sx ** 0.5 * sy ** 0.5)
+
+
+def _spearman_ic(xs, ys):
+    """Spearman 秩相关 = 秩上的 Pearson；任一序列为常数返回 None。"""
+    if len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    return _pearson(_rankdata(xs), _rankdata(ys))
+
+
+def _ic_tstat(ic, n):
+    """IC 的近似 t 值：ic·sqrt((n-2)/(1-ic²))。"""
+    if ic is None or n <= 2 or abs(ic) >= 1.0:
+        return None
+    return ic * ((n - 2) / (1.0 - ic * ic)) ** 0.5
+
+
+def _quantile_means(xs, ys, q=5):
+    """按 x 升序分 q 档，返回每档 y 均值（样本不足或 x 为常数返回 None）。"""
+    if len(xs) < q * 2 or len(set(xs)) < 2:
+        return None
+    pairs = sorted(zip(xs, ys))
+    n = len(pairs)
+    return [mean(y for _, y in pairs[b * n // q:(b + 1) * n // q]) for b in range(q)]
+
+
+def analyze_ambush_ic(target="max_gain_pct"):
+    """离线读 ambush_backtest.json，算各评分分项与前向收益的 Spearman IC。"""
+    try:
+        with open(AMBUSH_BACKTEST_FILE, encoding="utf-8") as f:
+            payload = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        print(f"[ERROR] 找不到/无法读取 {AMBUSH_BACKTEST_FILE}，请先跑一次 --ambush-backtest。")
+        return
+
+    picks = payload.get("picks", [])
+    rows = [p for p in picks if p.get(target) is not None]
+    if not rows:
+        print(f"[ERROR] {AMBUSH_BACKTEST_FILE.name} 里没有带前向收益的买点。")
+        return
+    if len(rows) < 20:
+        print(f"[WARN] 有效买点仅 {len(rows)} 个，样本太少、IC 噪声极大，仅供参考。\n")
+
+    horizon = (payload.get("params") or {}).get("horizon")
+    factor_keys = sorted({k for p in rows for k in (p.get("parts") or {}).keys()})
+
+    print("=" * 96)
+    print("  潜伏雷达 · 分项有效性 IC 分析（Spearman 秩相关，越高=越领先于前向涨幅）")
+    print(f"  产物 {AMBUSH_BACKTEST_FILE.name} · 买点 {len(picks)}（有前向 {len(rows)}）"
+          f" · horizon={horizon}日 · 目标=期间最高涨幅")
+    print("=" * 96)
+    print(_pad_visual("分项", 12) + _pad_visual("样本", 6)
+          + _pad_visual("IC", 9) + _pad_visual("t值", 8)
+          + "  低→高分5档 期间最高均值%（单调上升=有效）")
+    print("-" * 96)
+
+    def _ic_row(name, getter):
+        xs, ys = [], []
+        for p in rows:
+            x, y = getter(p), p.get(target)
+            if x is None or y is None:
+                continue
+            xs.append(x)
+            ys.append(y)
+        ic = _spearman_ic(xs, ys)
+        t = _ic_tstat(ic, len(xs))
+        buckets = _quantile_means(xs, ys)
+        ic_s = f"{ic:+.3f}" if ic is not None else "N/A"
+        t_s = f"{t:+.2f}" if t is not None else "-"
+        flag = ""
+        if ic is not None and t is not None and abs(ic) >= 0.05 and abs(t) >= 2.0:
+            flag = " ✅有效" if ic > 0 else " ⚠反向"
+        if buckets:
+            bucket_s = " → ".join(f"{b:+.1f}" for b in buckets)
+        else:
+            bucket_s = "(常数/无效)" if ic is None else "(样本不足)"
+        print(_pad_visual(name, 12) + _pad_visual(str(len(xs)), 6)
+              + _pad_visual(ic_s, 9) + _pad_visual(t_s, 8) + "  " + bucket_s + flag)
+
+    for key in factor_keys:
+        _ic_row(key, lambda p, k=key: (p.get("parts") or {}).get(k))
+    _ic_row("score总分", lambda p: p.get("score"))
+
+    print("-" * 96)
+    print("  读法: IC>0=因子值越高前向涨幅越高；|IC|≥0.05 且 |t|≥2 标 ✅有效 / ⚠反向。")
+    print("  分5档均值单调上升=方向可靠；据此砍无效/反向分项、给有效分项加权。")
+    print("  注: 单次回测、买点样本有限，IC 噪声大；多跑几段 --ambush-backtest 再下结论。")
+
+
 # ─── 入口 ─────────────────────────────────────────────────────
 
 def main():
@@ -1308,6 +1667,8 @@ def main():
                         help="回看某日潜伏名单的前向收益（配 --date/--horizon）")
     parser.add_argument("--ambush-backtest", action="store_true",
                         help="逐日回放过去 N 个交易日的潜伏雷达并统计前向收益（配 --days/--horizon）")
+    parser.add_argument("--ambush-ic", action="store_true",
+                        help="离线读 ambush_backtest.json，算各评分分项与前向收益的 Spearman IC（不联网）")
     parser.add_argument("--days", type=int, default=15,
                         help="--ambush-backtest 回放的交易日数，默认15")
     parser.add_argument("--horizon", type=int, default=5,
@@ -1328,6 +1689,9 @@ def main():
         return
     if args.ambush_backtest:
         ambush_backtest(args)
+        return
+    if args.ambush_ic:
+        analyze_ambush_ic()
         return
     if args.ambush:
         picks, candidate_count = ambush_scan(args)

@@ -1,4 +1,11 @@
-let config = null;
+(() => {
+  function initStockDashboard() {
+    const dashboardRoot = document.querySelector("#stock-native-dashboard");
+    if (!dashboardRoot || dashboardRoot.dataset.stockDashboardInitialized === "1") return;
+    dashboardRoot.dataset.stockDashboardInitialized = "1";
+
+    let disposed = false;
+    let config = null;
     let registry = null;
     let latest = null;
     let active = "long";
@@ -12,7 +19,10 @@ let config = null;
     let refreshShouldRunAfterDone = false;
 
     const $ = (id) => document.getElementById(id);
-    const status = (text) => { $("status").textContent = text; };
+    const status = (text) => {
+      const node = $("status");
+      if (node) node.textContent = text;
+    };
     const fmt = (v, digits = 2) => {
       if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
       return Number(v).toFixed(digits);
@@ -39,6 +49,7 @@ let config = null;
       try {
         const saved = localStorage.getItem("stockStrategyConfig");
         const payload = await fetchConfig();
+        if (disposed) return;
         config = saved ? mergeDeep(payload.config, JSON.parse(saved)) : payload.config;
         registry = payload.factors;
       } catch (err) {
@@ -49,8 +60,11 @@ let config = null;
       bindEvents();
       renderControls();
       await loadDataRefreshStatus();
+      if (disposed) return;
       await resumeOptimizeIfRunning();
+      if (disposed) return;
       await resumeDataRefreshIfRunning();
+      if (disposed) return;
       await runNow();
     }
 
@@ -118,6 +132,7 @@ let config = null;
     async function loadDataRefreshStatus() {
       try {
         const payload = await fetchHealth();
+        if (disposed) return null;
         return renderDataRefreshStatus(payload);
       } catch (err) {
         $("data-refresh-time").textContent = "读取失败";
@@ -127,7 +142,7 @@ let config = null;
 
     async function startDataRefresh() {
       if ($("refresh-data").disabled) return;
-      const msg = "本次会执行股票数据全量拉取（mode=full），数据刷新时间会很久，大约30分钟。确定开始吗？";
+      const msg = "本次会执行股票数据全量拉取（mode=full，no-proxy），数据刷新时间会很久，大约10-30分钟。确定开始吗？";
       if (!window.confirm(msg)) return;
       setRefreshButtonBusy(true);
       $("data-refresh-log-panel").hidden = false;
@@ -137,6 +152,7 @@ let config = null;
       try {
         const resp = await fetch("/api/stock/refresh", {method: "POST"});
         const payload = await resp.json();
+        if (disposed) return;
         if (!resp.ok) throw new Error(payload.error || "启动失败");
       } catch (err) {
         status("刷新失败");
@@ -151,6 +167,7 @@ let config = null;
 
     async function pollDataRefreshStatus() {
       const job = await loadDataRefreshStatus();
+      if (disposed) return;
       if (!job || job.running) return;
       clearInterval(refreshTimer);
       refreshTimer = null;
@@ -161,6 +178,7 @@ let config = null;
         status(`数据已刷新(${job.elapsed_sec ?? "?"}s)`);
         try {
           const payload = await fetchConfig();
+          if (disposed) return;
           config = mergeDeep(payload.config, JSON.parse(localStorage.getItem("stockStrategyConfig") || "{}"));
           registry = payload.factors;
           renderControls();
@@ -191,6 +209,7 @@ let config = null;
       try {
         const resp = await fetch("/api/optimize", {method: "POST"});
         const payload = await resp.json();
+        if (disposed) return;
         if (!resp.ok) throw new Error(payload.error || "启动失败");
       } catch (err) {
         status("失败");
@@ -217,6 +236,7 @@ let config = null;
       } catch (err) {
         return; // 网络抖动，下一轮再试
       }
+      if (disposed) return;
       if (state.running) return;
       clearInterval(optimizeTimer);
       optimizeTimer = null;
@@ -226,6 +246,7 @@ let config = null;
         localStorage.removeItem("stockStrategyConfig");
         try {
           const payload = await fetchConfig();
+          if (disposed) return;
           config = payload.config;
           registry = payload.factors;
         } catch (err) {
@@ -247,6 +268,7 @@ let config = null;
       try {
         const resp = await fetch("/api/optimize/status");
         const state = await resp.json();
+        if (disposed) return;
         if (state.running) showOptimizeOverlay();
       } catch (err) {
         /* 状态接口异常不阻塞页面初始化 */
@@ -392,6 +414,9 @@ let config = null;
         range.oninput = () => {
           num.value = setWeight(range.value).toFixed(2);
         };
+        bindRangeDrag(range, (value) => {
+          num.value = setWeight(value).toFixed(2);
+        });
         num.oninput = () => {
           if (num.value === "" || Number.isNaN(Number(num.value))) return;
           range.value = setWeight(num.value);
@@ -402,6 +427,61 @@ let config = null;
           range.value = v;
         };
       }
+    }
+
+    function bindRangeDrag(range, onValue) {
+      let dragging = false;
+
+      const numberFromAttr = (name, fallback) => {
+        const value = Number(range.getAttribute(name));
+        return Number.isFinite(value) ? value : fallback;
+      };
+      const min = numberFromAttr("min", 0);
+      const max = numberFromAttr("max", 100);
+      const step = numberFromAttr("step", 1);
+      const decimals = String(range.getAttribute("step") || "").split(".")[1]?.length || 0;
+
+      const valueAt = (clientX) => {
+        const rect = range.getBoundingClientRect();
+        const ratio = rect.width <= 0 ? 0 : Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
+        const raw = min + ratio * (max - min);
+        const stepped = min + Math.round((raw - min) / step) * step;
+        return Math.max(min, Math.min(max, stepped)).toFixed(decimals);
+      };
+
+      const applyPointer = (event) => {
+        const value = valueAt(event.clientX);
+        if (range.value !== value) {
+          range.value = value;
+          onValue(value);
+        }
+      };
+
+      range.addEventListener("pointerdown", (event) => {
+        if (range.disabled || (event.button !== undefined && event.button !== 0)) return;
+        dragging = true;
+        event.preventDefault();
+        range.focus();
+        range.setPointerCapture && range.setPointerCapture(event.pointerId);
+        applyPointer(event);
+      });
+
+      range.addEventListener("pointermove", (event) => {
+        if (!dragging) return;
+        event.preventDefault();
+        applyPointer(event);
+      });
+
+      const stopDragging = (event) => {
+        if (!dragging) return;
+        dragging = false;
+        if (range.hasPointerCapture && range.hasPointerCapture(event.pointerId)) {
+          range.releasePointerCapture(event.pointerId);
+        }
+      };
+
+      range.addEventListener("pointerup", stopDragging);
+      range.addEventListener("pointercancel", stopDragging);
     }
 
     function renderFactorGroupSelect(groupNames) {
@@ -466,6 +546,7 @@ let config = null;
           body: JSON.stringify({config})
         });
         const payload = await resp.json();
+        if (disposed) return;
         if (!resp.ok) throw new Error(payload.error || "run failed");
         latest = payload;
         status("已完成");
@@ -624,4 +705,21 @@ let config = null;
       `;
     }
 
+    window.FinancialAnalysisPages = window.FinancialAnalysisPages || {};
+    window.FinancialAnalysisPages.cleanup = () => {
+      disposed = true;
+      clearTimeout(runTimer);
+      clearInterval(optimizeTimer);
+      clearInterval(refreshTimer);
+    };
     init();
+  }
+
+  window.FinancialAnalysisPages = window.FinancialAnalysisPages || {};
+  window.FinancialAnalysisPages.stock = initStockDashboard;
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initStockDashboard, { once: true });
+  } else {
+    initStockDashboard();
+  }
+})();

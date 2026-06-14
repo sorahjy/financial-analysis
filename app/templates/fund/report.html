@@ -2,10 +2,6 @@
 
 {% block title %}基金报告 - financial-analysis{% endblock %}
 
-{% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/fund-report.css') }}">
-{% endblock %}
-
 {% block content %}
 <section class="fund-command-bar" data-fund-status>
   <div class="fund-command-meta">
@@ -13,7 +9,37 @@
     <span>任务 <b data-field="job-state">空闲</b></span>
   </div>
   <div class="action-row">
+    <button
+      class="btn ghost"
+      type="button"
+      data-fund-editor-open
+      data-read-url="{{ url_for('fund.read_fund_editor_file') }}"
+      data-save-url="{{ url_for('fund.save_fund_editor_file') }}"
+    >编辑funds.py</button>
     <button class="btn primary" type="button" data-post-url="{{ url_for('fund.refresh_fund_report') }}">刷新数据</button>
+  </div>
+</section>
+
+<section class="fund-editor-modal" data-fund-editor-modal hidden>
+  <div class="fund-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="fund-editor-title">
+    <header class="fund-editor-head">
+      <div>
+        <h2 id="fund-editor-title">编辑funds.py</h2>
+        <p data-fund-editor-path>读取中</p>
+      </div>
+      <button class="btn ghost" type="button" data-fund-editor-cancel>关闭</button>
+    </header>
+    <div class="python-editor" data-python-editor>
+      <pre class="python-highlight" aria-hidden="true"><code data-fund-editor-highlight></code></pre>
+      <textarea data-fund-editor-code spellcheck="false" aria-label="funds.py Python 编辑器"></textarea>
+    </div>
+    <footer class="fund-editor-actions">
+      <span data-fund-editor-status>未加载</span>
+      <div class="action-row">
+        <button class="btn ghost" type="button" data-fund-editor-cancel>取消编辑</button>
+        <button class="btn primary" type="button" data-fund-editor-save>保存编辑</button>
+      </div>
+    </footer>
   </div>
 </section>
 
@@ -40,8 +66,4 @@
     </div>
   {% endif %}
 </section>
-{% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/fund-report.js') }}"></script>
 {% endblock %}

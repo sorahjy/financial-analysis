@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import subprocess
-import sys
 import threading
 import time
 from typing import Any, Dict, Optional
@@ -81,13 +80,11 @@ def start_stock_data_refresh() -> bool:
     return start_command_job(
         STOCK_REFRESH_JOB_ID,
         [
-            sys.executable,
-            "-B",
+            "python",
             "stock_data_refresh.py",
             "--mode",
             "full",
-            "--timeout",
-            "1800",
+            "--no-proxy",
         ],
         cwd=ROOT_DIR,
         timeout=1800,

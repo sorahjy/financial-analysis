@@ -2,16 +2,8 @@
 
 {% block title %}A股策略 - financial-analysis{% endblock %}
 
-{% block head %}
-<link rel="stylesheet" href="{{ url_for('static', filename='css/stock-dashboard.css') }}">
-{% endblock %}
-
 {% block content %}
 <section id="stock-native-dashboard" class="stock-native">
   {% include "stock/dashboard_body.html" %}
 </section>
-{% endblock %}
-
-{% block scripts %}
-<script src="{{ url_for('static', filename='js/stock-dashboard.js') }}"></script>
 {% endblock %}

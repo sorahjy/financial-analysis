@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import sys
 
-from flask import Blueprint, current_app, jsonify, render_template
+from flask import Blueprint, current_app, jsonify, render_template, request
 
 from app.config import ROOT_DIR
 from app.services.fund_report_service import load_fund_report_view
@@ -11,6 +11,7 @@ from app.utils import file_status
 
 
 bp = Blueprint("fund", __name__)
+FUND_EDITOR_FILE = ROOT_DIR / "funds.py"
 
 
 @bp.get("/fund")
@@ -40,6 +41,43 @@ def fund_status():
             "signals": file_status(current_app.config["FUND_SIGNALS_FILE"]),
             "generate": get_job_state("fund-report-generate"),
             "refresh": get_job_state("fund-refresh"),
+        }
+    )
+
+
+@bp.get("/api/fund/editor")
+def read_fund_editor_file():
+    try:
+        content = FUND_EDITOR_FILE.read_text(encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(
+        {
+            "path": FUND_EDITOR_FILE.relative_to(ROOT_DIR).as_posix(),
+            "content": content,
+        }
+    )
+
+
+@bp.put("/api/fund/editor")
+def save_fund_editor_file():
+    payload = request.get_json(silent=True) or {}
+    content = payload.get("content")
+    if not isinstance(content, str):
+        return jsonify({"error": "缺少可保存的文本内容"}), 400
+    try:
+        compile(content, str(FUND_EDITOR_FILE), "exec")
+    except SyntaxError as exc:
+        return jsonify({"error": f"Python 语法错误: line {exc.lineno}, {exc.msg}"}), 400
+    try:
+        FUND_EDITOR_FILE.write_text(content, encoding="utf-8")
+    except OSError as exc:
+        return jsonify({"error": str(exc)}), 500
+    return jsonify(
+        {
+            "saved": True,
+            "path": FUND_EDITOR_FILE.relative_to(ROOT_DIR).as_posix(),
+            "size": len(content.encode("utf-8")),
         }
     )
 
