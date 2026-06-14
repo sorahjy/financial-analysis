@@ -7,7 +7,7 @@
     let disposed = false;
     let config = null;
     let registry = null;
-    let latest = null;
+    let result = null;
     let active = "long";
     let runTimer = null;
     let factorSearch = "";
@@ -47,18 +47,9 @@
       return payload;
     }
 
-    async function fetchLatestResult() {
-      const resp = await fetch("/api/stock/latest");
-      const payload = await resp.json();
-      if (!resp.ok) throw new Error(payload.error || "latest failed");
-      return payload;
-    }
-
     async function init() {
-      let hasSavedConfig = false;
       try {
         const saved = localStorage.getItem("stockStrategyConfig");
-        hasSavedConfig = Boolean(saved);
         const payload = await fetchConfig();
         if (disposed) return;
         config = saved ? mergeDeep(payload.config, JSON.parse(saved)) : payload.config;
@@ -76,14 +67,8 @@
       if (disposed) return;
       await resumeDataRefreshIfRunning();
       if (disposed) return;
-      const loaded = await loadCachedResult();
-      if (disposed) return;
-      if (loaded) {
-        status(hasSavedConfig ? "已加载上次结果，点击运行更新" : "已加载");
-      } else {
-        renderPendingResult("正在计算策略结果...");
-        await runNow();
-      }
+      renderPendingResult("正在计算策略结果...");
+      await runNow();
     }
 
     function bindEvents() {
@@ -555,19 +540,6 @@
       runTimer = setTimeout(runNow, 350);
     }
 
-    async function loadCachedResult() {
-      try {
-        const payload = await fetchLatestResult();
-        if (disposed) return false;
-        if (!payload.cached || !payload.result) return false;
-        latest = payload.result;
-        renderResults();
-        return true;
-      } catch (err) {
-        return false;
-      }
-    }
-
     function renderPendingResult(message) {
       $("subtitle").textContent = "";
       $("generated").textContent = "";
@@ -596,7 +568,7 @@
         const payload = await resp.json();
         if (disposed) return;
         if (!resp.ok) throw new Error(payload.error || "run failed");
-        latest = payload;
+        result = payload;
         status("已完成");
         renderResults();
       } catch (err) {
@@ -613,8 +585,8 @@
     }
 
     function renderResults() {
-      if (!latest) return;
-      const section = latest[active];
+      if (!result) return;
+      const section = result[active];
       if (!section) return;
       $("subtitle").textContent = section.title;
       $("generated").textContent = section.generated_at;

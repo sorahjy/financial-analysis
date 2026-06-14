@@ -3,7 +3,7 @@ from __future__ import annotations
 from flask import Flask
 
 
-def create_app(*, warmup_stock_strategy: bool = False) -> Flask:
+def create_app() -> Flask:
     app = Flask(__name__)
     app.config.from_object("app.config.AppConfig")
     app.json.ensure_ascii = False
@@ -17,8 +17,4 @@ def create_app(*, warmup_stock_strategy: bool = False) -> Flask:
     app.register_blueprint(fund_bp)
     app.register_blueprint(stock_bp)
     app.register_blueprint(jobs_bp)
-    if warmup_stock_strategy:
-        from app.services.stock_strategy_service import start_stock_strategy_warmup
-
-        start_stock_strategy_warmup()
     return app

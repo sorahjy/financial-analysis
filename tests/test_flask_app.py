@@ -111,17 +111,15 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("config", payload)
         self.assertIn("factors", payload)
 
-    def test_stock_health_reports_warmup_state(self):
+    def test_stock_health_reports_refresh_state(self):
         response = self.client.get("/api/stock/health")
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
         self.assertIn("refresh", payload)
         self.assertIn("refresh_job", payload)
-        self.assertIn("warmup", payload)
+        self.assertNotIn("warmup", payload)
         self.assertIn("log_lines", payload["refresh_job"])
-        self.assertIn("running", payload["warmup"])
-        self.assertIn("elapsed_sec", payload["warmup"])
 
     def test_stock_refresh_endpoint_starts_job(self):
         with patch("app.routes.stock.start_stock_data_refresh", return_value=True):

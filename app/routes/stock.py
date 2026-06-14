@@ -12,8 +12,6 @@ from stock_crawl_common import load_json_file
 from stock_data_refresh import REFRESH_REPORT_FILE
 
 from app.services.stock_strategy_service import (
-    get_latest_stock_strategy_result,
-    get_stock_strategy_warmup_state,
     optimizer_state_snapshot,
     run_stock_strategies,
     start_stock_data_refresh,
@@ -48,15 +46,8 @@ def stock_health():
             "ok": True,
             "refresh": load_json_file(REFRESH_REPORT_FILE, {}),
             "refresh_job": stock_data_refresh_state(),
-            "warmup": get_stock_strategy_warmup_state(),
         }
     )
-
-
-@bp.get("/api/stock/latest")
-def stock_latest():
-    result = get_latest_stock_strategy_result()
-    return jsonify({"ok": True, "cached": bool(result), "result": result})
 
 
 @bp.post("/api/stock/refresh")
