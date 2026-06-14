@@ -13,7 +13,6 @@ import argparse
 import glob
 import json
 import os
-import re
 import shutil
 import subprocess
 import sys
@@ -23,10 +22,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+from stock_crawl_common import (
+    daily_payload_from_history_records,
+    history_payload_from_records,
+    load_json_file,
+    prune_snapshot_only_history_records,
+    write_json_file,
+)
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 CAPITAL_DIR = DATA_DIR / "capital"
+HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
 REFRESH_REPORT_FILE = DATA_DIR / "stock_data_refresh_report.json"
 
 
@@ -108,130 +116,55 @@ def run_step(
         return StepResult(name, text, False, 127, elapsed, error=str(exc))
 
 
-def load_json(path: Path, default: Any) -> Any:
-    try:
-        with open(path, "r", encoding="utf-8") as fp:
-            return json.load(fp)
-    except (OSError, json.JSONDecodeError):
-        return default
+def _history_payload(code: str, name: str, records: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
+    return history_payload_from_records(code, name, records, source)
 
 
-def write_json(path: Path, payload: Dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fp:
-        json.dump(payload, fp, ensure_ascii=False, indent=2)
+def fill_stock_history_from_local_data() -> Dict[str, Any]:
+    """Normalize stock_data.history and remove snapshot-only daily points.
 
-
-def safe_name_component(name: Any) -> str:
-    text = str(name).strip()
-    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
-    return text.strip(" ._") or "UNKNOWN"
-
-
-def cn_stock_path(code: str, name: str) -> Path:
-    return DATA_DIR / "CN_stock" / f"CN_{code}_{safe_name_component(name)}.json"
-
-
-def find_cn_stock_file(code: str) -> Optional[Path]:
-    matches = sorted((DATA_DIR / "CN_stock").glob(f"CN_{code}_*.json"))
-    return matches[0] if matches else None
-
-
-def merge_records(existing: List[Dict[str, Any]], new_records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    by_date: Dict[str, Dict[str, Any]] = {}
-    for row in existing:
-        date = row.get("date")
-        if date:
-            by_date[str(date)] = dict(row)
-    for row in new_records:
-        date = row.get("date")
-        if not date:
-            continue
-        merged = by_date.setdefault(str(date), {})
-        merged.update({key: value for key, value in row.items() if value is not None or key not in merged})
-    return sorted(by_date.values(), key=lambda item: str(item.get("date", "")))
-
-
-def cn_records_from_stock_data(stock: Dict[str, Any], snapshot_row: Dict[str, Any], today: str) -> List[Dict[str, Any]]:
-    records: List[Dict[str, Any]] = []
-    for row in (stock.get("daily", {}) or {}).get("recent_daily", []) or []:
-        if not isinstance(row, dict) or not row.get("date"):
-            continue
-        records.append(
-            {
-                "date": str(row.get("date"))[:10],
-                "close": row.get("close"),
-                "change_pct": row.get("change_pct"),
-                "turnover_rate": row.get("turnover_rate"),
-                "market_cap": None,
-                "pe_ttm": None,
-                "pe_static": None,
-                "pb": None,
-                "pcf": None,
-            }
-        )
-
-    price = snapshot_row.get("price")
-    if price is not None:
-        market_cap_est = snapshot_row.get("market_cap_est")
-        records.append(
-            {
-                "date": today,
-                "close": price,
-                "change_pct": None,
-                "turnover_rate": None,
-                "market_cap": market_cap_est / 100000000 if isinstance(market_cap_est, (int, float)) else None,
-                "pe_ttm": None,
-                "pe_static": None,
-                "pb": None,
-                "pcf": None,
-            }
-        )
-    return records
-
-
-def fill_cn_stock_from_local_data() -> Dict[str, Any]:
+    The old fallback used daily.recent_daily and market_snapshot to synthesize
+    history rows. New stock_data.daily intentionally stores only stats, so this
+    step must not create close-only rows that later poison OHLCV checks.
+    """
     stock_files = sorted(glob.glob(str(DATA_DIR / "stock_data" / "CN_*.json")))
-    snapshot = load_json(DATA_DIR / "market_snapshot.json", {})
-    today = datetime.now().strftime("%Y-%m-%d")
-    created = 0
     updated = 0
     skipped = 0
+    removed_records = 0
 
     for path_text in stock_files:
         stock_path = Path(path_text)
-        stock = load_json(stock_path, {})
-        code = str(stock.get("symbol") or stock_path.name.split("_")[1]).zfill(6)
-        name = str(stock.get("name") or (snapshot.get(code, {}) or {}).get("name") or code)
-        current_path = find_cn_stock_file(code)
-        current = load_json(current_path, {}) if current_path else {}
-        existing = current.get("records", []) if isinstance(current, dict) else []
-        new_records = cn_records_from_stock_data(stock, snapshot.get(code, {}) if isinstance(snapshot, dict) else {}, today)
-        merged = merge_records(existing, new_records)
-        if not merged:
+        stock = load_json_file(stock_path, {})
+        if not isinstance(stock, dict):
             skipped += 1
             continue
-        payload = {
-            "symbol": code,
-            "name": name,
-            "start_date": merged[0]["date"],
-            "end_date": merged[-1]["date"],
-            "records": merged,
-            "fallback_source": "stock_data+market_snapshot",
-        }
-        out_path = current_path or cn_stock_path(code, name)
-        write_json(out_path, payload)
-        if current_path:
-            updated += 1
-        else:
-            created += 1
+        code = str(stock.get("symbol") or stock_path.name.split("_")[1]).zfill(6)
+        name = str(stock.get("name") or code)
+        existing = (stock.get("history") or {}).get("records", [])
+        cleaned, removed = prune_snapshot_only_history_records(existing)
+        if not removed:
+            skipped += 1
+            continue
+        stock["history"] = _history_payload(code, name, cleaned, "stock_data.history")
+        stock["daily"] = daily_payload_from_history_records(cleaned)
+        stock.pop("history_fallback_at", None)
+        stock["history_sanitized_at"] = datetime.now().isoformat()
+        write_json_file(stock_path, stock)
+        updated += 1
+        removed_records += removed
+
+    stock_history_files = 0
+    for fp in (DATA_DIR / "stock_data").glob("CN_*.json"):
+        payload = load_json_file(fp, {})
+        if isinstance(payload, dict) and (payload.get("history") or {}).get("records"):
+            stock_history_files += 1
 
     return {
-        "created": created,
         "updated": updated,
         "skipped": skipped,
+        "removed_snapshot_only_records": removed_records,
         "source_files": len(stock_files),
-        "cn_stock_files": len(list((DATA_DIR / "CN_stock").glob("CN_*.json"))),
+        "stock_history_files": stock_history_files,
     }
 
 
@@ -252,48 +185,50 @@ def local_step_result(name: str, command: str, func) -> StepResult:
 
 
 def mirror_capital_outputs() -> Dict[str, Any]:
-    scored_path = CAPITAL_DIR / "scored_stocks.json"
-    scored = load_json(scored_path, {})
-    stocks = scored.get("stocks", []) if isinstance(scored, dict) else []
+    candidates = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
+    stocks = candidates.get("stocks", []) if isinstance(candidates, dict) else []
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     today = datetime.now().strftime("%Y-%m-%d")
 
-    snapshot_path = CAPITAL_DIR / "snapshots" / f"scored_{today}.json"
-    if scored_path.exists():
+    snapshot_path = CAPITAL_DIR / "snapshots" / f"hot_money_candidates_{today}.json"
+    if HOT_MONEY_CANDIDATES_FILE.exists():
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(scored_path, snapshot_path)
+        shutil.copyfile(HOT_MONEY_CANDIDATES_FILE, snapshot_path)
 
     picks = []
     for item in stocks:
-        scores = item.get("scores", {}) if isinstance(item, dict) else {}
         picks.append(
             {
                 "code": str(item.get("code", "")).zfill(6),
                 "name": item.get("name", ""),
-                "score": scores.get("total"),
-                "scores": scores,
                 "followers": item.get("followers", []),
+                "concurrent_count": item.get("concurrent_count"),
+                "total_buyers": item.get("total_buyers"),
+                "buy_amount_total": item.get("buy_amount_total"),
+                "weighted_score": item.get("weighted_score"),
+                "best_window": item.get("best_window"),
+                "known_seat_count": item.get("known_seat_count"),
                 "signals": item.get("signals"),
             }
         )
-    write_json(
+    write_json_file(
         DATA_DIR / "main_capital_picks.json",
         {
             "generated_at": now,
-            "source": "data/capital/scored_stocks.json",
+            "source": "data/capital/hot_money_candidates.json",
             "count": len(picks),
             "picks": picks,
         },
     )
     return {
-        "capital_scored_count": len(stocks),
+        "capital_candidate_count": len(stocks),
         "capital_snapshot": str(snapshot_path.relative_to(ROOT)),
         "main_capital_picks_count": len(picks),
     }
 
 
 def refresh_csi300_benchmark() -> Dict[str, Any]:
-    from stock_crawl_top_800_data import (
+    from stock_crawl_price_valuation import (
         CSI300_ETF_CODE,
         CSI300_ETF_YEARS,
         CSI300_FILE,
@@ -318,17 +253,29 @@ def refresh_csi300_benchmark() -> Dict[str, Any]:
 
 def collect_data_health() -> Dict[str, Any]:
     stock_data_count = len(list((DATA_DIR / "stock_data").glob("CN_*.json")))
-    cn_stock_count = len(list((DATA_DIR / "CN_stock").glob("CN_*.json")))
-    capital = load_json(CAPITAL_DIR / "scored_stocks.json", {})
-    strategy = load_json(DATA_DIR / "stock_advanced_strategy_results.json", {})
-    csi300 = load_json(DATA_DIR / "csi300_etf_nav.json", {})
+    stock_history_count = 0
+    for fp in (DATA_DIR / "stock_data").glob("CN_*.json"):
+        stock = load_json_file(fp, {})
+        if isinstance(stock, dict) and (stock.get("history") or {}).get("records"):
+            stock_history_count += 1
+    capital = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
+    strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
+    csi300 = load_json_file(DATA_DIR / "csi300_etf_nav.json", {})
     csi300_records = csi300.get("records", []) if isinstance(csi300, dict) else []
+    candidate_cache = load_json_file(DATA_DIR / "stock_strategy_candidate_cache.json", {})
+    long_cache = candidate_cache.get("long") if isinstance(candidate_cache, dict) else {}
+    short_cache = candidate_cache.get("short") if isinstance(candidate_cache, dict) else {}
     return {
         "stock_data_files": stock_data_count,
-        "cn_stock_files": cn_stock_count,
-        "capital_scored_count": capital.get("count") if isinstance(capital, dict) else None,
+        "stock_history_files": stock_history_count,
+        "capital_candidate_count": capital.get("count") if isinstance(capital, dict) else None,
         "capital_generated_at": capital.get("generated_at") if isinstance(capital, dict) else None,
         "strategy_generated_at": strategy.get("generated_at") if isinstance(strategy, dict) else None,
+        "strategy_candidate_cache_version": candidate_cache.get("version") if isinstance(candidate_cache, dict) else None,
+        "strategy_long_cache_generated_at": long_cache.get("generated_at") if isinstance(long_cache, dict) else None,
+        "strategy_long_cache_candidates": long_cache.get("candidate_count") if isinstance(long_cache, dict) else None,
+        "strategy_short_cache_generated_at": short_cache.get("generated_at") if isinstance(short_cache, dict) else None,
+        "strategy_short_cache_candidates": short_cache.get("candidate_count") if isinstance(short_cache, dict) else None,
         "csi300_benchmark_records": len(csi300_records),
         "csi300_benchmark_start": csi300.get("start_date") if isinstance(csi300, dict) else None,
         "csi300_benchmark_end": csi300.get("end_date") if isinstance(csi300, dict) else None,
@@ -373,7 +320,7 @@ def refresh_before_server(
     index_cmd = [
         python_bin,
         "-B",
-        "stock_crawl_index_all_stock_data.py",
+        "stock_crawl_fundamentals.py",
         "--mode",
         "staged",
         "--workers",
@@ -394,7 +341,7 @@ def refresh_before_server(
     steps.append(
         run_step(
             "csi800_history",
-            [python_bin, "-B", "stock_crawl_top_800_data.py"],
+            [python_bin, "-B", "stock_crawl_price_valuation.py"],
             timeout=timeout,
             env=env,
             skip=not full,
@@ -411,9 +358,9 @@ def refresh_before_server(
     if full:
         steps.append(
             local_step_result(
-                "cn_stock_fallback",
-                "local fallback from data/stock_data and data/market_snapshot",
-                fill_cn_stock_from_local_data,
+                "stock_history_fallback",
+                "normalize stock_data.history and remove snapshot-only points",
+                fill_stock_history_from_local_data,
             )
         )
 
@@ -423,7 +370,7 @@ def refresh_before_server(
             [
                 python_bin,
                 "-B",
-                "stock_crawl_capital.py",
+                "stock_crawl_hot_money.py",
                 "--days",
                 str(capital_days),
                 "--top-yyb",
@@ -440,7 +387,7 @@ def refresh_before_server(
 
     mirror_step = local_step_result(
         "mirror_capital_outputs",
-        "mirror data/capital/scored_stocks.json -> data/main_capital_picks.json",
+        "mirror data/capital/hot_money_candidates.json -> data/main_capital_picks.json",
         mirror_capital_outputs,
     )
     steps.append(mirror_step)
@@ -449,7 +396,7 @@ def refresh_before_server(
     steps.append(
         run_step(
             "strategy_results",
-            [python_bin, "-B", "stock_advanced_strategies.py", "--persist"],
+            [python_bin, "-B", "stock_advanced_strategies.py", "--persist", "--rebuild-cache"],
             timeout=timeout,
             env=env,
         )
@@ -468,7 +415,7 @@ def refresh_before_server(
         "mirror": mirror_meta,
         "health": health,
     }
-    write_json(REFRESH_REPORT_FILE, report)
+    write_json_file(REFRESH_REPORT_FILE, report)
 
     if strict and not ok:
         failed = [step.name for step in steps if not step.ok]

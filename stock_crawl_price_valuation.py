@@ -2,10 +2,12 @@
 爬取中证800成分股历史日频数据（最多10年）。
 
 数据字段:
-  行情: 收盘价(close)、涨跌幅(change_pct)、换手率(turnover_rate)
+  行情: 单日开高低收/成交量/成交额/涨跌幅/换手率
+        (daily_open/daily_high/daily_low/daily_close/daily_volume/daily_amount/
+         daily_change_pct/daily_turnover_rate)
   估值: 总市值(market_cap,亿元)、PE(TTM)(pe_ttm)、PE(静)(pe_static)、PB(pb)、PCF(pcf)
         — 来自百度接口，只覆盖近5年（非逐日，约914点），更早记录该字段为 None
-存储路径: data/CN_stock/CN_{code}_{name}.json
+存储路径: data/stock_data/CN_{code}_{name}.json 的 history 字段
 增量更新: 已有文件只补充 end_date+1 至今的缺失数据
 并发: 默认6线程，可通过 STOCK_THREAD_COUNT 环境变量调整
 
@@ -14,10 +16,8 @@
 """
 
 import json
-import math
 import os
 import random
-import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,9 +25,27 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import akshare as ak
-import pandas as pd
 
-DATA_DIR = Path("data/CN_stock")
+from stock_crawl_common import (
+    strip_proxy_env,
+    safe_float as _safe_float,
+    retry_fetch as _retry_fetch,
+    fetch_index_constituents,
+    fetch_qfq_daily_records,
+    find_stock_json,
+    daily_payload_from_history_records,
+    history_record_has_daily_ohlcv,
+    history_record_is_snapshot_only,
+    history_payload_from_records,
+    latest_weekday_date,
+    merge_records_by_date,
+    prune_snapshot_only_history_records,
+    stock_json_path,
+    load_json_file,
+    write_json_file,
+)
+
+DATA_DIR = Path("data/stock_data")
 MAX_YEARS = 10
 MAX_RETRIES = 3
 DEFAULT_THREAD_COUNT = 6   # 不要调高：>6 易被东财/百度等境内接口限流甚至跑挂
@@ -52,22 +70,7 @@ def _env_int(name, default, minimum=1, maximum=None):
 THREAD_COUNT = _env_int("STOCK_THREAD_COUNT", DEFAULT_THREAD_COUNT, maximum=20)
 
 
-def _strip_proxy_env():
-    """STOCK_CRAWL_NO_PROXY=1 时绕过系统/环境变量代理直连。
-
-    东财/腾讯/新浪/百度均为境内接口，经本地代理转发常出现
-    ProxyError(RemoteDisconnected)；NO_PROXY=* 同时屏蔽 macOS 系统代理。
-    """
-    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
-        return
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(var, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
-
-
-_strip_proxy_env()
+strip_proxy_env()
 
 _print_lock = threading.Lock()
 
@@ -77,205 +80,67 @@ def safe_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
-def _safe_float(val):
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return None if (math.isnan(f) or math.isinf(f)) else round(f, 6)
-    except (ValueError, TypeError):
-        return None
-
-
-def _retry_fetch(func, *args, retries=MAX_RETRIES, **kwargs):
-    for attempt in range(retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception as e:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt + 1)
-            else:
-                raise
-
-
 # ─── 中证800成分股 ────────────────────────────────────────────
 
 def get_csi800_stocks():
-    """获取中证800成分股列表，返回 {code: name}"""
+    """获取中证800成分股列表，返回 {code: name}（中证官网优先，新浪回退）"""
     safe_print("正在获取中证800成分股列表...")
-    df = _retry_fetch(ak.index_stock_cons, symbol="000906")
-    result = {}
-    for _, row in df.iterrows():
-        code = str(row["品种代码"]).zfill(6)
-        name = str(row["品种名称"])
-        result[code] = name
+    result = fetch_index_constituents("000906")
     safe_print(f"共 {len(result)} 只成分股")
     return result
 
 
-# ─── 文件 I/O ────────────────────────────────────────────────
-
-def _safe_name_component(name):
-    text = str(name).strip()
-    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
-    return text.strip(" ._") or "UNKNOWN"
-
-
-def _filepath(code, name):
-    return DATA_DIR / f"CN_{code}_{_safe_name_component(name)}.json"
-
+# ─── 文件 I/O（长历史写入 stock_data.history）──
 
 def find_stock_file(code, name=None):
-    candidates = []
-    if name is not None:
-        candidates.append(_filepath(code, name))
-        legacy = DATA_DIR / f"CN_{code}_{name}.json"
-        if legacy not in candidates:
-            candidates.append(legacy)
-    candidates.extend(sorted(DATA_DIR.glob(f"CN_{code}_*.json")))
-
-    for fp in candidates:
-        if fp.exists():
-            return fp
-    return None
+    return find_stock_json(DATA_DIR, code, name)
 
 
 def load_stock_file(code, name):
-    fp = find_stock_file(code, name)
+    fp = find_stock_json(DATA_DIR, code, name)
     if fp is not None:
-        with open(fp, encoding="utf-8") as f:
-            return json.load(f)
+        data = load_json_file(fp, {})
+        history = data.get("history") if isinstance(data, dict) else None
+        if isinstance(history, dict):
+            return history
+        if isinstance(data, dict) and isinstance(data.get("records"), list):
+            return data
     return {}
 
 
 def save_stock_file(code, name, data):
-    fp = _filepath(code, name)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    with open(fp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
+    fp = find_stock_json(DATA_DIR, code, name) or stock_json_path(DATA_DIR, code, name)
+    payload = load_json_file(fp, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    history = history_payload_from_records(
+        code, name, data.get("records", []), "stock_crawl_price_valuation"
+    )
+
+    payload.setdefault("symbol", str(code).zfill(6))
+    payload.setdefault("name", name)
+    payload["history"] = history
+    payload["daily"] = daily_payload_from_history_records(history.get("records", []))
+    payload["history_refetched_at"] = datetime.now().isoformat()
+    write_json_file(fp, payload)
 
 
 # ─── 数据爬取 ─────────────────────────────────────────────────
-
-# 腾讯/新浪接口不直接返回涨跌幅，需要多取一段历史用相邻收盘价推算首日涨跌幅
-CHANGE_PCT_LOOKBACK_DAYS = 15
-
-
-def _exchange_prefix(code):
-    code = str(code).zfill(6)
-    if code[0] in ("6", "9", "5"):
-        return "sh"
-    if code[0] in ("4", "8"):
-        return "bj"
-    return "sz"
-
-
-def _fetch_daily_eastmoney(symbol, start_date, end_date):
-    df = ak.stock_zh_a_hist(
-        symbol=symbol,
-        period="daily",
-        start_date=start_date.replace("-", ""),
-        end_date=end_date.replace("-", ""),
-        adjust="qfq",
-    )
-    if df is None or df.empty:
-        return []
-
-    records = []
-    for _, row in df.iterrows():
-        records.append({
-            "date": str(row["日期"])[:10],
-            "close": _safe_float(row["收盘"]),
-            "change_pct": _safe_float(row["涨跌幅"]),
-            "turnover_rate": _safe_float(row["换手率"]),
-        })
-    return records
-
-
-def _records_with_computed_change(rows, start_date, end_date):
-    """rows: 按日期升序的 (date, close, turnover_rate)，含 lookback 段；
-    用相邻收盘价推算 change_pct 后截取 [start_date, end_date]。"""
-    records = []
-    prev_close = None
-    for date_str, close, turnover_rate in rows:
-        change_pct = None
-        if close is not None and prev_close:
-            change_pct = round((close / prev_close - 1) * 100, 6)
-        if start_date <= date_str <= end_date:
-            records.append({
-                "date": date_str,
-                "close": close,
-                "change_pct": change_pct,
-                "turnover_rate": turnover_rate,
-            })
-        if close is not None:
-            prev_close = close
-    return records
-
-
-def _lookback_start(start_date):
-    return (datetime.strptime(start_date, "%Y-%m-%d")
-            - timedelta(days=CHANGE_PCT_LOOKBACK_DAYS)).strftime("%Y%m%d")
-
-
-def _fetch_daily_tencent(symbol, start_date, end_date):
-    """腾讯日线：无换手率字段，turnover_rate 置 None"""
-    df = ak.stock_zh_a_hist_tx(
-        symbol=f"{_exchange_prefix(symbol)}{symbol}",
-        start_date=_lookback_start(start_date),
-        end_date=end_date.replace("-", ""),
-        adjust="qfq",
-    )
-    if df is None or df.empty:
-        return []
-    rows = [(str(row["date"])[:10], _safe_float(row["close"]), None)
-            for _, row in df.sort_values("date").iterrows()]
-    return _records_with_computed_change(rows, start_date, end_date)
-
-
-def _fetch_daily_sina(symbol, start_date, end_date):
-    """新浪日线：turnover 为小数形式换手率（×100 对齐东财百分比口径）"""
-    df = ak.stock_zh_a_daily(
-        symbol=f"{_exchange_prefix(symbol)}{symbol}",
-        start_date=_lookback_start(start_date),
-        end_date=end_date.replace("-", ""),
-        adjust="qfq",
-    )
-    if df is None or df.empty:
-        return []
-    has_turnover = "turnover" in df.columns
-    rows = []
-    for _, row in df.sort_values("date").iterrows():
-        turnover = _safe_float(row["turnover"]) if has_turnover else None
-        rows.append((
-            str(row["date"])[:10],
-            _safe_float(row["close"]),
-            round(turnover * 100, 6) if turnover is not None else None,
-        ))
-    return _records_with_computed_change(rows, start_date, end_date)
-
-
-DAILY_SOURCES = (
-    ("东财", _fetch_daily_eastmoney),
-    ("腾讯", _fetch_daily_tencent),
-    ("新浪", _fetch_daily_sina),
-)
 
 
 def fetch_daily_range(symbol, start_date, end_date):
     """爬取 [start_date, end_date] 的日频数据，返回 records 列表。
 
-    数据源回退链：东财 → 腾讯 → 新浪。腾讯无换手率；腾讯/新浪的涨跌幅
-    由相邻收盘价推算。每个源内部仍走 _retry_fetch 重试。
+    数据源回退链：东财 → 腾讯 → 新浪。腾讯无换手率；
+    腾讯/新浪的涨跌幅由相邻收盘价推算，新浪源串行兜底以避免 MiniRacer 并发崩溃。
     """
-    last_err = None
-    for source, fetcher in DAILY_SOURCES:
-        try:
-            return _retry_fetch(fetcher, symbol, start_date, end_date)
-        except Exception as e:
-            last_err = e
-            safe_print(f"  [FALLBACK] {symbol} {source}行情失败({e})，切换下一数据源")
-    raise last_err
+    return fetch_qfq_daily_records(
+        symbol,
+        start_date,
+        end_date,
+        include_trading_value=True,
+        warn=lambda message: safe_print(f"  [FALLBACK] {message}"),
+    )
 
 
 # 百度估值指标映射: 存盘字段名 → akshare indicator 参数
@@ -320,16 +185,7 @@ def fetch_valuation_data(symbol, period="近五年"):
 
 def merge_records(existing, new_records):
     """按日期字段级合并：同日期 dict 浅合并（新值覆盖同名字段、保留其他字段），按日期升序"""
-    by_date = {}
-    for r in existing:
-        by_date[r["date"]] = dict(r)
-    for r in new_records:
-        d = r["date"]
-        if d in by_date:
-            by_date[d].update(r)
-        else:
-            by_date[d] = dict(r)
-    return sorted(by_date.values(), key=lambda x: x["date"])
+    return merge_records_by_date(existing, new_records, overwrite_none=True)
 
 
 def attach_valuation(records, val_by_date):
@@ -342,6 +198,23 @@ def attach_valuation(records, val_by_date):
             if r.get(f) is None:
                 r[f] = vals.get(f)
     return records
+
+
+def records_need_ohlcv_backfill(records):
+    """Whether existing history is structurally missing OHLCV.
+
+    Ignore market_snapshot-only rows and require a majority of rows to be
+    incomplete before triggering a 10-year refetch. One dirty latest close
+    should not cause a full backfill.
+    """
+    rows = [
+        row for row in (records or [])
+        if isinstance(row, dict) and not history_record_is_snapshot_only(row)
+    ]
+    if not rows:
+        return False
+    missing = sum(1 for row in rows if not history_record_has_daily_ohlcv(row))
+    return missing > len(rows) / 2
 
 
 # ─── 单股增量更新 ─────────────────────────────────────────────
@@ -385,25 +258,47 @@ def _decide_valuation_period(records, today):
 def process_stock(code, name, idx, total):
     existing = load_stock_file(code, name)
     existing_records = existing.get("records", [])
+    snapshot_removed = 0
+    if existing_records:
+        existing_records, snapshot_removed = prune_snapshot_only_history_records(existing_records)
     start_date = existing.get("start_date")
     end_date = existing.get("end_date")
+    today = latest_weekday_date()
     if existing_records:
-        existing_records = sorted(existing_records, key=lambda row: str(row.get("date", "")))
-        start_date = start_date or existing_records[0].get("date")
-        end_date = end_date or existing_records[-1].get("date")
+        existing_records = sorted(
+            [
+                row for row in existing_records
+                if str(row.get("date", ""))[:10] <= today
+            ],
+            key=lambda row: str(row.get("date", "")),
+        )
+        if existing_records:
+            start_date = start_date or existing_records[0].get("date")
+            end_date = end_date or existing_records[-1].get("date")
+        else:
+            start_date = None
+            end_date = None
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    max_start = (datetime.now() - timedelta(days=365 * MAX_YEARS)).strftime("%Y-%m-%d")
+    max_start = (
+        datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * MAX_YEARS)
+    ).strftime("%Y-%m-%d")
 
     hist_new_records = []
 
-    if existing_records and start_date and start_date > max_start:
+    full_daily_backfill = bool(existing_records and records_need_ohlcv_backfill(existing_records))
+    if full_daily_backfill:
+        safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {max_start} ~ {today}")
+        hist_new_records.extend(fetch_daily_range(code, max_start, today))
+
+    if not full_daily_backfill and existing_records and start_date and start_date > max_start:
         prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         if max_start <= prev_day:
             safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {max_start} ~ {prev_day}")
             hist_new_records.extend(fetch_daily_range(code, max_start, prev_day))
 
-    if end_date:
+    if full_daily_backfill:
+        pass
+    elif end_date:
         if end_date < today:
             next_day = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
             safe_print(f"[{idx}/{total}] {code} {name}: 补行情 {next_day} ~ {today}")
@@ -435,10 +330,11 @@ def process_stock(code, name, idx, total):
 
     n_new = len(merged) - len(existing_records)
     val_info = f"估值={val_period}" if val_period else "估值=skip"
+    clean_info = f", 清理snapshot={snapshot_removed}" if snapshot_removed else ""
     safe_print(
         f"[{idx}/{total}] {code} {name}: "
         f"{merged[0]['date']} ~ {merged[-1]['date']} "
-        f"({len(merged)}条, +{n_new}, {val_info})"
+        f"({len(merged)}条, +{n_new}, {val_info}{clean_info})"
     )
 
 
@@ -468,8 +364,10 @@ def fetch_csi300_etf(years=CSI300_ETF_YEARS):
             ]
             existing.sort(key=lambda r: r["date"])
 
-    today = datetime.now().strftime("%Y-%m-%d")
-    start = (datetime.now() - timedelta(days=365 * years + 10)).strftime("%Y-%m-%d")
+    today = latest_weekday_date()
+    start = (
+        datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * years + 10)
+    ).strftime("%Y-%m-%d")
 
     rows = []
     if not existing:

@@ -15,8 +15,10 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
+import threading
 import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -26,14 +28,19 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+from stock_crawl_common import analysis_records_from_history_records, daily_stats_from_history_records
+
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-CN_STOCK_DIR = DATA_DIR / "CN_stock"
 CAPITAL_DIR = DATA_DIR / "capital"
+HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
+LEGACY_HOT_MONEY_SCORED_FILE = CAPITAL_DIR / "scored_stocks.json"
 OUTPUT_FILE = DATA_DIR / "stock_advanced_strategy_results.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
+LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
+LIVE_CANDIDATE_CACHE_VERSION = 1
 
 
 # ---------------------------------------------------------------------------
@@ -129,10 +136,10 @@ SHORT_FACTORS: List[FactorSpec] = [
     FactorSpec("seat_diversity", "席位多样性", "short", "游资追踪", "不同营业部数量。", 0.5, "percentile"),
     FactorSpec("recency", "上榜新鲜度", "short", "时效", "最近席位日期距快照日越近越好。", 0.7, "percentile", "low", missing_score=40),
     FactorSpec("best_window_tightness", "共振窗口紧凑", "short", "时效", "共振窗口跨度越短越好。", 0.5, "percentile", "low", missing_score=50),
-    FactorSpec("resonance_score", "原共振分", "short", "资金评分", "现有龙虎榜共振评分。", 0.8, "direct", missing_score=40),
-    FactorSpec("momentum_score", "短线动量", "short", "技术", "现有短线动量评分或技术形态。", 0.8, "direct", missing_score=40),
-    FactorSpec("position_score", "短线位置", "short", "技术", "距高点/RSI等位置评分。", 0.6, "direct", missing_score=40),
-    FactorSpec("risk_control", "风险控制", "short", "风控", "100 - 风险扣分。", 0.9, "direct", missing_score=45),
+    FactorSpec("resonance_score", "共振强度分", "short", "资金评分", "由共买席位数折算的资金共振强度。", 0.8, "direct", missing_score=40),
+    FactorSpec("momentum_score", "短线动量", "short", "技术", "由近期涨幅、量比和均线形态生成。", 0.8, "direct", missing_score=40),
+    FactorSpec("position_score", "短线位置", "short", "技术", "由MA20乖离和RSI甜区生成。", 0.6, "direct", missing_score=40),
+    FactorSpec("risk_control", "风险控制", "short", "风控", "由过热、可交易性和RSI位置合成。", 0.9, "direct", missing_score=45),
     FactorSpec("limit_up_control", "连板约束", "short", "风控", "连板越少越容易成交。", 0.5, "percentile", "low", missing_score=60),
     FactorSpec("tradability", "可交易性", "short", "风控", "非一字板、非T字板得分更高。", 0.6, "direct", missing_score=60),
     FactorSpec("turnover_heat", "换手热度", "short", "技术", "当日换手率或成交热度。", 0.4, "percentile", missing_score=35),
@@ -273,6 +280,7 @@ def load_json_file(path_text: str) -> Any:
 
 _DIR_FINGERPRINT_TTL_SEC = 2.0
 _dir_fingerprint_cache: Dict[Tuple[str, str], Tuple[float, int]] = {}
+_candidate_cache_lock = threading.Lock()
 
 
 def _dir_fingerprint(directory: Path, pattern: str) -> int:
@@ -293,10 +301,43 @@ def _dir_fingerprint(directory: Path, pattern: str) -> int:
     return fingerprint
 
 
+def _dir_cache_signature(directory: Path, pattern: str) -> Dict[str, Any]:
+    digest = hashlib.blake2b(digest_size=16)
+    count = 0
+    total_size = 0
+    latest_mtime_ns = 0
+    if directory.exists():
+        for fp in sorted(directory.glob(pattern), key=lambda item: item.name):
+            try:
+                stat = fp.stat()
+            except OSError:
+                continue
+            count += 1
+            total_size += stat.st_size
+            latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
+            digest.update(fp.name.encode("utf-8", errors="ignore"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_mtime_ns).encode("ascii"))
+            digest.update(b"\0")
+            digest.update(str(stat.st_size).encode("ascii"))
+            digest.update(b"\0")
+    return {
+        "count": count,
+        "total_size": total_size,
+        "latest_mtime_ns": latest_mtime_ns,
+        "digest": digest.hexdigest(),
+    }
+
+
 def invalidate_dir_fingerprints() -> None:
     # Drops the TTL'd directory fingerprints so the next access re-scans
     # immediately; loaded data is still reused when fingerprints are unchanged.
     _dir_fingerprint_cache.clear()
+    try:
+        _build_live_long_candidates_cached.cache_clear()
+        _build_live_short_candidates_cached.cache_clear()
+    except NameError:
+        pass
 
 
 def load_json_optional(path: Path, default: Any) -> Any:
@@ -318,6 +359,69 @@ def deep_merge(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict
         else:
             result[key] = value
     return result
+
+
+def stable_config_key(config: Dict[str, Any], *, ignore: Iterable[str] = ()) -> str:
+    trimmed = copy.deepcopy(config or {})
+    for key in ignore:
+        trimmed.pop(key, None)
+    return json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def config_from_key(key: str) -> Dict[str, Any]:
+    return json.loads(key) if key else {}
+
+
+def read_live_candidate_cache(section: str, meta: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, Any]], List[str]]]:
+    with _candidate_cache_lock:
+        payload = load_json_optional(LIVE_CANDIDATE_CACHE_FILE, {})
+        if not isinstance(payload, dict) or payload.get("version") != LIVE_CANDIDATE_CACHE_VERSION:
+            return None
+        entry = payload.get(section)
+        if not isinstance(entry, dict) or entry.get("meta") != meta:
+            return None
+        candidates = entry.get("candidates")
+        if not isinstance(candidates, list):
+            return None
+        notes = entry.get("notes")
+        return copy.deepcopy(candidates), list(notes if isinstance(notes, list) else [])
+
+
+def write_live_candidate_cache(
+        section: str,
+        meta: Dict[str, Any],
+        candidates: List[Dict[str, Any]],
+        notes: List[str],
+) -> None:
+    with _candidate_cache_lock:
+        payload = load_json_optional(LIVE_CANDIDATE_CACHE_FILE, {})
+        if not isinstance(payload, dict) or payload.get("version") != LIVE_CANDIDATE_CACHE_VERSION:
+            payload = {"version": LIVE_CANDIDATE_CACHE_VERSION}
+        payload[section] = {
+            "meta": meta,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "candidate_count": len(candidates),
+            "candidates": candidates,
+            "notes": notes,
+        }
+        LIVE_CANDIDATE_CACHE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = LIVE_CANDIDATE_CACHE_FILE.with_suffix(".tmp")
+        with open(tmp_path, "w", encoding="utf-8") as fp:
+            json.dump(payload, fp, ensure_ascii=False, separators=(",", ":"))
+        tmp_path.replace(LIVE_CANDIDATE_CACHE_FILE)
+
+
+def clear_live_candidate_cache() -> None:
+    try:
+        _build_live_long_candidates_cached.cache_clear()
+        _build_live_short_candidates_cached.cache_clear()
+    except NameError:
+        pass
+    with _candidate_cache_lock:
+        try:
+            LIVE_CANDIDATE_CACHE_FILE.unlink()
+        except FileNotFoundError:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -423,13 +527,27 @@ def estimate_shares(stock: Dict[str, Any]) -> Optional[float]:
     return None
 
 
+def stock_history_records(stock: Dict[str, Any]) -> List[Dict[str, Any]]:
+    history = stock.get("history") or {}
+    records = history.get("records") if isinstance(history, dict) else None
+    return records if isinstance(records, list) else []
+
+
+def derived_daily_stats(stock: Dict[str, Any]) -> Dict[str, Any]:
+    stats = (stock.get("daily") or {}).get("stats") or {}
+    if stats.get("latest_daily_close") is not None or stats.get("latest_close") is not None:
+        return stats
+    return daily_stats_from_history_records(stock_history_records(stock))
+
+
 def estimate_market_cap_cny(stock: Dict[str, Any], snapshot: Optional[Dict[str, Any]] = None) -> Optional[float]:
     snap_cap = safe_float((snapshot or {}).get("market_cap_est"))
     if snap_cap and snap_cap > 0:
         return snap_cap
 
     shares = estimate_shares(stock)
-    price = safe_float(stock.get("daily", {}).get("stats", {}).get("latest_close"))
+    stats = derived_daily_stats(stock)
+    price = first_not_none(stats.get("latest_daily_close"), stats.get("latest_close"))
     if shares and shares > 0 and price and price > 0:
         return shares * price
     return None
@@ -444,8 +562,9 @@ def dividend_yield(
     # 实盘(as_of=None)：直接用预算的 yearly_dividends 与最新收盘。
     if as_of is None:
         yearly = stock.get("dividends", {}).get("yearly_dividends", {})
-        ref_price = price if price is not None else safe_float(
-            stock.get("daily", {}).get("stats", {}).get("latest_close")
+        stats = derived_daily_stats(stock)
+        ref_price = price if price is not None else first_not_none(
+            stats.get("latest_daily_close"), stats.get("latest_close")
         )
         ref_year = datetime.now().year
     else:
@@ -581,7 +700,7 @@ def annualized_vol_from_rows(
 def pit_liquidity(
         rows: List[Dict[str, Any]], market_cap_cny: Optional[float], window: int = 60
 ) -> Optional[float]:
-    """PIT 日均成交额(元)代理 = 近窗平均换手率% × 总市值。CN_stock 无成交额字段，故近似。"""
+    """PIT 日均成交额(元)代理 = 近窗平均换手率% × 总市值。长历史通常无成交额字段，故近似。"""
     if not market_cap_cny:
         return None
     tos = [safe_float(r.get("turnover_rate")) for r in (rows or [])[-window:]]
@@ -740,21 +859,31 @@ def load_market_snapshot() -> Dict[str, Any]:
 
 
 def load_cn_stock_index() -> Dict[str, Dict[str, Any]]:
-    return _load_cn_stock_index_cached(_dir_fingerprint(CN_STOCK_DIR, "CN_*.json"))
+    return _load_cn_stock_index_cached(_dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"))
 
 
 @lru_cache(maxsize=1)
 def _load_cn_stock_index_cached(fingerprint: int) -> Dict[str, Dict[str, Any]]:
     index: Dict[str, Dict[str, Any]] = {}
-    if not CN_STOCK_DIR.exists():
-        return index
-    for fp in CN_STOCK_DIR.glob("CN_*.json"):
-        try:
-            data = load_json_file(str(fp))
-        except (OSError, json.JSONDecodeError):
-            continue
-        code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
-        index[code] = data
+    if STOCK_DATA_DIR.exists():
+        for fp in STOCK_DATA_DIR.glob("CN_*.json"):
+            try:
+                data = load_json_file(str(fp))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(data, dict):
+                continue
+            history = data.get("history") or {}
+            records = history.get("records") if isinstance(history, dict) else None
+            if not records:
+                continue
+            code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
+            item = dict(history)
+            item["records"] = analysis_records_from_history_records(records)
+            item.setdefault("symbol", code)
+            item.setdefault("name", data.get("name") or history.get("name") or code)
+            item["_source"] = "stock_data.history"
+            index[code] = item
     return index
 
 
@@ -827,14 +956,14 @@ def combined_recent_rows(code: str, stock: Dict[str, Any]) -> List[Dict[str, Any
     cn = load_cn_stock_index().get(code)
     if cn and cn.get("records"):
         return cn["records"][-80:]
-    return stock.get("daily", {}).get("recent_daily", [])[-80:]
+    return stock_history_records(stock)[-80:]
 
 
 def price_history_rows(code: str, stock: Dict[str, Any]) -> List[Dict[str, Any]]:
     cn = load_cn_stock_index().get(code)
     if cn and cn.get("records"):
         return cn["records"]
-    return stock.get("daily", {}).get("recent_daily", [])
+    return stock_history_records(stock)
 
 
 def historical_high_drawdown_pct(
@@ -986,7 +1115,7 @@ def pit_market_cap_cny(
         hist_rows: Optional[List[Dict[str, Any]]] = None,
         cn_records: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[float]:
-    """PIT 总市值(元)：优先 CN_stock ≤as_of 的 market_cap；否则用截止 as_of 收盘 ×
+    """PIT 总市值(元)：优先 stock_data.history ≤as_of 的 market_cap；否则用截止 as_of 收盘 ×
     当时可见财报推算的股本(归母权益 / 每股净资产)。不碰 market_snapshot 的当前市值。"""
     cn_val = (
         latest_valuation_from_records(cn_records, as_of=as_of)
@@ -1054,7 +1183,7 @@ def build_long_candidates(
             continue
 
         cn_records = (cn_index.get(code) or {}).get("records", [])
-        base_price_rows = cn_records or stock.get("daily", {}).get("recent_daily", [])
+        base_price_rows = cn_records or stock_history_records(stock)
         hist_rows = price_rows_asof(base_price_rows, as_of)
 
         if as_of is None:
@@ -1166,7 +1295,7 @@ def compute_long_raw_factors(
 
     market_cap_yi = market_cap_cny / 1e8 if market_cap_cny else None
 
-    # 价格行为因子用历史日线（CN_stock 最长约10年）；PIT 下切到 as_of 之前
+    # 价格行为因子用历史日线（stock_data.history 最长约10年）；PIT 下切到 as_of 之前
     if hist_rows is None:
         hist_rows = price_rows_asof(price_history_rows(code, stock), as_of)
     hist_closes = [safe_float(row.get("close")) for row in hist_rows]
@@ -1250,10 +1379,16 @@ def compute_long_raw_factors(
 
     # 波动率/流动性/分红：实盘读文件快照；PIT 从切片日线 + 截止 as_of 的分红现算
     if as_of is None:
-        daily_stats = stock.get("daily", {}).get("stats", {})
-        low_volatility = safe_float(daily_stats.get("volatility_annual"))
+        daily_stats = derived_daily_stats(stock)
+        low_volatility = first_not_none(
+            daily_stats.get("history_window_annualized_volatility"),
+            daily_stats.get("volatility_annual"),
+        )
         liquidity = first_not_none(
-            daily_stats.get("avg_daily_turnover_approx"), snapshot.get("turnover")
+            daily_stats.get("history_window_avg_daily_amount"),
+            daily_stats.get("avg_daily_turnover_approx"),
+            daily_stats.get("avg_daily_turnover"),
+            snapshot.get("turnover"),
         )
         dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
         dividend_consistency = 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0
@@ -1364,15 +1499,20 @@ def long_reasons(item: Dict[str, Any]) -> List[str]:
 
 def load_short_pool() -> Dict[str, Dict[str, Any]]:
     pool: Dict[str, Dict[str, Any]] = {}
-    scored = load_json_optional(CAPITAL_DIR / "scored_stocks.json", {})
-    for stock in scored.get("stocks", []) if isinstance(scored, dict) else []:
+    candidates = load_json_optional(HOT_MONEY_CANDIDATES_FILE, {})
+    source_name = "capital_candidates"
+    if not isinstance(candidates, dict) or not candidates.get("stocks"):
+        candidates = load_json_optional(LEGACY_HOT_MONEY_SCORED_FILE, {})
+        source_name = "capital_scored_legacy"
+
+    for stock in candidates.get("stocks", []) if isinstance(candidates, dict) else []:
         code = str(stock.get("code", "")).zfill(6)
         if not code:
             continue
         entry = pool.setdefault(code, {"code": code, "name": stock.get("name", ""), "sources": []})
-        entry["sources"].append("capital_scored")
-        entry["scored"] = stock
-        entry["as_of_date"] = scored.get("as_of_date") or scored.get("generated_at")
+        entry["sources"].append(source_name)
+        entry["capital"] = stock
+        entry["as_of_date"] = candidates.get("as_of_date") or candidates.get("generated_at")
 
     picks = load_json_optional(DATA_DIR / "main_capital_picks.json", {})
     for pick in picks.get("picks", []) if isinstance(picks, dict) else []:
@@ -1391,7 +1531,7 @@ def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
     pool = load_short_pool()
     notes = []
     if not pool:
-        notes.append("No Dragon Tiger List pool found. Run stock_crawl_capital.py or main-capital script first.")
+        notes.append("No Dragon Tiger List pool found. Run stock_crawl_hot_money.py or main-capital script first.")
 
     exclude_st = bool(config.get("exclude_st", True))
     min_lhb_count = int(safe_float(config.get("min_lhb_count")) or 0)
@@ -1430,43 +1570,44 @@ def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
 
 def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     pick = data.get("pick") or {}
-    scored = data.get("scored") or {}
-    signals = pick.get("signals") or scored.get("signals") or {}
+    capital = data.get("capital") or data.get("scored") or pick or {}
+    signals = pick.get("signals") or capital.get("signals") or {}
     lhb = signals.get("lhb") or {}
     inst = signals.get("inst") or {}
     stat = signals.get("stat") or {}
     tech = signals.get("tech") or {}
-    scores = scored.get("scores") or {}
-    followers = normalize_followers(scored.get("followers") or [])
+    followers = normalize_followers(capital.get("followers") or pick.get("followers") or [])
 
     seats = [str(f.get("seat", "")) for f in followers if f.get("seat")]
     seat_counts = Counter(seats)
     known_count = sum(1 for f in followers if str(f.get("category", "")).lower() == "knownhotmoney")
     buy_values = [safe_float(f.get("buy_est")) for f in followers]
     buy_values = [v for v in buy_values if v is not None and v > 0]
-    total_buy_est = sum(buy_values) if buy_values else safe_float(scored.get("buy_amount_total"))
+    total_buy_est = sum(buy_values) if buy_values else first_not_none(
+        safe_float(capital.get("buy_amount_total")),
+        safe_float(pick.get("buy_amount_total")),
+    )
     known_buy_est = sum(
         safe_float(f.get("buy_est")) or 0.0
         for f in followers
         if str(f.get("category", "")).lower() == "knownhotmoney"
     )
     latest_date = latest_follower_date(followers)
-    as_of = parse_date(scored.get("as_of_date") or data.get("as_of_date"))
+    as_of = parse_date(capital.get("as_of_date") or data.get("as_of_date"))
     recency_days = None
     if latest_date and as_of:
         recency_days = max(0, (as_of - latest_date).days)
 
     best_window_span = None
-    best_window = scored.get("best_window")
+    best_window = capital.get("best_window") or pick.get("best_window")
     if isinstance(best_window, list) and len(best_window) >= 2:
         d0 = parse_date(best_window[0])
         d1 = parse_date(best_window[1])
         if d0 and d1:
             best_window_span = abs((d1 - d0).days)
 
-    risk_penalty = safe_float(scores.get("risk_penalty"))
-    is_yizi = bool(scores.get("is_yizi_ban"))
-    is_t_ban = bool(scores.get("is_t_ban"))
+    is_yizi = bool(tech.get("is_yizi_ban"))
+    is_t_ban = bool(tech.get("is_t_ban"))
     tradability = 100.0
     if is_yizi:
         tradability -= 60.0
@@ -1478,7 +1619,9 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     lhb_net = safe_float(lhb.get("total_net_buy"))
     follower_count = len(followers)
     concurrent = first_not_none(
-        scored.get("concurrent_count"), follower_count if follower_count else None
+        capital.get("concurrent_count"),
+        pick.get("concurrent_count"),
+        follower_count if follower_count else None,
     )
     buy_concentration = buy_concentration_score(buy_values)
     known_amount_ratio = safe_ratio(known_buy_est, total_buy_est)
@@ -1487,10 +1630,11 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     institution_combo = institution_hotmoney_combo_score(inst_net, concurrent, lhb_net)
     institution_conflict = institution_conflict_score(inst_net, lhb_net)
     amount_per_buyer = safe_ratio(
-        total_buy_est, first_not_none(scored.get("total_buyers"), len(seat_counts) or None)
+        total_buy_est,
+        first_not_none(capital.get("total_buyers"), pick.get("total_buyers"), len(seat_counts) or None),
     )
     limit_up_count = first_not_none(
-        tech.get("recent_limit_up"), scores.get("consecutive_limit_up")
+        tech.get("consecutive_limit_up"), tech.get("recent_limit_up")
     )
     chg_5d = safe_float(tech.get("chg_5d"))
     chg_today = safe_float(tech.get("chg_today"))
@@ -1498,7 +1642,8 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     rsi_score = rsi_sweetspot_score(safe_float(tech.get("rsi")))
     vol_ratio = safe_float(tech.get("vol_ratio"))
     turnover_today = safe_float(tech.get("turnover_today"))
-    overheat = overheat_control_score(chg_5d, safe_float(scores.get("consecutive_limit_up")), safe_float(tech.get("rsi")))
+    overheat = overheat_control_score(chg_5d, safe_float(limit_up_count), safe_float(tech.get("rsi")))
+    risk_control = average_score(overheat, tradability, rsi_score)
     ma_distance = sweetspot_score(dist_ma20, 0.0, 18.0, -12.0, 45.0)
     macd_strength = sweetspot_score(safe_float(tech.get("macd_dif")), 0.0, 0.8, -0.6, 2.5)
     alpha_pv1 = average_score(
@@ -1508,7 +1653,7 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
     alpha_rev1 = average_score(
         sweetspot_score(chg_today, -3.0, 7.5, -10.0, 15.0),
         overheat,
-        bounded_linear(safe_float(scores.get("consecutive_limit_up")), 0.0, 4.0, reverse=True),
+        bounded_linear(safe_float(limit_up_count), 0.0, 4.0, reverse=True),
     )
 
     return {
@@ -1525,17 +1670,20 @@ def compute_short_raw_factors(data: Dict[str, Any]) -> Dict[str, Any]:
         "stat_lhb_count": safe_float(stat.get("stat_count")),
         "stat_net_buy": safe_float(stat.get("stat_net_buy")),
         "hot_money_concurrent": concurrent,
-        "weighted_hot_money": first_not_none(scored.get("weighted_score"), scores.get("total")),
-        "buy_amount_total": safe_float(scored.get("buy_amount_total")),
+        "weighted_hot_money": first_not_none(capital.get("weighted_score"), pick.get("weighted_score")),
+        "buy_amount_total": first_not_none(
+            safe_float(capital.get("buy_amount_total")),
+            safe_float(pick.get("buy_amount_total")),
+        ),
         "known_hot_money_ratio": known_count / len(followers) if followers else None,
         "seat_diversity": len(seat_counts) if seat_counts else None,
         "recency": recency_days,
         "best_window_tightness": best_window_span,
-        "resonance_score": safe_float(scores.get("resonance")),
-        "momentum_score": first_not_none(scores.get("momentum"), tech_momentum_score(tech)),
-        "position_score": safe_float(scores.get("position")),
-        "risk_control": 100.0 - risk_penalty if risk_penalty is not None else None,
-        "limit_up_control": safe_float(scores.get("consecutive_limit_up")),
+        "resonance_score": resonance_strength_score(concurrent),
+        "momentum_score": tech_momentum_score(tech),
+        "position_score": tech_position_score(tech),
+        "risk_control": risk_control,
+        "limit_up_control": safe_float(limit_up_count),
         "tradability": clamp(tradability),
         "turnover_heat": safe_float(tech.get("turnover_today")),
         "ma_bull": 1.0 if tech.get("ma_bull") else 0.0,
@@ -1702,6 +1850,26 @@ def tech_momentum_score(tech: Dict[str, Any]) -> Optional[float]:
     return clamp(score)
 
 
+def tech_position_score(tech: Dict[str, Any]) -> Optional[float]:
+    if not tech:
+        return None
+    dist_score = sweetspot_score(
+        safe_float(tech.get("dist_from_ma20_pct")),
+        -3.0,
+        14.0,
+        -20.0,
+        42.0,
+    )
+    return average_score(dist_score, rsi_sweetspot_score(safe_float(tech.get("rsi"))))
+
+
+def resonance_strength_score(concurrent: Optional[float]) -> Optional[float]:
+    value = safe_float(concurrent)
+    if value is None:
+        return None
+    return bounded_linear(value, 1.0, 4.0)
+
+
 def short_reasons(data: Dict[str, Any], raw: Dict[str, Any]) -> List[str]:
     pick = data.get("pick") or {}
     reasons = list(pick.get("reasons") or [])[:3]
@@ -1722,13 +1890,14 @@ def short_warnings(data: Dict[str, Any], raw: Dict[str, Any]) -> List[str]:
         warnings.append("连板较高，注意接力失败")
     if first_not_none(raw.get("tradability"), 100) < 80:
         warnings.append("可能一字/T字板，成交质量需复核")
-    if data.get("pick") and not data.get("scored"):
+    if data.get("pick") and not data.get("capital"):
         warnings.append("缺少席位级followers明细")
     return warnings
 
 
 def follower_sample(data: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
-    followers = normalize_followers((data.get("scored") or {}).get("followers") or [])
+    capital = data.get("capital") or data.get("scored") or {}
+    followers = normalize_followers(capital.get("followers") or [])
     out = []
     for follower in followers[:limit]:
         out.append({
@@ -1743,6 +1912,98 @@ def follower_sample(data: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]
 def is_st_name(name: str) -> bool:
     upper = str(name).upper()
     return "ST" in upper or "*ST" in upper or upper.startswith("S ")
+
+
+def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
+    universe_signature = _file_signature(DATA_DIR / "stock_universe.json")
+    snapshot_signature = _file_signature(DATA_DIR / "market_snapshot.json")
+    meta = {
+        "config_key": key,
+        "stock_data": _dir_cache_signature(STOCK_DATA_DIR, "CN_*.json"),
+        "stock_universe": list(universe_signature),
+        "market_snapshot": list(snapshot_signature),
+    }
+    cached = read_live_candidate_cache("long", meta)
+    if cached is not None:
+        return cached
+
+    candidates, notes = _build_live_long_candidates_cached(
+        _dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"),
+        universe_signature,
+        snapshot_signature,
+        key,
+    )
+    write_live_candidate_cache("long", meta, candidates, notes)
+    return copy.deepcopy(candidates), list(notes)
+
+
+@lru_cache(maxsize=8)
+def _build_live_long_candidates_cached(
+        stock_data_fingerprint: int,
+        universe_signature: Tuple[int, int],
+        snapshot_signature: Tuple[int, int],
+        config_key: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    _ = (stock_data_fingerprint, universe_signature, snapshot_signature)
+    return build_long_candidates(config_from_key(config_key))
+
+
+def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
+    hot_money_signature = _file_signature(HOT_MONEY_CANDIDATES_FILE)
+    legacy_hot_money_signature = _file_signature(LEGACY_HOT_MONEY_SCORED_FILE)
+    main_capital_signature = _file_signature(DATA_DIR / "main_capital_picks.json")
+    meta = {
+        "config_key": key,
+        "hot_money_candidates": list(hot_money_signature),
+        "legacy_hot_money_scored": list(legacy_hot_money_signature),
+        "main_capital_picks": list(main_capital_signature),
+    }
+    cached = read_live_candidate_cache("short", meta)
+    if cached is not None:
+        return cached
+
+    candidates, notes = _build_live_short_candidates_cached(
+        hot_money_signature,
+        legacy_hot_money_signature,
+        main_capital_signature,
+        key,
+    )
+    write_live_candidate_cache("short", meta, candidates, notes)
+    return copy.deepcopy(candidates), list(notes)
+
+
+@lru_cache(maxsize=8)
+def _build_live_short_candidates_cached(
+        hot_money_signature: Tuple[int, int],
+        legacy_hot_money_signature: Tuple[int, int],
+        main_capital_signature: Tuple[int, int],
+        config_key: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    _ = (hot_money_signature, legacy_hot_money_signature, main_capital_signature)
+    return build_short_candidates(config_from_key(config_key))
+
+
+def passes_short_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bool:
+    name = str(item.get("name") or "")
+    if bool(config.get("exclude_st", True)) and is_st_name(name):
+        return False
+
+    raw = item.get("raw_factors", {})
+    min_lhb_count = int(safe_float(config.get("min_lhb_count")) or 0)
+    if (safe_float(raw.get("lhb_recent_count")) or 0) < min_lhb_count:
+        return False
+
+    min_concurrent = int(safe_float(config.get("min_hot_money_concurrent")) or 0)
+    if (safe_float(raw.get("hot_money_concurrent")) or 0) < min_concurrent:
+        return False
+
+    max_consec = int(first_not_none(config.get("max_consecutive_limit_up"), 999))
+    if (safe_float(raw.get("limit_up_control")) or 0) > max_consec:
+        return False
+
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1761,7 +2022,7 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     scoring_config["min_listing_years"] = 0
     scoring_config["require_csi300"] = False
     scoring_config["require_high_drawdown"] = False
-    candidates, notes = build_long_candidates(scoring_config)
+    candidates, notes = live_long_candidate_pool(scoring_config)
     scored = apply_scores(candidates, LONG_FACTORS, merged.get("weights", {}))
     scored = rerank_scored([item for item in scored if passes_long_hard_filters(item, merged)])
     candidate_codes = {item["code"] for item in scored}
@@ -1785,8 +2046,16 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
 
 def run_short_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     merged = deep_merge(get_default_config()["short"], config or {})
-    candidates, notes = build_short_candidates(merged)
+    scoring_config = copy.deepcopy(merged)
+    scoring_config["exclude_st"] = False
+    scoring_config["min_lhb_count"] = 0
+    scoring_config["min_hot_money_concurrent"] = 0
+    scoring_config["max_consecutive_limit_up"] = 999
+    candidates, notes = live_short_candidate_pool(scoring_config)
     scored = apply_scores(candidates, SHORT_FACTORS, merged.get("weights", {}))
+    scored = rerank_scored([item for item in scored if passes_short_hard_filters(item, merged)])
+    candidate_codes = {item["code"] for item in scored}
+    candidates = [item for item in candidates if item["code"] in candidate_codes]
     min_score = safe_float(merged.get("min_score")) or 0.0
     selected = [item for item in scored if item["score"] >= min_score]
     selected = selected[: max(0, int(first_not_none(merged.get("top_n"), 30)))]
@@ -1975,8 +2244,13 @@ def main() -> None:
     parser.add_argument("--strategy", choices=["all", "long", "short"], default="all")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--persist", action="store_true", help=f"write {OUTPUT_FILE}")
+    parser.add_argument("--rebuild-cache", action="store_true",
+                        help=f"rebuild {LIVE_CANDIDATE_CACHE_FILE} before scoring")
     parser.add_argument("--json", action="store_true", help="print full JSON")
     args = parser.parse_args()
+
+    if args.rebuild_cache:
+        clear_live_candidate_cache()
 
     config = get_default_config()
     if args.strategy == "long":

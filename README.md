@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.1.post1
+当前版本：v3.1.2
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -12,7 +12,7 @@
 - [2. 功能概览](#2-功能概览)
 - [3. 快速开始](#3-快速开始)
 - [4. 基金分析](#4-基金分析)
-- [5. A 股策略平台](#5-a-股策略平台)
+- [5. A 股策略配置台](#5-a-股策略配置台)
 - [6. 游资雷达](#6-游资雷达)
 - [7. 行业周期](#7-行业周期)
 - [8. 输出文件](#8-输出文件)
@@ -105,7 +105,7 @@ bash fund_run.sh
 FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
 ```
 
-## 5. A 股策略平台
+## 5. A 股策略配置台
 
 A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strategies.py` 评分，既可以命令行运行，也可以通过本地 Dashboard 调参。
 
@@ -149,7 +149,7 @@ Dashboard 支持：
 首次使用推荐后台跑以下命令组合
 
 ```bash
-python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
+python stock_data_refresh.py --mode full --no-proxy
 python stock_strategy_optimizer.py --iterations 200
 ```
 
@@ -166,10 +166,13 @@ python stock_data_refresh.py --mode capital-only --timeout 1800
 ```bash
 python run.py --port 8765
 python stock_advanced_strategies.py --persist
+python stock_advanced_strategies.py --persist --rebuild-cache
 python stock_advanced_strategies.py --strategy long --json
 python stock_advanced_strategies.py --strategy short --json
 python stock_strategy_optimizer.py --iterations 200
 ```
+
+`stock_data_refresh.py` 会在刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成最新策略结果并预构建候选池缓存。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
 
 ## 6. 游资雷达
 
@@ -206,7 +209,22 @@ STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 
 
 ## 7. 行业周期
 
-占坑，正在施工中...
+`industry_cycle_extractor.py` 是 v3.1.2 新增的行业指数周期位置提取能力骨架，后续用于把宽基指数、一级行业、热门行业、大宗商品、聪明资金行为和景气度数据统一成周期位置特征。
+
+计划覆盖的数据维度包括：
+
+- 宽基与市场指数：万得全 A（除科创板）、上证指数、沪深300除金融、上证50、中证500、中证1000、国证2000、创业板指、创业板50、港股、短债、长债。
+- 行业指数：申万一级行业指数周期位置（31 个）、热门行业指数周期位置（10+）。
+- 大宗商品：黄金、白银、原油的周期位置。
+- 行业强弱：每周更新的行业强弱模型数据。
+- 聪明资金行为：周期底部更有效的进场动作模型。
+- 景气度：行业景气度跟踪。
+
+当前文件只搭建任务拆解、数据源占位、接口和输出结构，真正的数据抓取、特征计算和策略接入会在后续版本继续实现。
+
+```bash
+python industry_cycle_extractor.py
+```
 
 ## 8. 输出文件
 
@@ -217,9 +235,12 @@ STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 
 | `data/nav_history.json` / `data/nav_store.json` | 基金历史净值缓存 |
 | `data/realtime_estimate.json` | 基金实时估算缓存 |
 | `data/stock_advanced_strategy_results.json` | A 股长线/短线策略结果 |
+| `data/stock_strategy_candidate_cache.json` | A 股长线/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
 | `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数 |
+| `data/stock_data/CN_*.json` | A 股个股主数据文件，包含基本面、分红、质押、近日日线摘要，以及 `history.records` 长历史行情/估值序列 |
 | `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时和失败信息 |
+| `data/capital/hot_money_candidates.json` | 龙虎榜/游资候选池原始信号，短线最终分数由 `stock_advanced_strategies.py` 计算 |
 | `data/capital/hot_money_radar*.json` | 拉升雷达结果与每日快照 |
 | `data/capital/hot_money_ambush*.json` | 潜伏雷达结果与每日快照 |
 | `data/capital/ambush_backtest.json` | 潜伏雷达历史回放结果 |
@@ -236,8 +257,10 @@ STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 
 ├── stock_strategy_dashboard.py    # 兼容旧命令的启动壳，委托给 run.py
 ├── stock_strategy_optimizer.py    # 参数搜索和代理回测
 ├── stock_data_refresh.py          # 股票数据刷新编排
+├── stock_crawl_common.py          # 股票爬虫公共文件、JSON、历史行情和日线统计工具
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
 ├── stock_hot_money_radar.py       # 游资拉升/潜伏雷达
+├── industry_cycle_extractor.py    # 行业指数周期位置提取能力骨架
 ├── app/static/vendor/live2d-widget # 本地化 Live2D 小组件运行时资源
 ├── tests/                         # 核心逻辑和股票策略单测
 ├── img/                           # README 和说明文档展示图
@@ -309,7 +332,10 @@ STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 
 优化长线策略参数搜索与报告展示：510310 沪深300ETF 基准纳入股票数据刷新流程并扩展到近 12 年，长线默认输出数量固定为 10、默认搜索次数调整为 200，回测折起点间隔改为 30 个交易日，并生成每折组合走势与 510310 基准对比图；补充真实净值曲线最大回撤与基准最大回撤，`worst_fold_pct` 更名为 `worst_fold_excess_pct` 以避免与净值回撤混淆；移除“成分稳定分”硬过滤，仅保留沪深300稳定代理因子参与打分，避免与“必须当前沪深300”逻辑重叠；继续优化基金 HTML 报告的深色主题、筛选、排序和持仓过滤体验，移除强/弱超额筛选项并修复持仓筛选影响技术分析展示的问题。将基金报告与 A 股策略台统一到单一 Flask 工作台（`python run.py --port 8765`，路由 `/`、`/fund`、`/stock`），基金报告改为 `data/fund_report_data.json` 经 Flask 服务端渲染；清理迁移后的冗余——删除独立 HTML 报告链（`stock_generate_output.py` / `stock_report.html` / `stock_run.sh` / `fund_report.html`）与 `stock_crawl_top_800_data.py` 中已无消费者的回撤选股、选股回测代码（保留 510310 沪深300 ETF 基准），去重 `file_status`、合并 Flask 启动器、清理死配置，生成物 HTML 不再入库；基金净值与实时估值抓取脚本合并为单一 `fund_fetch_data.py`；新增 MIT LICENSE。
 
 #### Update v3.1.1.post1  2026.6.14
-优化股票部分爬虫逻辑，降低爬取时间。小幅优化游资雷达逻辑，开发中。重构 Flask 页面逻辑，新增 Live2D 小组件。
+优化股票部分爬虫逻辑，降低爬取时间；三个爬虫脚本更名为 `stock_crawl_hot_money` / `stock_crawl_fundamentals` / `stock_crawl_price_valuation`（原 `stock_crawl_capital` / `stock_crawl_index_all_stock_data` / `stock_crawl_top_800_data`），并抽出公共模块 `stock_crawl_common` 去除重复实现。小幅优化游资雷达逻辑，开发中。重构 Flask 页面逻辑，新增 Live2D 小组件。
+
+#### Update v3.1.2  2026.6.15
+重构 A 股数据刷新与策略缓存链路：`data/stock_data/CN_*.json` 统一承载个股基本面、历史行情、估值和日线统计，清理旧 `CN_stock` 依赖；`stock_crawl_common.py` 下沉 JSON 文件工具、历史行情合并、日线统计和快照清洗逻辑，减少多个 `stock_crawl_*` 爬虫重复实现；`stock_data_refresh.py` 的刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成 `data/stock_advanced_strategy_results.json` 和 `data/stock_strategy_candidate_cache.json`，Flask 启动时只读取已有结果，不再启动即重算候选池；A 股策略台新增 `/api/stock/latest` 缓存读取、刷新日志和刷新确认，因子权重、最低分、输出数量调整时复用候选池快速重打分，避免页面卡死；短线策略移除爬虫阶段的二次评分依赖，改由策略层统一按龙虎榜/游资原始信号打分；`stock_hot_money_radar.py` 同步适配新的 OHLCV 与 `daily.stats` 数据结构；新增 `industry_cycle_extractor.py` 行业指数周期位置能力骨架，为后续宽基、行业、大宗商品、聪明资金行为和景气度模型预留接口；补充相关单元测试和 README 文件结构、命令、输出文件说明。
 
 ## 12. Acknowledgment
 

@@ -41,7 +41,13 @@ from statistics import mean
 
 import akshare as ak
 
-from stock_crawl_capital import (
+from stock_crawl_common import (
+    analysis_records_from_history_records,
+    normalize_history_records,
+)
+
+from stock_crawl_hot_money import (
+    CANDIDATES_FILE,
     DATA_DIR,
     _kline_lock,
     _num,
@@ -49,11 +55,12 @@ from stock_crawl_capital import (
     _retry,
     _symbol_with_prefix,
     fetch_stock_data,
+    load_local_kline_records,
 )
 
 RADAR_LATEST_FILE = DATA_DIR / "hot_money_radar.json"
 AMBUSH_LATEST_FILE = DATA_DIR / "hot_money_ambush.json"
-SCORED_FILE = DATA_DIR / "scored_stocks.json"
+LEGACY_SCORED_FILE = DATA_DIR / "scored_stocks.json"
 
 # 异动事件 → 进攻性权重（单类事件多次出现按次数累计，封顶见评分函数）
 ALERT_CATEGORIES = {
@@ -295,13 +302,14 @@ def fetch_limit_pool():
 
 def load_seat_memory():
     """本地席位记忆：近一轮龙虎榜爬取里被 Top 席位买过的票。"""
+    source = CANDIDATES_FILE if CANDIDATES_FILE.exists() else LEGACY_SCORED_FILE
     try:
-        with open(SCORED_FILE, encoding="utf-8") as f:
-            scored = json.load(f)
+        with open(source, encoding="utf-8") as f:
+            candidates = json.load(f)
     except (OSError, json.JSONDecodeError):
         return {}
     memory = {}
-    for stock in scored.get("stocks", []):
+    for stock in candidates.get("stocks", []):
         code = _norm_code(stock.get("code"))
         followers = stock.get("followers") or []
         dates = [str(f.get("date", ""))[:10] for f in followers if isinstance(f, dict)]
@@ -1189,7 +1197,7 @@ def ambush_verify(date_str=None, horizon=5):
 # 同花顺多日资金流排行只有"当天快照"，无法直接回看历史；东财的单股历史资金流
 # 与历史K线接口(push2系)在本机均被拒。因此：
 #   - 历史K线用新浪 stock_zh_a_daily（全字段 OHLCV+成交额+换手，底层 mini_racer
-#     执行JS不可多线程，借用 stock_crawl_capital 的全局锁串行拉取，磁盘缓存当日复用）
+#     执行JS不可多线程，借用 stock_crawl_hot_money 的全局锁串行拉取，磁盘缓存当日复用）
 #   - "资金潜入"分项改用可完全重建的 Chaikin A/D 吸筹资金代理：Σ CLV×成交额，
 #     CLV=((收-低)-(高-收))/(高-低)。口径与实盘同花顺净额不同但方向一致；
 #     形态/筹码/试盘三个分项与实盘口径完全相同。
@@ -1202,6 +1210,11 @@ AMBUSH_BACKTEST_FILE = DATA_DIR / "ambush_backtest.json"
 def _fetch_kline_history(code, days_back=300):
     """新浪历史日线 → 统一记录格式；失败返回 []。turnover 小数换手→百分比。"""
     start = (datetime.now() - timedelta(days=days_back)).strftime("%Y%m%d")
+    start_dash = f"{start[:4]}-{start[4:6]}-{start[6:8]}"
+    local_records = load_local_kline_records(code, start_date=start_dash)
+    if local_records:
+        return local_records
+
     with _kline_lock:
         df = _retry(ak.stock_zh_a_daily, symbol=_symbol_with_prefix(code),
                     start_date=start, end_date=datetime.now().strftime("%Y%m%d"),
@@ -1229,7 +1242,11 @@ def _fetch_kline_history(code, days_back=300):
 
 
 def _load_kline_universe(universe):
-    """带磁盘缓存的批量历史K线（当日缓存直接复用；新浪源串行约0.5秒/只）。"""
+    """带磁盘缓存的批量历史K线。
+
+    磁盘缓存保存 daily_* 日频字段；进入模型前转换为 open/high/low/close
+    这样的算法内部字段，避免持久化数据含糊。
+    """
     AMBUSH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
     today = datetime.now().strftime("%Y-%m-%d")
     cache = {}
@@ -1241,8 +1258,12 @@ def _load_kline_universe(universe):
                 with open(fp, encoding="utf-8") as f:
                     saved = json.load(f)
                 if saved.get("fetched") == today and saved.get("records"):
-                    cache[code] = {"name": saved.get("name") or name, "records": saved["records"]}
-                    continue
+                    records = analysis_records_from_history_records(saved["records"])
+                    if not records and "close" in saved["records"][-1]:
+                        records = saved["records"]
+                    if records:
+                        cache[code] = {"name": saved.get("name") or name, "records": records}
+                        continue
             except (OSError, json.JSONDecodeError):
                 pass
         todo.append((code, name))
@@ -1252,14 +1273,27 @@ def _load_kline_universe(universe):
               f"（新浪源串行，预计约 {len(todo) // 2}~{len(todo)} 秒）...")
     else:
         print(f"  K线缓存全部命中（{len(cache)} 只）")
+    fetched_ok = 0
     for i, (code, name) in enumerate(todo, 1):
         records = _fetch_kline_history(code)
         if records:
+            stored_records = normalize_history_records(records, include_valuation=False)
             with open(AMBUSH_CACHE_DIR / f"{code}.json", "w", encoding="utf-8") as f:
-                json.dump({"fetched": today, "name": name, "records": records}, f, ensure_ascii=False)
+                json.dump(
+                    {
+                        "fetched": today,
+                        "name": name,
+                        "schema": "daily_ohlcv.v1",
+                        "records": stored_records,
+                    },
+                    f,
+                    ensure_ascii=False,
+                )
             cache[code] = {"name": name, "records": records}
+            fetched_ok += 1
         if i % 100 == 0:
-            print(f"    拉取进度 {i}/{len(todo)}（成功 {len(cache)}）")
+            # 本次成功只数这一轮真正拉到的，不含磁盘缓存命中（旧写法 len(cache) 会虚高/相减为负）
+            print(f"    拉取进度 {i}/{len(todo)}（本次成功 {fetched_ok}）")
         time.sleep(0.05)
     # 预建 日期→下标 索引
     for info in cache.values():

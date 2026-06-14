@@ -67,7 +67,7 @@ BENCHMARK_COMPONENTS = [
 LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
 DEFAULT_OPTIMIZATION_ITERATIONS = 200
 
-# 长线 walk-forward 回测参数：利用 data/CN_stock 的多年日线，
+# 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
 # 每隔约1.5个月取一折，固定持有 250 个交易日（约 1 年）。
 LONG_HOLD_CHOICES = [250]  # 长线持有期固定为250交易日(约1年)
 LONG_FOLD_STEP_TD = 30     # 折锚点间隔(交易日)；约每1.5个月一折，增加验证密度
@@ -135,7 +135,7 @@ def recent_series_map() -> Dict[str, List[Dict[str, Any]]]:
 
 
 def full_series_map() -> Dict[str, List[Dict[str, Any]]]:
-    """长线回测用全量历史日线（CN_stock 优先，最长约10年；缺失回退近段数据）。"""
+    """长线回测用全量历史日线（stock_data.history 优先，最长约10年；缺失回退近段数据）。"""
     stocks = load_fundamental_stocks()
     cn_index = load_cn_stock_index()
     return {

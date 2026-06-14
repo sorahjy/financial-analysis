@@ -8,9 +8,11 @@ from stock_advanced_strategies import (
     get_default_config,
     get_factor_registry,
 )
-from stock_data_refresh import REFRESH_REPORT_FILE, load_json
+from stock_crawl_common import load_json_file
+from stock_data_refresh import REFRESH_REPORT_FILE
 
 from app.services.stock_strategy_service import (
+    get_latest_stock_strategy_result,
     get_stock_strategy_warmup_state,
     optimizer_state_snapshot,
     run_stock_strategies,
@@ -44,11 +46,17 @@ def stock_health():
     return jsonify(
         {
             "ok": True,
-            "refresh": load_json(REFRESH_REPORT_FILE, {}),
+            "refresh": load_json_file(REFRESH_REPORT_FILE, {}),
             "refresh_job": stock_data_refresh_state(),
             "warmup": get_stock_strategy_warmup_state(),
         }
     )
+
+
+@bp.get("/api/stock/latest")
+def stock_latest():
+    result = get_latest_stock_strategy_result()
+    return jsonify({"ok": True, "cached": bool(result), "result": result})
 
 
 @bp.post("/api/stock/refresh")
@@ -77,7 +85,7 @@ def stock_optimize():
 def stock_run():
     try:
         payload = request.get_json(silent=True) or {}
-        result = run_stock_strategies(payload.get("config", {}), persist=False, invalidate=True)
+        result = run_stock_strategies(payload.get("config", {}), persist=False, invalidate=False)
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500

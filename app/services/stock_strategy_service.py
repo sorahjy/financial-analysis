@@ -3,15 +3,19 @@ from __future__ import annotations
 import subprocess
 import threading
 import time
+import copy
 from typing import Any, Dict, Optional
 
 from app.config import ROOT_DIR
 from app.services.job_service import get_job_state, start_command_job
+from stock_crawl_common import load_json_file
 
 
 _RUN_LOCK = threading.Lock()
 _WARMUP_LOCK = threading.Lock()
 _OPTIMIZE_LOCK = threading.Lock()
+_RESULT_LOCK = threading.Lock()
+_LATEST_RESULT: Optional[Dict[str, Any]] = None
 _WARMUP_STATE: Dict[str, Any] = {
     "started": False,
     "running": False,
@@ -45,30 +49,53 @@ def run_stock_strategies(
     with _RUN_LOCK:
         if invalidate:
             invalidate_dir_fingerprints()
-        return run_strategies(config or {}, persist=persist)
+        result = run_strategies(config or {}, persist=persist)
+    set_latest_stock_strategy_result(result)
+    return result
+
+
+def set_latest_stock_strategy_result(result: Dict[str, Any]) -> None:
+    with _RESULT_LOCK:
+        global _LATEST_RESULT
+        _LATEST_RESULT = copy.deepcopy(result)
+
+
+def get_latest_stock_strategy_result() -> Dict[str, Any]:
+    with _RESULT_LOCK:
+        if _LATEST_RESULT:
+            return copy.deepcopy(_LATEST_RESULT)
+
+    from stock_advanced_strategies import OUTPUT_FILE
+
+    payload = load_json_file(OUTPUT_FILE, {})
+    if isinstance(payload, dict) and (payload.get("long") or payload.get("short")):
+        set_latest_stock_strategy_result(payload)
+        return payload
+    return {}
 
 
 def start_stock_strategy_warmup() -> bool:
+    cached = get_latest_stock_strategy_result()
+    now = time.strftime("%Y-%m-%d %H:%M:%S")
+    long_section = cached.get("long") or {}
+    short_section = cached.get("short") or {}
     with _WARMUP_LOCK:
         if _WARMUP_STATE.get("running") or _WARMUP_STATE.get("ok") is True:
             return False
         _WARMUP_STATE.update(
             {
                 "started": True,
-                "running": True,
-                "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "finished_at": None,
-                "ok": None,
-                "error": "",
-                "elapsed_sec": None,
-                "long_candidates": None,
-                "short_candidates": None,
+                "running": False,
+                "started_at": now,
+                "finished_at": now,
+                "ok": bool(cached),
+                "error": "" if cached else "未找到已生成策略结果，请先刷新数据",
+                "elapsed_sec": 0.0,
+                "long_candidates": long_section.get("candidate_count"),
+                "short_candidates": short_section.get("candidate_count"),
             }
         )
-
-    thread = threading.Thread(target=_warmup_stock_strategy_cache, daemon=True)
-    thread.start()
-    return True
+    return False
 
 
 def get_stock_strategy_warmup_state() -> Dict[str, Any]:
@@ -115,34 +142,6 @@ def start_optimizer_job() -> bool:
 def optimizer_state_snapshot() -> Dict[str, Any]:
     with _OPTIMIZE_LOCK:
         return dict(_OPTIMIZE_STATE)
-
-
-def _warmup_stock_strategy_cache() -> None:
-    started = time.perf_counter()
-    ok = False
-    error = ""
-    long_candidates = None
-    short_candidates = None
-    try:
-        result = run_stock_strategies({}, persist=False, invalidate=True)
-        long_candidates = (result.get("long") or {}).get("candidate_count")
-        short_candidates = (result.get("short") or {}).get("candidate_count")
-        ok = True
-    except Exception as exc:
-        error = str(exc)
-
-    with _WARMUP_LOCK:
-        _WARMUP_STATE.update(
-            {
-                "running": False,
-                "finished_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "ok": ok,
-                "error": error,
-                "elapsed_sec": round(time.perf_counter() - started, 1),
-                "long_candidates": long_candidates,
-                "short_candidates": short_candidates,
-            }
-        )
 
 
 def _run_optimizer_job() -> None:

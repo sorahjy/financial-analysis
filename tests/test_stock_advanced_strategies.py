@@ -48,8 +48,9 @@ PIT_SYNTH_STOCK = {
         ],
     },
     "dividends": {"records": [], "yearly_dividends": {}, "consecutive_3y_dividend": False},
-    "daily": {"recent_daily": [], "stats": {"volatility_annual": 0.3,
-                                            "avg_daily_turnover_approx": 1e8, "latest_close": 15}},
+    "daily": {"stats": {"history_window_annualized_volatility": 0.3,
+                        "history_window_avg_daily_amount": 1e8,
+                        "latest_daily_close": 15}},
 }
 
 

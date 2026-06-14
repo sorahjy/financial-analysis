@@ -20,7 +20,7 @@ os.environ["TQDM_DISABLE"] = "1"
 
 import argparse
 import json
-import math
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -29,6 +29,24 @@ from pathlib import Path
 import akshare as ak
 import numpy as np
 import pandas as pd
+
+from stock_crawl_common import (
+    strip_proxy_env,
+    safe_float as _safe_float,
+    retry_fetch as _retry_fetch,
+    is_bse_stock,
+    fetch_index_constituents,
+    fetch_qfq_daily_records,
+    find_stock_json,
+    daily_payload_from_history_records,
+    daily_stats_from_history_records,
+    history_payload_from_records,
+    latest_weekday_date,
+    load_json_file,
+    merge_records_by_date,
+    normalize_history_records,
+    write_json_file,
+)
 
 DATA_DIR = Path(__file__).parent / "data"
 OUTPUT_DIR = DATA_DIR / "stock_data"
@@ -51,39 +69,10 @@ TECH_KEYWORDS = [
 ]
 
 
-def is_bse_stock(code: str) -> bool:
-    """判断是否为北交所股票。北交所代码以 4 或 8 开头（如 430xxx, 830xxx, 920xxx 等）"""
-    return code.startswith("4") or code.startswith("8") or code.startswith("9")
-
-
 # ═══════════════════════════════════════════════════════════
 # 单股数据获取（原 stock_fetch_data.py 并入）
 # ═══════════════════════════════════════════════════════════
 
-MAX_RETRIES = 3
-
-
-def _retry_fetch(func, *args, retries=MAX_RETRIES, **kwargs):
-    """带重试的数据获取，应对连接不稳定"""
-    for attempt in range(retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt + 1)
-            else:
-                raise
-
-
-def _safe_float(val):
-    """将值转为 float，NaN/None 转为 None（方便 JSON 序列化）"""
-    if val is None:
-        return None
-    try:
-        f = float(val)
-        return None if (math.isnan(f) or math.isinf(f)) else round(f, 6)
-    except (ValueError, TypeError):
-        return None
 
 
 def _df_to_records(df, cols_map, date_col="报告日"):
@@ -112,77 +101,26 @@ def _df_to_records(df, cols_map, date_col="报告日"):
 
 
 def fetch_daily_price(symbol, years=1):
-    """获取近 N 年日频行情，计算波动率和日均成交额
-    优先使用腾讯接口(稳定)，回退到东方财富接口
-    """
-    end_date = datetime.now().strftime("%Y%m%d")
-    start_date = (datetime.now() - timedelta(days=365 * years)).strftime("%Y%m%d")
+    """获取近 N 年前复权日频行情，并派生 daily.stats。"""
+    end_date = latest_weekday_date()
+    start_date = (
+        datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=365 * years)
+    ).strftime("%Y-%m-%d")
+    rows = fetch_qfq_daily_records(
+        symbol,
+        start_date,
+        end_date,
+        include_trading_value=True,
+        warn=lambda message: safe_print(f"  [FALLBACK] {message}"),
+    )
+    if not rows:
+        raise RuntimeError(f"{symbol} 日线为空")
 
-    # 确定腾讯接口需要的 symbol 前缀
-    tx_symbol = f"sh{symbol}" if symbol.startswith("6") else f"sz{symbol}"
-
-    try:
-        df = _retry_fetch(
-            ak.stock_zh_a_hist_tx,
-            symbol=tx_symbol, start_date=start_date, end_date=end_date
-        )
-        # 腾讯接口: date, open, close, high, low, amount(成交量,手)
-        close_prices = df["close"].astype(float)
-        daily_returns = close_prices.pct_change().dropna()
-        # amount 是成交量(手)，近似成交额 = 成交量 * 100 * 收盘价
-        df["turnover_approx"] = df["amount"].astype(float) * 100 * close_prices
-
-        stats = {
-            "trading_days": len(df),
-            "avg_daily_volume": _safe_float(df["amount"].astype(float).mean()),
-            "avg_daily_turnover_approx": _safe_float(df["turnover_approx"].mean()),
-            "volatility_annual": _safe_float(daily_returns.std() * np.sqrt(252)),
-            "volatility_daily_std": _safe_float(daily_returns.std()),
-            "latest_close": _safe_float(close_prices.iloc[-1]),
-            "start_date": str(df["date"].iloc[0])[:10],
-            "end_date": str(df["date"].iloc[-1])[:10],
-        }
-
-        recent = []
-        for _, row in df.tail(30).iterrows():
-            recent.append({
-                "date": str(row["date"])[:10],
-                "close": _safe_float(row["close"]),
-                "volume": _safe_float(row["amount"]),
-                "change_pct": _safe_float(
-                    (row["close"] - row["open"]) / row["open"] * 100 if row["open"] else None
-                ),
-            })
-
-    except Exception:
-        df = _retry_fetch(
-            ak.stock_zh_a_hist,
-            symbol=symbol, period="daily",
-            start_date=start_date, end_date=end_date, adjust="qfq"
-        )
-        close_prices = df["收盘"].astype(float)
-        daily_returns = close_prices.pct_change().dropna()
-
-        stats = {
-            "trading_days": len(df),
-            "avg_daily_turnover": _safe_float(df["成交额"].astype(float).mean()),
-            "volatility_annual": _safe_float(daily_returns.std() * np.sqrt(252)),
-            "volatility_daily_std": _safe_float(daily_returns.std()),
-            "latest_close": _safe_float(close_prices.iloc[-1]),
-            "start_date": str(df["日期"].iloc[0])[:10],
-            "end_date": str(df["日期"].iloc[-1])[:10],
-        }
-
-        recent = []
-        for _, row in df.tail(30).iterrows():
-            recent.append({
-                "date": str(row["日期"])[:10],
-                "close": _safe_float(row["收盘"]),
-                "turnover": _safe_float(row["成交额"]),
-                "change_pct": _safe_float(row["涨跌幅"]),
-            })
-
-    return {"stats": stats, "recent_daily": recent}
+    history_records = normalize_history_records(rows, include_valuation=False)
+    return {
+        "stats": daily_stats_from_history_records(history_records),
+        "history_records": history_records,
+    }
 
 
 def fetch_financial_reports(stock_code):
@@ -311,28 +249,6 @@ def fetch_dividend_history(symbol):
 # 公共工具
 # ═══════════════════════════════════════════════════════════
 
-def fetch_index_constituents(symbol):
-    """获取指数全量成分股, 返回 {code: name}。
-
-    优先中证官网接口 index_stock_cons_csindex(全量下载)；失败时回退
-    新浪接口 index_stock_cons —— 注意新浪分页对大样本指数(如中证全指
-    约5000只)只返回部分成分, 仅作兜底。
-    """
-    try:
-        df = _retry_fetch(ak.index_stock_cons_csindex, symbol=symbol)
-        cons = {
-            str(row["成分券代码"]).zfill(6): str(row["成分券名称"])
-            for _, row in df.iterrows()
-        }
-        if cons:
-            return cons
-    except Exception as e:
-        print(f"  [WARN] 中证官网成分接口失败({symbol}): {e}, 回退新浪接口(可能不全)")
-    df = _retry_fetch(ak.index_stock_cons, symbol=symbol)
-    return {
-        str(row["品种代码"]).zfill(6): str(row["品种名称"])
-        for _, row in df.iterrows()
-    }
 
 
 def save_stock_universe(csi300_map, csi_all_map):
@@ -381,7 +297,12 @@ def fetch_one_stock(symbol, name, pledge_map):
     """
     data = {"symbol": symbol, "name": name, "fetch_time": datetime.now().isoformat()}
 
-    data["daily"] = fetch_daily_price(symbol)
+    daily = fetch_daily_price(symbol)
+    history_records = daily.pop("history_records", [])
+    data["daily"] = daily
+    data["history"] = history_payload_from_records(
+        symbol, name, history_records, "stock_crawl_fundamentals.daily"
+    )
     time.sleep(0.5)
 
     data["financials"] = fetch_financial_reports(symbol)
@@ -412,7 +333,9 @@ def load_existing():
     for f in OUTPUT_DIR.glob("CN_*.json"):
         try:
             with open(f, "r", encoding="utf-8") as fp:
-                json.load(fp)
+                data = json.load(fp)
+            if not all(key in data for key in ("financials", "indicators", "dividends")):
+                continue
             code = f.stem.split("_")[1]
             existing.add(code)
         except (json.JSONDecodeError, ValueError, KeyError):
@@ -423,9 +346,23 @@ def load_existing():
 
 def save_stock(symbol, data):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = _stock_file(symbol, data.get("name", symbol))
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    path = find_stock_json(OUTPUT_DIR, symbol, data.get("name")) or _stock_file(symbol, data.get("name", symbol))
+    existing = load_json_file(path, {})
+    if isinstance(existing, dict):
+        existing_records = (existing.get("history") or {}).get("records", [])
+        incoming_records = (data.get("history") or {}).get("records", [])
+        merged_records = merge_records_by_date(existing_records, incoming_records, overwrite_none=False)
+        if merged_records:
+            data["history"] = history_payload_from_records(
+                symbol,
+                data.get("name", symbol),
+                merged_records,
+                "stock_data.history+stock_crawl_fundamentals.daily",
+            )
+            data["daily"] = daily_payload_from_history_records(merged_records)
+    if isinstance(existing, dict) and "history_refetched_at" in existing and "history_refetched_at" not in data:
+        data["history_refetched_at"] = existing["history_refetched_at"]
+    write_json_file(path, data)
 
 
 def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
@@ -758,17 +695,6 @@ def pre_screen_candidates(snapshot):
 # 财报加深重爬（PIT 回测用，跳过日线）
 # ═══════════════════════════════════════════════════════════
 
-def _strip_proxy_env():
-    """STOCK_CRAWL_NO_PROXY=1 时绕过系统/环境变量代理直连境内接口。"""
-    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
-        return
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(var, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
-
-
 def _find_stock_data_file(code):
     matches = sorted(OUTPUT_DIR.glob(f"CN_{code}_*.json"))
     return matches[0] if matches else None
@@ -776,17 +702,17 @@ def _find_stock_data_file(code):
 
 def refetch_financials(codes=None, workers=8):
     """只重拉三大报表+指标+分红(跳过日线)，把现有 stock_data 文件的财报加深到
-    FINANCIAL_YEARS 年。日线深度已在 data/CN_stock，这里不动，避免重爬慢接口。
+    FINANCIAL_YEARS 年。日线长历史已在 stock_data.history，这里不动，避免重爬慢接口。
 
-    codes=None 时取 data/CN_stock(有多年日线) ∩ data/stock_data 的交集——
-    正是 PIT 回测要 join 的股票池。
+    codes=None 时取带 history.records 的 stock_data 文件，正是 PIT 回测要 join 的股票池。
     """
-    cn_dir = DATA_DIR / "CN_stock"
     if codes is None:
-        cn_codes = ({fp.name.split("_")[1] for fp in cn_dir.glob("CN_*.json")}
-                    if cn_dir.exists() else set())
-        sd_codes = {fp.name.split("_")[1] for fp in OUTPUT_DIR.glob("CN_*.json")}
-        codes = sorted(cn_codes & sd_codes)
+        codes = []
+        for fp in OUTPUT_DIR.glob("CN_*.json"):
+            data = load_json_file(fp, {})
+            if isinstance(data, dict) and (data.get("history") or {}).get("records"):
+                codes.append(str(data.get("symbol") or fp.name.split("_")[1]).zfill(6))
+        codes = sorted(set(codes))
     print(f"重拉财报到 {FINANCIAL_YEARS} 年(跳过日线): {len(codes)} 只 / {workers} 线程\n")
 
     def _worker(code):
@@ -823,6 +749,62 @@ def refetch_financials(codes=None, workers=8):
         print(f"  ... 其余 {len(failed) - 10} 个失败")
 
 
+def refetch_daily(codes=None, years=1, workers=8, limit=0):
+    """只重拉已有 stock_data 文件的 daily 字段，用于统一日线复权和涨跌幅口径。"""
+    if codes is None:
+        files = sorted(OUTPUT_DIR.glob("CN_*.json"))
+    else:
+        files = [fp for code in codes if (fp := _find_stock_data_file(code)) is not None]
+    if limit and limit > 0:
+        files = files[:limit]
+
+    print(f"重拉前复权日线到 {years} 年: {len(files)} 只 / {workers} 线程\n")
+
+    failed = []
+    done = 0
+    lock = threading.Lock()
+
+    def _worker(fp):
+        data = load_json_file(fp, {})
+        if not isinstance(data, dict):
+            return fp.name, False, "JSON 非对象"
+        code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
+        try:
+            daily = fetch_daily_price(code, years=years)
+            new_records = daily.pop("history_records", [])
+            existing_records = (data.get("history") or {}).get("records", [])
+            merged_records = merge_records_by_date(existing_records, new_records, overwrite_none=False)
+            data["history"] = history_payload_from_records(
+                code,
+                data.get("name") or code,
+                merged_records,
+                "stock_data.history+stock_crawl_fundamentals.refetch_daily",
+            )
+            data["daily"] = daily_payload_from_history_records(merged_records)
+            data["daily_refetched_at"] = datetime.now().isoformat()
+            write_json_file(fp, data)
+            return code, True, ""
+        except Exception as e:
+            return code, False, str(e)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(_worker, fp) for fp in files]
+        for fut in as_completed(futures):
+            code, ok, err = fut.result()
+            with lock:
+                done += 1
+                if not ok:
+                    failed.append((code, err))
+                if done % 50 == 0 or done == len(files):
+                    print(f"  进度 {done}/{len(files)} (失败 {len(failed)})")
+
+    print(f"\n完成: {len(files) - len(failed)}/{len(files)} 成功, {len(failed)} 失败")
+    for code, err in failed[:10]:
+        print(f"  ✗ {code}: {err}")
+    if len(failed) > 10:
+        print(f"  ... 其余 {len(failed) - 10} 个失败")
+
+
 # ═══════════════════════════════════════════════════════════
 # 主流程
 # ═══════════════════════════════════════════════════════════
@@ -837,12 +819,24 @@ def main():
                         help="并发线程数(默认20)")
     parser.add_argument("--refetch-financials", action="store_true",
                         help="只把已有 stock_data 的财报加深重拉到10年(跳过日线), 用于PIT回测")
+    parser.add_argument("--refetch-daily", action="store_true",
+                        help="只重拉已有 stock_data 的前复权日线并统一 close-to-close 涨跌幅")
+    parser.add_argument("--daily-years", type=int, default=1,
+                        help="--refetch-daily 重拉最近多少年日线，默认 1")
     args = parser.parse_args()
 
-    _strip_proxy_env()
+    strip_proxy_env()
 
     if args.refetch_financials:
         refetch_financials(workers=max(args.workers, 1) if args.workers else 8)
+        return
+
+    if args.refetch_daily:
+        refetch_daily(
+            years=max(args.daily_years, 1),
+            workers=max(args.workers, 1) if args.workers else 8,
+            limit=args.limit,
+        )
         return
 
     if args.mode == "full":

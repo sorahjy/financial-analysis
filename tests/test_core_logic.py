@@ -7,7 +7,14 @@ from unittest.mock import patch
 from fund_backtest import backtest_fund
 from fund_generate_output import esc, parse_percent
 from fund_technical_analysis import analyze_fund, calc_percentile
-from stock_crawl_top_800_data import _decide_valuation_period, find_stock_file, load_stock_file, save_stock_file
+from stock_crawl_common import history_payload_from_records, merge_records_by_date
+from stock_crawl_price_valuation import (
+    _decide_valuation_period,
+    find_stock_file,
+    load_stock_file,
+    records_need_ohlcv_backfill,
+    save_stock_file,
+)
 
 
 class ParsePercentTest(unittest.TestCase):
@@ -104,8 +111,16 @@ class StockValuationDecisionTest(unittest.TestCase):
 class StockFilePathTest(unittest.TestCase):
     def test_save_stock_file_sanitizes_name_and_load_finds_it(self):
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("stock_crawl_top_800_data.DATA_DIR", Path(tmp)):
-                save_stock_file("000001", "坏/名字:测试", {"records": [{"date": "2026-01-01"}]})
+            with patch("stock_crawl_price_valuation.DATA_DIR", Path(tmp)):
+                save_stock_file("000001", "坏/名字:测试", {"records": [{
+                    "date": "2026-01-01",
+                    "daily_open": 10,
+                    "daily_high": 11,
+                    "daily_low": 9,
+                    "daily_close": 10.5,
+                    "daily_volume": 100,
+                    "daily_amount": 1050,
+                }]})
 
                 files = list(Path(tmp).glob("CN_000001_*.json"))
                 self.assertEqual(len(files), 1)
@@ -117,8 +132,77 @@ class StockFilePathTest(unittest.TestCase):
             fp = Path(tmp) / "CN_000002_旧名.json"
             fp.write_text(json.dumps({"records": []}), encoding="utf-8")
 
-            with patch("stock_crawl_top_800_data.DATA_DIR", Path(tmp)):
+            with patch("stock_crawl_price_valuation.DATA_DIR", Path(tmp)):
                 self.assertEqual(find_stock_file("000002", "新名"), fp)
+
+
+class StockRecordMergeTest(unittest.TestCase):
+    def test_merge_records_by_date_can_overwrite_with_none(self):
+        merged = merge_records_by_date(
+            [{"date": "2026-01-01", "pb": 1.2, "close": 10}],
+            [{"date": "2026-01-01", "pb": None, "close": 11}],
+            overwrite_none=True,
+        )
+
+        self.assertIsNone(merged[0]["pb"])
+        self.assertEqual(merged[0]["close"], 11)
+
+    def test_merge_records_by_date_can_preserve_existing_when_new_value_is_none(self):
+        merged = merge_records_by_date(
+            [{"date": "2026-01-01", "pb": 1.2, "close": 10}],
+            [{"date": "2026-01-01", "pb": None, "close": 11}],
+            overwrite_none=False,
+        )
+
+        self.assertEqual(merged[0]["pb"], 1.2)
+        self.assertEqual(merged[0]["close"], 11)
+
+
+class StockHistorySchemaTest(unittest.TestCase):
+    def complete_row(self, date):
+        return {
+            "date": date,
+            "daily_open": 10,
+            "daily_high": 11,
+            "daily_low": 9,
+            "daily_close": 10.5,
+            "daily_volume": 10000,
+            "daily_amount": 105000,
+            "daily_change_pct": 1.2,
+            "daily_turnover_rate": 2.3,
+        }
+
+    def test_history_payload_prunes_snapshot_only_rows(self):
+        payload = history_payload_from_records(
+            "000001",
+            "测试股份",
+            [
+                self.complete_row("2026-06-11"),
+                {"date": "2026-06-11"},
+                {"date": "2026-06-12", "daily_close": 10.8, "market_cap": 100},
+            ],
+            "test",
+        )
+
+        self.assertEqual([row["date"] for row in payload["records"]], ["2026-06-11"])
+
+    def test_single_snapshot_row_does_not_trigger_full_ohlcv_backfill(self):
+        records = [
+            self.complete_row("2026-06-10"),
+            self.complete_row("2026-06-11"),
+            {"date": "2026-06-12", "daily_close": 10.8, "market_cap": 100},
+        ]
+
+        self.assertFalse(records_need_ohlcv_backfill(records))
+
+    def test_majority_missing_ohlcv_still_triggers_backfill(self):
+        records = [
+            self.complete_row("2026-06-10"),
+            {"date": "2026-06-11", "daily_close": 10.6, "daily_change_pct": 0.9},
+            {"date": "2026-06-12", "daily_close": 10.8, "daily_change_pct": 1.1},
+        ]
+
+        self.assertTrue(records_need_ohlcv_backfill(records))
 
 
 class FundBacktestTest(unittest.TestCase):

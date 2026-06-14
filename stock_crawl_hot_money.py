@@ -1,6 +1,6 @@
 """
 爬取龙虎榜数据：活跃营业部（主力席位）、每日明细、机构买卖统计、个股上榜统计，
-按共振席位聚合打分，并落盘短线策略需要的 signals（龙虎榜/机构/统计/技术面）。
+按共振席位聚合候选池，并落盘短线策略需要的原始 signals（龙虎榜/机构/统计/技术面）。
 
 数据来源（东方财富网 - 数据中心 - 龙虎榜单）:
     akshare.stock_lhb_hyyyb_em            每日活跃营业部（席位 → 买入股票）
@@ -12,9 +12,6 @@
 
 import argparse
 import json
-import math
-import os
-import random
 import threading
 import time
 from collections import defaultdict
@@ -24,40 +21,32 @@ from pathlib import Path
 
 import akshare as ak
 
+from stock_crawl_common import (
+    analysis_records_from_history_records,
+    find_stock_json,
+    history_record_has_daily_ohlcv,
+    load_json_file,
+    normalize_history_records,
+    retry_fetch_or_none as _retry,
+    safe_num as _num,
+    strip_proxy_env,
+    symbol_with_prefix as _symbol_with_prefix,
+)
+
 KLINE_LOOKBACK = 60      # 取最近 60 个交易日（足够算 MA20 / RSI / 距高点）
 MAX_RETRIES = 3
 THREAD_COUNT = 6         # 不要调高：>6 易被龙虎榜/K线接口限流甚至跑挂
 DATA_DIR = Path("data/capital")
+STOCK_DATA_DIR = Path("data/stock_data")
+CANDIDATES_FILE = DATA_DIR / "hot_money_candidates.json"
 KNOWN_SEAT_TOP_N = 100   # 营业部排行前 N 标记为高活跃/知名席位
 
 
-def _strip_proxy_env():
-    """STOCK_CRAWL_NO_PROXY=1 时绕过系统/环境变量代理直连（东财为境内接口）。"""
-    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
-        return
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(var, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
-
-
-_strip_proxy_env()
+strip_proxy_env()
 
 # 新浪 K 线接口底层走 mini_racer / V8 执行 JS 加密，V8 不是线程安全
 # 多线程并发会 segfault → 用全局锁串行化 JS 执行段。
 _kline_lock = threading.Lock()
-
-
-def _num(v):
-    """把 None / NaN / 字符串都转成 float，无法解析返回 0.0。"""
-    if v is None:
-        return 0.0
-    try:
-        f = float(v)
-        return 0.0 if math.isnan(f) else f
-    except (ValueError, TypeError):
-        return 0.0
 
 
 def _visual_width(s):
@@ -344,27 +333,33 @@ def get_name_code_map():
 
 # ─── 单只股票数据爬取（K 线）────────────────────────────────────
 
-def _retry(func, *args, retries=MAX_RETRIES, **kwargs):
-    """退避重试包装；末次失败返回 None 而非抛错。"""
-    for i in range(retries):
-        try:
-            return func(*args, **kwargs)
-        except Exception:
-            if i == retries - 1:
-                return None
-            time.sleep(0.5 * (i + 1) + random.uniform(0, 0.5))
-    return None
+def _has_complete_ohlcv(records):
+    required = ("open", "high", "low", "close", "volume", "amount")
+    return bool(records) and all(
+        all(row.get(field) is not None for field in required)
+        for row in records
+    )
 
 
-def _symbol_with_prefix(code):
-    """6 位 code → 新浪接口要求的 sh/sz/bj 前缀格式。"""
-    if code.startswith(("60", "68", "9")):
-        return "sh" + code
-    if code.startswith(("00", "30", "20")):
-        return "sz" + code
-    if code.startswith(("8", "4", "92")):
-        return "bj" + code
-    return "sh" + code
+def load_local_kline_records(code, name=None, *, lookback=None, start_date=None):
+    """Read complete OHLCV rows from data/stock_data.history when available."""
+    fp = find_stock_json(STOCK_DATA_DIR, str(code).zfill(6), name)
+    if fp is None:
+        return []
+    payload = load_json_file(fp, {})
+    records = normalize_history_records(
+        (payload.get("history") or {}).get("records", []),
+        include_valuation=False,
+    )
+    if start_date:
+        records = [row for row in records if row.get("date") >= start_date]
+    records = [row for row in records if history_record_has_daily_ohlcv(row)]
+    if lookback:
+        records = records[-lookback:]
+        if len(records) < lookback:
+            return []
+    analysis_records = analysis_records_from_history_records(records)
+    return analysis_records if _has_complete_ohlcv(analysis_records) else []
 
 
 def fetch_stock_data(code, name):
@@ -374,6 +369,10 @@ def fetch_stock_data(code, name):
         dict | None: {code, name, records: [{date,open,high,low,close,volume,
             amount,change_pct,turnover_rate}, ...]}；失败返回 None。
     """
+    local_records = load_local_kline_records(code, name, lookback=KLINE_LOOKBACK)
+    if local_records:
+        return {"code": code, "name": name, "records": local_records}
+
     with _kline_lock:
         df = _retry(ak.stock_zh_a_daily,
                     symbol=_symbol_with_prefix(code), adjust="qfq")
@@ -495,229 +494,74 @@ def compute_tech_signals(records, code):
     }
 
 
-def score_resonance(follower_count):
-    """主力共振分：被几个 Top 席位共同买入。"""
-    table = {0: 0, 1: 30, 2: 55, 3: 70, 4: 85}
-    return table.get(follower_count, 100)
+# ─── 候选排序 / 输出 / 落盘 ─────────────────────────────────────
 
-
-def score_momentum(records):
-    """动量分 = 平均(5日涨幅分, 量比分, 均线多头分)。"""
-    if len(records) < 20:
-        return 0.0
-    closes = [r["close"] for r in records]
-    vols = [r["volume"] for r in records]
-
-    # 1) 5 日涨幅：钟形得分，2~10% 最佳（动量但未过热）
-    if closes[-6] > 0:
-        ret5 = (closes[-1] / closes[-6] - 1) * 100
-    else:
-        ret5 = 0
-    if 2 <= ret5 <= 10:
-        r_score = 100
-    elif ret5 < -10 or ret5 > 25:
-        r_score = 0
-    elif ret5 < 2:
-        r_score = max(0, 50 + ret5 * 5)        # -10→0, 2→60
-    else:
-        r_score = max(0, 100 - (ret5 - 10) * 5) # 10→100, 25→25
-
-    # 2) 量比：今日量 vs 5 日均量
-    avg5 = sum(vols[-6:-1]) / 5 if len(vols) >= 6 else 0
-    vol_ratio = (vols[-1] / avg5) if avg5 > 0 else 1
-    if vol_ratio < 0.5: v_score = 20
-    elif vol_ratio < 0.8: v_score = 40
-    elif vol_ratio < 1.2: v_score = 60
-    elif vol_ratio < 2:   v_score = 80
-    elif vol_ratio < 4:   v_score = 100
-    else:                 v_score = 70         # 过度天量警惕
-
-    # 3) 均线多头：MA5 > MA10 > MA20 且 close > MA5
-    ma5, ma10, ma20 = _ma(closes, 5), _ma(closes, 10), _ma(closes, 20)
-    if ma5 and ma10 and ma20:
-        bull = ma5 > ma10 > ma20
-        above5 = closes[-1] > ma5
-        ma_score = 100 if (bull and above5) else (60 if above5 else 30)
-    else:
-        ma_score = 50
-
-    return (r_score + v_score + ma_score) / 3
-
-
-def score_position(records):
-    """位置分 = 平均(距 60 日高点位置分, RSI 分)。"""
-    if len(records) < 20:
-        return 50.0
-    closes = [r["close"] for r in records]
-    highs = [r["high"] for r in records]
-
-    look = min(60, len(records))
-    peak = max(highs[-look:])
-    last = closes[-1]
-    if peak <= 0:
-        p_score = 50
-    else:
-        drop = (peak - last) / peak * 100  # 距高点跌幅 %
-        if drop < 0:      p_score = 80     # 已破前高（继续强但不追)
-        elif drop < 5:    p_score = 90
-        elif drop < 15:   p_score = 100    # 上攻空间最佳
-        elif drop < 30:   p_score = 70
-        elif drop < 50:   p_score = 40
-        else:             p_score = 20
-
-    r = _rsi(closes, 14)
-    if r is None:        rsi_score = 50
-    elif r < 30:         rsi_score = 100   # 超卖反弹
-    elif r < 50:         rsi_score = 90
-    elif r < 70:         rsi_score = 70
-    elif r < 80:         rsi_score = 40
-    else:                rsi_score = 10    # 极度超买
-
-    return (p_score + rsi_score) / 2
-
-
-def score_risk_penalty(name, records):
-    """风险扣分汇总（越大越坏，上限 100）。"""
-    penalty = 0
-    upper = name.upper()
-    if "ST" in upper or "*ST" in upper:
-        penalty += 60
-
-    if len(records) >= 6 and records[-6]["close"] > 0:
-        ret5 = (records[-1]["close"] / records[-6]["close"] - 1) * 100
-        if ret5 > 30:    penalty += 30      # 短期过热
-        elif ret5 > 20:  penalty += 15
-
-    if records and records[-1]["change_pct"] < -5:
-        penalty += 30                       # 昨日大跌（可能炸板）
-
-    # 流动性
-    if len(records) >= 5:
-        avg_amt = sum(r["amount"] for r in records[-5:]) / 5
-        if avg_amt < 5e7:    penalty += 20  # 日均成交 <5000 万
-        elif avg_amt < 1e8:  penalty += 10
-
-    # 长上影线（昨日上影 > 实体 1.5 倍）
-    if records:
-        r = records[-1]
-        body = abs(r["close"] - r["open"])
-        up_wick = r["high"] - max(r["close"], r["open"])
-        if body > 0 and up_wick > body * 1.5:
-            penalty += 15
-
-    return min(penalty, 100)
-
-
-WEIGHTS = {
-    "resonance": 0.25,  # 主力共振
-    "momentum":  0.30,  # 动量
-    "position":  0.20,  # 位置（距高点/RSI）
-    "risk":      0.25,  # 风控（反向）
-}
-
-
-def score_stock(stock):
-    """对单只股票打分。
-
-    Args:
-        stock: 含 followers / records / name 的字典
-    Returns:
-        dict: {resonance, momentum, position, risk_penalty, total, verdict}
-    """
-    records = stock.get("records") or []
-    name = stock.get("name", "")
-    followers = stock.get("followers") or []
-    # followers 是席位级明细（同一席位多日重复出现），共振按去重席位数算
-    n_followers = len(set(
-        f.get("seat") if isinstance(f, dict) else str(f) for f in followers
-    ))
-
-    r = score_resonance(n_followers)
-    m = score_momentum(records)
-    p = score_position(records)
-    risk = score_risk_penalty(name, records)
-
-    total = (
-        WEIGHTS["resonance"] * r
-        + WEIGHTS["momentum"] * m
-        + WEIGHTS["position"] * p
-        + WEIGHTS["risk"] * max(0, 100 - risk)
+def _candidate_sort_key(stock):
+    """仅用于 CLI 展示和落盘稳定排序，不作为策略分数。"""
+    return (
+        -(stock.get("weighted_score") or 0.0),
+        -(stock.get("concurrent_count") or 0),
+        -(stock.get("buy_amount_total") or 0.0),
+        stock.get("code") or "",
     )
 
-    if total >= 75:   verdict = "Strong Buy"
-    elif total >= 60: verdict = "Watch"
-    else:             verdict = "Skip"
 
-    return {
-        "resonance":     round(r, 1),
-        "momentum":      round(m, 1),
-        "position":      round(p, 1),
-        "risk_penalty":  round(risk, 1),
-        "total":         round(total, 1),
-        "verdict":       verdict,
-    }
+def sort_candidates(stocks):
+    """按席位聚合强度做稳定排序；正式分数由 stock_advanced_strategies 计算。"""
+    return sorted(stocks, key=_candidate_sort_key)
 
 
-# ─── 排序 / 输出 / 落盘 ─────────────────────────────────────────
-
-def rank_and_print(stocks, top_n=20):
-    """对带 scores 的 stocks 排序并打印 Top N。"""
-    ranked = sorted(stocks, key=lambda s: -s["scores"]["total"])
+def print_candidates(stocks, top_n=20):
+    """打印游资候选池 Top N，不输出策略总分。"""
+    ranked = sort_candidates(stocks)
 
     print("\n" + "=" * 110)
-    print(f"  T+1 买 / T+2 卖 综合打分 Top {top_n}")
-    print(f"  权重: 共振{int(WEIGHTS['resonance']*100)}% 动量{int(WEIGHTS['momentum']*100)}% "
-          f"位置{int(WEIGHTS['position']*100)}% 风控{int(WEIGHTS['risk']*100)}%")
+    print(f"  游资候选池 Top {top_n}（仅按席位聚合强度展示，非策略评分）")
     print("=" * 110)
     header = (
         _pad_visual("代码", 8)
         + _pad_visual("名称", 14)
-        + _pad_visual("总分", 8)
-        + _pad_visual("评级", 14)
+        + _pad_visual("席位加权", 12)
         + _pad_visual("共振", 8)
-        + _pad_visual("动量", 8)
-        + _pad_visual("位置", 8)
-        + _pad_visual("风控", 8)
         + _pad_visual("席位数", 8)
+        + _pad_visual("知名席位", 10)
+        + _pad_visual("估算买入(亿)", 14)
+        + _pad_visual("窗口", 22)
     )
     print(header)
     print("-" * 110)
     for s in ranked[:top_n]:
-        sc = s["scores"]
+        window = s.get("best_window") or []
+        window_text = "~".join(window) if len(window) >= 2 else ""
         print(
             _pad_visual(s["code"], 8)
             + _pad_visual(s["name"], 14)
-            + _pad_visual(f"{sc['total']:.1f}", 8)
-            + _pad_visual(sc["verdict"], 14)
-            + _pad_visual(f"{sc['resonance']:.0f}", 8)
-            + _pad_visual(f"{sc['momentum']:.0f}", 8)
-            + _pad_visual(f"{sc['position']:.0f}", 8)
-            + _pad_visual(f"{100 - sc['risk_penalty']:.0f}", 8)
-            + _pad_visual(str(s.get("total_buyers") or len(s["followers"])), 8)
+            + _pad_visual(f"{(s.get('weighted_score') or 0):.1f}", 12)
+            + _pad_visual(str(s.get("concurrent_count") or 0), 8)
+            + _pad_visual(str(s.get("total_buyers") or len(s.get("followers") or [])), 8)
+            + _pad_visual(str(s.get("known_seat_count") or 0), 10)
+            + _pad_visual(f"{(s.get('buy_amount_total') or 0)/1e8:.2f}", 14)
+            + _pad_visual(window_text, 22)
         )
     print("=" * 110)
-    print("注: 分数仅供参考；T+1 实际买点请结合开盘竞价与盘口。")
+    print("注: 这里不再预打分；短线最终分数由 stock_advanced_strategies.py 统一计算。")
     return ranked
 
 
-def persist_results(stocks, fp=None):
-    """落盘排序结果。"""
-    if fp is None:
-        fp = DATA_DIR / "scored_stocks.json"
-    else:
-        fp = Path(fp)
+def persist_candidates(stocks, fp=None):
+    """落盘游资候选池与原始 signals。"""
+    fp = Path(fp) if fp is not None else CANDIDATES_FILE
     fp.parent.mkdir(parents=True, exist_ok=True)
-    ranked = sorted(stocks, key=lambda s: -s["scores"]["total"])
+    ranked = sort_candidates(stocks)
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "as_of_date": datetime.now().strftime("%Y-%m-%d"),
-        "weights": WEIGHTS,
+        "schema": "hot_money_candidates.v1",
         "count": len(ranked),
         "stocks": [
             {
                 "code": s["code"],
                 "name": s["name"],
-                "scores": s["scores"],
                 "followers": s["followers"],
                 "concurrent_count": s.get("concurrent_count"),
                 "total_buyers": s.get("total_buyers"),
@@ -740,14 +584,14 @@ def persist_results(stocks, fp=None):
 
 def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
                               min_followers=2, score_top=20):
-    """主流程：龙虎榜 → 共振股票池 → 并发拉 K 线 → 打分 → 排序输出。
+    """主流程：龙虎榜 → 共振股票池 → 并发拉 K 线 → 原始信号落盘。
 
     Args:
-        min_followers: 至少被多少个 Top 席位共买才纳入打分，默认 2（更聚焦共振）。
-        score_top:     最终打分榜展示前 N 条。
+        min_followers: 至少被多少个 Top 席位共买才纳入候选池，默认 2（更聚焦共振）。
+        score_top:     终端候选池展示前 N 条；保留参数名兼容原 CLI。
 
     Returns:
-        list[dict]: 含 scores 的股票列表（已按 total 降序）。
+        list[dict]: 候选股票列表（已按席位聚合强度排序）。
     """
     df = fetch_active_yyb(days=days)
     print(f"共 {len(df)} 条上榜记录 · {df['营业部名称'].nunique()} 个不同营业部 · "
@@ -792,7 +636,7 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
             continue
         tasks.append((code, stock_name, sorted(pool[stock_name], key=lambda f: f["date"])))
 
-    print(f"\n开始并发拉 K 线 + 打分（{len(tasks)} 只 / {THREAD_COUNT} 线程）...")
+    print(f"\n开始并发拉 K 线 + 生成原始信号（{len(tasks)} 只 / {THREAD_COUNT} 线程）...")
     results, failed = [], []
     completed = 0
 
@@ -809,13 +653,6 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
             "stat": stat_map.get(code),
             "tech": tech or None,
         }
-        data["scores"] = score_stock(data)
-        if tech:
-            data["scores"].update({
-                "consecutive_limit_up": tech.get("consecutive_limit_up"),
-                "is_yizi_ban": tech.get("is_yizi_ban"),
-                "is_t_ban": tech.get("is_t_ban"),
-            })
         return ("OK", data)
 
     with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
@@ -834,7 +671,7 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
             if completed % 50 == 0:
                 print(f"  进度 {completed}/{len(tasks)}")
 
-    print(f"\n已打分 {len(results)} 只 · 跳过(无代码) {len(missing)} · 失败 {len(failed)}")
+    print(f"\n已生成候选 {len(results)} 只 · 跳过(无代码) {len(missing)} · 失败 {len(failed)}")
     if missing:
         sample = missing[:10]
         more = f" ...+{len(missing) - 10}" if len(missing) > 10 else ""
@@ -846,14 +683,14 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
     if not results:
         return []
 
-    ranked = rank_and_print(results, top_n=score_top)
-    persist_results(ranked)
+    ranked = print_candidates(results, top_n=score_top)
+    persist_candidates(ranked)
     return ranked
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="主力席位龙虎榜 → 共振股票池 → T+1/T+2 打分排序")
+        description="主力席位龙虎榜 → 共振股票池 → 原始信号候选池")
     parser.add_argument("--days", type=int, default=14,
                         help="拉取最近多少自然日的龙虎榜数据，默认 14")
     parser.add_argument("--top-yyb", type=int, default=20,
@@ -862,9 +699,9 @@ def main():
                         default="appearances",
                         help="席位排序依据：上榜次数/净买入/买入金额")
     parser.add_argument("--min-followers", type=int, default=2,
-                        help="股票至少被多少个 Top 席位共买才纳入打分，默认 2")
+                        help="股票至少被多少个 Top 席位共买才纳入候选池，默认 2")
     parser.add_argument("--score-top", type=int, default=20,
-                        help="打分榜展示前 N 条，默认 20")
+                        help="候选池展示前 N 条，默认 20；参数名保留兼容原命令")
     args = parser.parse_args()
 
     print(f"拉取最近 {args.days} 天的活跃营业部数据...")

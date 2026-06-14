@@ -6,7 +6,7 @@
   2. 中金300 (931069) - 高ROE稳定性、分红+成长
   3. 科技100 (931187) - 研发强度+盈利+成长
 
-数据来源: data/stock_data/CN_*.json (由 stock_crawl_index_all_stock_data.py 爬取)
+数据来源: data/stock_data/CN_*.json (由 stock_crawl_fundamentals.py 爬取)
 
 参考指数编制方案：
   - 中证红利低波动100 (930955): index_report/红利低波100.pdf
@@ -20,6 +20,8 @@ from pathlib import Path
 from datetime import datetime
 
 import numpy as np
+
+from stock_crawl_common import daily_stats_from_history_records
 
 DATA_DIR = Path(__file__).parent / "data"
 
@@ -54,6 +56,35 @@ def safe(val):
         return None
 
 
+def stock_history_records(stock):
+    history = stock.get("history") or {}
+    records = history.get("records") if isinstance(history, dict) else None
+    return records if isinstance(records, list) else []
+
+
+def derived_daily_stats(stock):
+    stats = (stock.get("daily") or {}).get("stats") or {}
+    if stats.get("latest_daily_close") is not None or stats.get("latest_close") is not None:
+        return stats
+    return daily_stats_from_history_records(stock_history_records(stock))
+
+
+def latest_daily_close(stats):
+    return safe(stats.get("latest_daily_close")) or safe(stats.get("latest_close"))
+
+
+def history_window_avg_daily_amount(stats):
+    return (
+        safe(stats.get("history_window_avg_daily_amount"))
+        or safe(stats.get("avg_daily_turnover_approx"))
+        or safe(stats.get("avg_daily_turnover"))
+    )
+
+
+def history_window_daily_return_std(stats):
+    return safe(stats.get("history_window_daily_return_std")) or safe(stats.get("volatility_daily_std"))
+
+
 def get_annual_records(records, field, n_years=3):
     """从财报记录中取最近 n 个年报（12-31）的指定字段值"""
     values = []
@@ -83,7 +114,7 @@ def estimate_shares(stock):
 def estimate_market_cap(stock):
     """估算总市值 = 总股本 × 最新收盘价"""
     shares = estimate_shares(stock)
-    price = safe(stock.get("daily", {}).get("stats", {}).get("latest_close"))
+    price = latest_daily_close(derived_daily_stats(stock))
     if shares and price:
         return shares * price
     return None
@@ -95,7 +126,7 @@ def compute_dividend_yield(stock, years=3):
     近似: 使用最新收盘价代替调整日总市值/股本来计算每股股息率
     """
     yearly = stock.get("dividends", {}).get("yearly_dividends", {})
-    price = safe(stock.get("daily", {}).get("stats", {}).get("latest_close"))
+    price = latest_daily_close(derived_daily_stats(stock))
     if not price or price <= 0:
         return None
 
@@ -313,9 +344,9 @@ def build_dividend_low_vol_100(all_stocks):
     # 准备有效数据
     candidates = []
     for sym, stock in all_stocks.items():
-        stats = stock.get("daily", {}).get("stats", {})
-        turnover = safe(stats.get("avg_daily_turnover_approx")) or safe(stats.get("avg_daily_turnover"))
-        vol = safe(stats.get("volatility_daily_std"))
+        stats = derived_daily_stats(stock)
+        turnover = history_window_avg_daily_amount(stats)
+        vol = history_window_daily_return_std(stats)
         if turnover and vol:
             candidates.append((sym, stock, turnover, vol))
 
@@ -389,7 +420,7 @@ def build_cicc_300(all_stocks):
 
     candidates = []
     for sym, stock in all_stocks.items():
-        stats = stock.get("daily", {}).get("stats", {})
+        stats = derived_daily_stats(stock)
         balance = stock.get("financials", {}).get("balance", [])
         income = stock.get("financials", {}).get("income", [])
         indicators = stock.get("indicators", {})
@@ -405,7 +436,7 @@ def build_cicc_300(all_stocks):
             continue
 
         # PDF "过去一年日均成交额" (行业内综合排名用)
-        turnover = safe(stats.get("avg_daily_turnover_approx")) or safe(stats.get("avg_daily_turnover"))
+        turnover = history_window_avg_daily_amount(stats)
         if turnover is None:
             continue
 
@@ -552,8 +583,8 @@ def build_tech_100(all_stocks):
     # Step 2: PDF "剔除总市值或日均成交额任一排名后20%的股票"
     valid = []
     for sym, stock in tech_stocks:
-        stats = stock.get("daily", {}).get("stats", {})
-        turnover = safe(stats.get("avg_daily_turnover_approx")) or safe(stats.get("avg_daily_turnover"))
+        stats = derived_daily_stats(stock)
+        turnover = history_window_avg_daily_amount(stats)
         mkt_cap = estimate_market_cap(stock)
         if turnover and mkt_cap:
             valid.append((sym, stock, mkt_cap, turnover))
@@ -614,7 +645,7 @@ def build_tech_100(all_stocks):
 
         # PB = price / bvps
         bvps = safe(indicators[0].get("bvps_adjusted")) if indicators else None
-        price = safe(stock.get("daily", {}).get("stats", {}).get("latest_close"))
+        price = latest_daily_close(derived_daily_stats(stock))
         pb = (price / bvps) if (price and bvps and bvps > 0) else None
 
         # 扣非净利润
