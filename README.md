@@ -335,7 +335,7 @@ python industry_cycle_extractor.py
 优化股票部分爬虫逻辑，降低爬取时间；三个爬虫脚本更名为 `stock_crawl_hot_money` / `stock_crawl_fundamentals` / `stock_crawl_price_valuation`（原 `stock_crawl_capital` / `stock_crawl_index_all_stock_data` / `stock_crawl_top_800_data`），并抽出公共模块 `stock_crawl_common` 去除重复实现。小幅优化游资雷达逻辑，开发中。重构 Flask 页面逻辑，新增 Live2D 小组件。
 
 #### Update v3.1.2  2026.6.15
-重构 A 股数据刷新与策略缓存链路：`data/stock_data/CN_*.json` 统一承载个股基本面、历史行情、估值和日线统计，清理旧 `CN_stock` 依赖；`stock_crawl_common.py` 下沉 JSON 文件工具、历史行情合并、日线统计和快照清洗逻辑，减少多个 `stock_crawl_*` 爬虫重复实现；`stock_data_refresh.py` 的刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成 `data/stock_advanced_strategy_results.json` 和 `data/stock_strategy_candidate_cache.json`，Flask 启动时只读取已有结果，不再启动即重算候选池；A 股策略台新增 `/api/stock/latest` 缓存读取、刷新日志和刷新确认，因子权重、最低分、输出数量调整时复用候选池快速重打分，避免页面卡死；短线策略移除爬虫阶段的二次评分依赖，改由策略层统一按龙虎榜/游资原始信号打分；`stock_hot_money_radar.py` 同步适配新的 OHLCV 与 `daily.stats` 数据结构；新增 `industry_cycle_extractor.py` 行业指数周期位置能力骨架，为后续宽基、行业、大宗商品、聪明资金行为和景气度模型预留接口；补充相关单元测试和 README 文件结构、命令、输出文件说明。
+重构 A 股数据刷新与策略缓存链路：`data/stock_data/CN_*.json` 统一承载个股基本面、历史行情、估值和日线统计，清理旧 `CN_stock` 依赖；`stock_crawl_common.py` 下沉 JSON 文件工具、历史行情合并、日线统计和快照清洗逻辑，减少多个 `stock_crawl_*` 爬虫重复实现；`stock_data_refresh.py` 的刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成 `data/stock_advanced_strategy_results.json` 和 `data/stock_strategy_candidate_cache.json`，Flask 启动时不再预热或加载上次策略结果；A 股策略台打开后直接基于候选池缓存运行策略，刷新日志和刷新确认保留，因子权重、最低分、输出数量调整时复用候选池快速重打分，避免页面卡死；短线策略移除爬虫阶段的二次评分依赖，改由策略层统一按龙虎榜/游资原始信号打分；`stock_hot_money_radar.py` 同步适配新的 OHLCV 与 `daily.stats` 数据结构；新增 `industry_cycle_extractor.py` 行业指数周期位置能力骨架，为后续宽基、行业、大宗商品、聪明资金行为和景气度模型预留接口；补充相关单元测试和 README 文件结构、命令、输出文件说明。
 
 ## 12. Acknowledgment
 
