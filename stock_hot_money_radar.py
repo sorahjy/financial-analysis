@@ -204,15 +204,15 @@ def fetch_big_deals():
     return out
 
 
-def fetch_main_capital_flow(indicator="今日"):
-    """东财全市场个股资金分级（一个请求）→ {code: {main_net, main_ratio, small_net}}。
-    indicator: "今日"(拉升用) / "5日" / "10日"(潜伏吸筹用)。main=主力(超大+大单)净额，
-    small=小单净额；用于 ①「主力进散户出」背离判断。
-    需代理关闭直连(东财 push2)；失败返回 {}（① 背离分项自动降级为 0）。"""
-    df = _retry(ak.stock_individual_fund_flow_rank, indicator=indicator)
-    out = {}
-    if df is None or getattr(df, "empty", True):
-        return out
+MAIN_CAPITAL_TTL_SEC = 600  # ① 主力分级资金缓存(秒)：盘中10分钟内复用，控 push2 频率（东财分级唯一源、易限流）
+
+
+def _main_capital_cache_file(indicator):
+    return DATA_DIR / f"main_capital_{indicator}.json"
+
+
+def _parse_main_capital_df(df):
+    """解析 stock_individual_fund_flow_rank 返回 → {code:{main_net,main_ratio,small_net}}；列名容错。"""
     cols = list(df.columns)
     find = lambda key: next((c for c in cols if key in c), None)
     code_col = find("代码")
@@ -220,7 +220,8 @@ def fetch_main_capital_flow(indicator="今日"):
     main_ratio_col = find("主力净流入-净占比") or find("主力净流入净占比")
     small_net_col = find("小单净流入-净额") or find("小单净流入")
     if not code_col or not main_net_col:
-        return out
+        return {}
+    out = {}
     for _, row in df.iterrows():
         code = _norm_code(row.get(code_col))
         if not code:
@@ -230,6 +231,38 @@ def fetch_main_capital_flow(indicator="今日"):
             "main_ratio": _parse_pct(row.get(main_ratio_col)) if main_ratio_col else None,
             "small_net": _num(row.get(small_net_col)) if small_net_col else None,
         }
+    return out
+
+
+def fetch_main_capital_flow(indicator="今日", ttl_sec=MAIN_CAPITAL_TTL_SEC):
+    """东财全市场个股资金分级 → {code: {main_net, main_ratio, small_net}}。
+    indicator: "今日"(拉升用) / "5日" / "10日"(潜伏吸筹用)。main=主力(超大+大单)净额，
+    small=小单净额；用于 ①「主力进散户出」背离判断。
+
+    带本地缓存(默认 ttl_sec 内复用)+退避重试+旧缓存兜底，把对 push2 的调用压到最低
+    （东财分级是唯一源、对频率极敏感）；需代理关闭直连。彻底无数据→{}（背离降级为0）。"""
+    cache_fp = _main_capital_cache_file(indicator)
+    cached = None
+    try:
+        with open(cache_fp, encoding="utf-8") as f:
+            cached = json.load(f)
+        if time.time() - cached.get("fetched_ts", 0) < ttl_sec and cached.get("data"):
+            return cached["data"]   # 新鲜缓存命中，不打 push2
+    except (OSError, json.JSONDecodeError):
+        cached = None
+
+    df = _retry(ak.stock_individual_fund_flow_rank, indicator=indicator)
+    out = _parse_main_capital_df(df) if df is not None and not getattr(df, "empty", True) else {}
+    if not out:
+        # 抓取失败/解析空 → 用旧缓存兜底（任意时效，聊胜于无）
+        return cached["data"] if cached and cached.get("data") else {}
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        with open(cache_fp, "w", encoding="utf-8") as f:
+            json.dump({"fetched_ts": time.time(), "indicator": indicator, "data": out}, f, ensure_ascii=False)
+    except OSError:
+        pass
     return out
 
 
