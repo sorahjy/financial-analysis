@@ -51,35 +51,13 @@
 
 ## 3. 快速开始
 
+首先安装环境：
+
 ```bash
 pip install -r requirements.txt
 ```
 
-### 3.1 基金分析
-
-基金分析报告可以直接运行：
-
-```bash
-bash fund_run.sh
-```
-
-如果境内数据源通过本地代理容易失败，可以直连运行：
-
-```bash
-FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
-```
-
-### 3.2 A股策略平台
-
-首次使用建议先刷新股票数据和默认参数：
-
-```bash
-python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
-python stock_strategy_optimizer.py --iterations 200
-python run.py --port 8765
-```
-
-后续直接使用以下命令启动统一 Flask 工作台即可：
+直接使用以下命令后台启动 Flask ：
 
 ```bash
 python run.py --port 8765
@@ -112,6 +90,20 @@ http://127.0.0.1:8765
 - `fund_technical_analysis.py`：生成技术指标和买卖信号。
 - `fund_generate_output.py`：生成 `data/fund_report_data.json`（HTML 由 Flask `/fund` 页面渲染）。
 - `fund_backtest.py`：基金买卖信号的回测逻辑。
+
+### 4.3 基金分析命令行工具
+
+基金分析报告可以直接运行：
+
+```bash
+bash fund_run.sh
+```
+
+如果境内数据源通过本地代理容易失败，可以直连运行：
+
+```bash
+FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
+```
 
 ## 5. A 股策略平台
 
@@ -151,6 +143,34 @@ Dashboard 支持：
 - 直接触发 200 次参数搜索，并查看后台搜索状态。
 - 展示候选数、入选数、平均分、分数区间、数据覆盖率、筛选解释和主要因子贡献。
 
+
+### 5.4 常用命令
+
+首次使用推荐后台跑以下命令组合
+
+```bash
+python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
+python stock_strategy_optimizer.py --iterations 200
+```
+
+股票数据刷新
+
+```bash
+python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
+python stock_data_refresh.py --mode quick --timeout 1800
+python stock_data_refresh.py --mode capital-only --timeout 1800
+```
+
+股票策略
+
+```bash
+python run.py --port 8765
+python stock_advanced_strategies.py --persist
+python stock_advanced_strategies.py --strategy long --json
+python stock_advanced_strategies.py --strategy short --json
+python stock_strategy_optimizer.py --iterations 200
+```
+
 ## 6. 游资雷达
 
 `stock_hot_money_radar.py` 是 v3.1 新增的实验性模块，按「潜伏吸筹 → 拉升 → 出货」三阶段理解短线资金行为。
@@ -183,44 +203,10 @@ STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
 - 建议先积累 `--verify`、`--ambush-verify` 和 `--ambush-backtest` 的命中率，再决定是否纳入交易流程。
 
-## 7. 常用命令
 
-### 7.1 基金
+## 7. 行业周期提取
 
-```bash
-bash fund_run.sh
-FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
-python fund_technical_analysis.py
-python fund_generate_output.py
-```
-
-### 7.2 股票数据刷新
-
-```bash
-python stock_data_refresh.py --mode full --timeout 1800 --no-proxy
-python stock_data_refresh.py --mode quick --timeout 1800
-python stock_data_refresh.py --mode capital-only --timeout 1800
-```
-
-### 7.3 股票策略
-
-```bash
-python run.py --port 8765
-python stock_advanced_strategies.py --persist
-python stock_advanced_strategies.py --strategy long --json
-python stock_advanced_strategies.py --strategy short --json
-python stock_strategy_optimizer.py --iterations 200
-```
-
-### 7.4 验证
-
-```bash
-curl --noproxy '*' -s http://127.0.0.1:8765/api/health
-curl --noproxy '*' -s -X POST http://127.0.0.1:8765/api/run \
-  -H 'Content-Type: application/json' \
-  -d '{}'
-python -m unittest tests/test_core_logic.py tests/test_stock_advanced_strategies.py
-```
+占坑，正在施工中...
 
 ## 8. 输出文件
 
