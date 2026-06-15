@@ -84,8 +84,8 @@ LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
 DEFAULT_OPTIMIZATION_ITERATIONS = 300
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
-# 每隔约1.5个月取一折，固定持有 250 个交易日（约 1 年）。
-LONG_HOLD_CHOICES = [250]  # 长线持有期固定为250交易日(约1年)
+# 每隔约1.5个月取一折，固定持有 125 个交易日（约半年）。
+LONG_HOLD_CHOICES = [125]  # 长线持有期固定为125交易日(约半年)
 LONG_FOLD_STEP_TD = 30     # 折锚点间隔(交易日)；约每1.5个月一折，增加验证密度
 LONG_MAX_LOOKBACK_TD = 2400
 LONG_COST = 0.004          # 单折买卖往返成本（佣金+冲击的粗略值）
@@ -93,6 +93,8 @@ LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
 LONG_MIN_FOLDS = 16        # 有效折数下限，低于此的配置不参与选优(防少数折彩票配置)
 LONG_SOFT_TARGET_FOLDS = 40
 LONG_FOLD_COUNT_PENALTY = 1.25
+LONG_RECENCY_WEIGHT_MIN = 0.5
+LONG_RECENCY_WEIGHT_MAX = 2.0
 LONG_UNTRUSTED_WEIGHT_CAPS = {
     # 指数约束两因子权重上限（按用户要求压低，避免它们主导选参）；
     # csi300_current 另因无历史成分快照(前视)只保留极轻偏好。
@@ -169,6 +171,12 @@ def long_anchor_offsets(hold_td: int) -> List[int]:
     return list(range(hold_td + 1, LONG_MAX_LOOKBACK_TD, LONG_FOLD_STEP_TD))
 
 
+def long_partial_anchor_offsets(hold_td: int) -> List[int]:
+    """走势图专用：最新端尚未走满持有期的锚点，不参与优化选优。"""
+    first = max(1, hold_td + 1 - LONG_FOLD_STEP_TD)
+    return list(range(first, 0, -LONG_FOLD_STEP_TD))
+
+
 def fold_calendar(series: Dict[str, List[Dict[str, Any]]]) -> List[str]:
     """全市场交易日历(各股日期并集，升序)，把折偏移映射成 PIT 时点日期。"""
     dates: set = set()
@@ -240,7 +248,7 @@ def decorrelate_pairs(pairs: List[Dict[str, Any]], min_gap_td: int) -> List[Dict
     """按交易日间隔贪心抽稀重叠折，降低自相关，用于尾部/IR等风险统计。
 
     稠密折每 LONG_FOLD_STEP_TD 个交易日取一折，持有期远大于步长时相邻折高度重叠
-    （hold=250/step=30 时相邻折重叠约88%），会让胜率/IR虚高、把几十折当成几十个独立样本。
+    （hold=125/step=30 时相邻折重叠约76%），会让胜率/IR虚高、把几十折当成几十个独立样本。
     抽稀到相邻保留折至少间隔 min_gap_td 个交易日后，再算风险统计才可信。
     """
     if not pairs:
@@ -261,7 +269,7 @@ def random_fold_split(
     """按折随机打乱后切分训练/验证（约 train_frac / 1-train_frac），不做时间隔离。
 
     用户指定口径：取消 embargo 与时间分块，训练/验证折在时间上混合、各覆盖全部 regime。
-    ⚠ 注意泄漏：稠密折相邻重叠很高（hold=250/step=30 约 88%），随机切分会让训练折与
+    ⚠ 注意泄漏：稠密折相邻重叠很高（hold=125/step=30 约 76%），随机切分会让训练折与
     验证折在时间上重叠 → 含样本内泄漏，验证不再是严格样本外（gap 被人为收窄、val 被抬高）。
     每折按其 as_of 的确定性随机键排序后切分，保证可复现、且各配置用同一划分。
     """
@@ -272,20 +280,108 @@ def random_fold_split(
     return keyed[:k], keyed[k:]
 
 
+def apply_recency_weights(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按时间远近给折加权：最旧 0.5x，最新 2.0x，只影响优化统计。"""
+    if not pairs:
+        return []
+    idxs = [safe_float(pair.get("cal_idx")) for pair in pairs]
+    valid = [idx for idx in idxs if idx is not None]
+    if not valid:
+        return [{**pair, "fold_weight": 1.0} for pair in pairs]
+    lo = min(valid)
+    hi = max(valid)
+    span = hi - lo
+    weighted = []
+    for pair, idx in zip(pairs, idxs):
+        if idx is None or span <= 0:
+            weight = 1.0
+        else:
+            pos = (idx - lo) / span
+            weight = LONG_RECENCY_WEIGHT_MIN + pos * (LONG_RECENCY_WEIGHT_MAX - LONG_RECENCY_WEIGHT_MIN)
+        weighted.append({**pair, "fold_weight": round(weight, 6)})
+    return weighted
+
+
+def fold_weight(pair: Dict[str, Any]) -> float:
+    weight = safe_float(pair.get("fold_weight"))
+    return weight if weight is not None and weight > 0 else 1.0
+
+
+def weighted_mean(values: List[float], weights: List[float]) -> float:
+    total = sum(weights)
+    if total <= 0:
+        return mean(values) if values else 0.0
+    return sum(value * weight for value, weight in zip(values, weights)) / total
+
+
+def weighted_std(values: List[float], weights: List[float], center: float) -> float:
+    total = sum(weights)
+    if total <= 0:
+        return pstdev(values) if len(values) > 1 else 0.0
+    return math.sqrt(sum(weight * (value - center) ** 2 for value, weight in zip(values, weights)) / total)
+
+
+def weighted_median(values: List[float], weights: List[float]) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(zip(values, weights), key=lambda item: item[0])
+    total = sum(max(0.0, weight) for _, weight in ordered)
+    if total <= 0:
+        mid = len(ordered) // 2
+        return ordered[mid][0] if len(ordered) % 2 else (ordered[mid - 1][0] + ordered[mid][0]) / 2.0
+    acc = 0.0
+    cutoff = total / 2.0
+    for value, weight in ordered:
+        acc += max(0.0, weight)
+        if acc >= cutoff:
+            return value
+    return ordered[-1][0]
+
+
+def weighted_tail_mean(values: List[float], weights: List[float], fraction: float = 0.2) -> float:
+    if not values:
+        return 0.0
+    ordered = sorted(zip(values, weights), key=lambda item: item[0])
+    total = sum(max(0.0, weight) for _, weight in ordered)
+    if total <= 0:
+        tail_k = max(1, math.ceil(len(values) * fraction))
+        return mean(value for value, _ in ordered[:tail_k])
+    target = total * fraction
+    used = 0.0
+    accum = 0.0
+    for value, weight in ordered:
+        weight = max(0.0, weight)
+        take = min(weight, target - used)
+        if take <= 0:
+            break
+        accum += value * take
+        used += take
+        if used >= target:
+            break
+    return accum / used if used > 0 else ordered[0][0]
+
+
 def excess_risk_stats(pairs: List[Dict[str, Any]], decorr_gap_td: int) -> Dict[str, float]:
     """尾部/风险统计：最差折、CVaR、下行偏差在去相关子样本上算；回撤用全样本均值。"""
     indep = decorrelate_pairs(pairs, decorr_gap_td)
     use = indep if len(indep) >= LONG_MIN_INDEP_FOLDS else pairs
-    excess = sorted(p["excess_return"] for p in use)
-    n = len(excess)
-    worst = excess[0]
-    tail_k = max(1, math.ceil(n * 0.2))
-    cvar = mean(excess[:tail_k])                      # 最差20%折的平均超额
-    negatives = [e for e in excess if e < 0]
-    downside_dev = math.sqrt(sum(e * e for e in negatives) / n) if negatives else 0.0
-    mean_fold_mdd = mean(p.get("portfolio_max_drawdown", 0.0) for p in pairs) if pairs else 0.0
+    excess = [p["excess_return"] for p in use]
+    weights = [fold_weight(p) for p in use]
+    worst_pair = min(use, key=lambda p: p["excess_return"])
+    worst = worst_pair["excess_return"]
+    cvar = weighted_tail_mean(excess, weights)        # 最差20%折的加权平均超额
+    total_weight = sum(weights)
+    downside_dev = (
+        math.sqrt(sum(w * e * e for e, w in zip(excess, weights) if e < 0) / total_weight)
+        if total_weight > 0 and any(e < 0 for e in excess)
+        else 0.0
+    )
+    mdd_values = [p.get("portfolio_max_drawdown", 0.0) for p in pairs]
+    mdd_weights = [fold_weight(p) for p in pairs]
+    mean_fold_mdd = weighted_mean(mdd_values, mdd_weights) if pairs else 0.0
     return {
         "worst": worst,
+        "worst_weight": fold_weight(worst_pair),
         "cvar": cvar,
         "downside_dev": downside_dev,
         "mean_fold_mdd": mean_fold_mdd,
@@ -338,12 +434,18 @@ def benchmark_window_from_date(
     benchmark_series: List[Dict[str, Any]],
     as_of: str,
     hold_td: int,
+    *,
+    allow_partial: bool = False,
 ) -> Optional[List[Dict[str, Any]]]:
     entry_idx = row_index_on_or_before(benchmark_series, as_of)
     if entry_idx is None:
         return None
     exit_idx = entry_idx + hold_td
     if exit_idx >= len(benchmark_series):
+        if not allow_partial:
+            return None
+        exit_idx = len(benchmark_series) - 1
+    if exit_idx <= entry_idx:
         return None
     return benchmark_series[entry_idx:exit_idx + 1]
 
@@ -354,11 +456,16 @@ def portfolio_fold_path(
     benchmark_series: List[Dict[str, Any]],
     as_of: str,
     hold_td: int,
+    *,
+    allow_partial: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    benchmark_window = benchmark_window_from_date(benchmark_series, as_of, hold_td)
+    benchmark_window = benchmark_window_from_date(
+        benchmark_series, as_of, hold_td, allow_partial=allow_partial
+    )
     if not benchmark_window:
         return None
     dates = [row["date"] for row in benchmark_window]
+    actual_hold_td = len(dates) - 1
     benchmark_prices = [safe_float(row.get("close")) for row in benchmark_window]
     benchmark_entry = benchmark_prices[0]
     benchmark_exit = benchmark_prices[-1]
@@ -393,6 +500,9 @@ def portfolio_fold_path(
     return {
         "as_of": as_of,
         "dates": dates,
+        "target_hold_td": hold_td,
+        "actual_hold_td": actual_hold_td,
+        "partial": actual_hold_td < hold_td,
         "portfolio_path": portfolio_path,
         "benchmark_path": benchmark_path,
         "stock_count": len(stock_paths),
@@ -430,22 +540,26 @@ def long_fold_summary(pairs: List[Dict[str, Any]], hold_td: int) -> Dict[str, An
     excess = [row["excess_return"] for row in ordered]
     portfolio = [row["portfolio_return"] for row in ordered]
     benchmark = [row["benchmark_return"] for row in ordered]
+    weights = [fold_weight(row) for row in ordered]
     ann = 250.0 / hold_td
-    vol = pstdev(excess) if len(excess) > 1 else 0.0
+    mean_e = weighted_mean(excess, weights)
+    vol = weighted_std(excess, weights, mean_e) if len(excess) > 1 else 0.0
     max_dd = max(row.get("portfolio_max_drawdown", 0.0) for row in ordered)
     benchmark_max_dd = max(row.get("benchmark_max_drawdown", 0.0) for row in ordered)
-    mean_e = mean(excess)
     risk = excess_risk_stats(ordered, max(1, hold_td // 2))
     sortino = mean_e / max(risk["downside_dev"], LONG_DOWNSIDE_DEV_FLOOR)
     return {
         "folds": len(excess),
         "indep_folds": risk["indep_folds"],
         "hold_td": hold_td,
-        "avg_portfolio_return_pct": round(mean(portfolio) * 100, 3),
-        "avg_benchmark_return_pct": round(mean(benchmark) * 100, 3),
+        "avg_fold_weight": round(mean(weights), 4),
+        "min_fold_weight": round(min(weights), 4),
+        "max_fold_weight": round(max(weights), 4),
+        "avg_portfolio_return_pct": round(weighted_mean(portfolio, weights) * 100, 3),
+        "avg_benchmark_return_pct": round(weighted_mean(benchmark, weights) * 100, 3),
         "avg_excess_pct": round(mean_e * 100, 3),
         "avg_excess_ann_pct": round(mean_e * ann * 100, 3),
-        "hit_rate": round(sum(1 for e in excess if e > 0) / len(excess) * 100, 2),
+        "hit_rate": round(sum(w for e, w in zip(excess, weights) if e > 0) / sum(weights) * 100, 2),
         "ir": round(mean_e / vol, 3) if vol > 1e-9 else None,
         "downside_ir": round(sortino, 3) if sortino is not None else None,
         "worst_fold_excess_pct": round(min(excess) * 100, 3),
@@ -472,12 +586,12 @@ def long_fold_objective(
     """
     if not pairs:
         return None
-    excess = sorted(p["excess_return"] for p in pairs)
-    n = len(excess)
+    excess = [p["excess_return"] for p in pairs]
+    weights = [fold_weight(p) for p in pairs]
     ann = 250.0 / hold_td
-    median = excess[n // 2] if n % 2 else (excess[n // 2 - 1] + excess[n // 2]) / 2.0
-    mean_e = mean(excess)
-    hit = sum(1 for e in excess if e > 0) / n
+    median = weighted_median(excess, weights)
+    mean_e = weighted_mean(excess, weights)
+    hit = sum(w for e, w in zip(excess, weights) if e > 0) / sum(weights)
     risk = excess_risk_stats(pairs, decorr_gap_td)
     # 下行偏差设地板并对 Sortino 封顶：样本内几乎无下行折时比率会趋于无穷，
     # 不封顶会让"在训练折恰好没有亏损折"的退化配置靠巨大Sortino霸榜(过拟合)。
@@ -490,7 +604,7 @@ def long_fold_objective(
         + sortino * 2.0                                # 下行调整信息比(Sortino)
         + risk["cvar"] * ann * 100 * 0.5               # 最差20%折均值,尾部差则扣分
         - risk["mean_fold_mdd"] * 100 * 0.15           # 持有期内组合回撤惩罚(新增)
-        - tail_breach * 100 * 0.8                      # 最差折击穿地板的硬惩罚
+        - tail_breach * risk["worst_weight"] * 100 * 0.8  # 最差折击穿地板的加权惩罚
     )
 
 
@@ -524,6 +638,7 @@ def long_validation_adjusted_objective(
     negative_validation_penalty = max(0.0, -val_ann) * 0.8
     # 全样本最深折内回撤超过45%再线性惩罚(基准约37%)，压制高回撤的"漂亮"配置。
     worst_mdd_penalty = max(0.0, full_max_mdd - 45.0) * 0.10
+    fold_weights = [fold_weight(pair) for pair in all_pairs]
     objective = (
         blended
         - train_val_gap_penalty
@@ -537,6 +652,8 @@ def long_validation_adjusted_objective(
         "blended_objective": round(blended, 5),
         "train_folds": len(train_pairs),
         "validation_folds": len(val_pairs),
+        "fold_weight_min": round(min(fold_weights), 5),
+        "fold_weight_max": round(max(fold_weights), 5),
         "train_val_gap_ann_pct": round(abs(train_ann - val_ann), 3),
         "train_val_gap_penalty": round(train_val_gap_penalty, 5),
         "fold_count_penalty": round(fold_count_penalty, 5),
@@ -856,7 +973,7 @@ def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg["require_high_drawdown"] = True
     cfg["min_high_drawdown_pct"] = LONG_HIGH_DD_PCT_CHOICES[1]
     if iteration > 0:
-        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
+        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 8
         cfg["min_score"] = rng.choice([45, 50, 55, 58, 60, 63, 66, 70])
         # 市值下限放开到100亿，让中盘股（中证500档）有入池机会
         cfg["min_market_cap_yi"] = rng.choice([100, 200, 300, 500, 800])
@@ -1097,6 +1214,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
             pairs.append({"as_of": as_of, "cal_idx": cal_pos.get(as_of, 0), **fold_stats})
         # 风险/尾部统计的去相关间隔：相邻保留折至少隔半个持有期(重叠≤50%)
         decorr_gap_td = max(1, hold_td // 2)
+        pairs = apply_recency_weights(pairs)
         train_pairs, val_pairs = random_fold_split(pairs)
         adjusted_obj, objective_detail = long_validation_adjusted_objective(
             train_pairs, val_pairs, pairs, hold_td, decorr_gap_td
@@ -1146,8 +1264,9 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "iterations": iterations,
         "candidate_count": len(deep_codes),
         "notes": [search_note] + benchmark_notes + notes + [
-            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有250交易日(约1年)，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
-            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime。⚠注意：稠密折相邻重叠~88%，随机切分下训练折与验证折在时间上重叠，含样本内泄漏，验证不再是严格样本外(gap人为收窄、验证超额被抬高)，系有意为之的口径。",
+            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有125交易日(约半年)，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
+            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime。⚠注意：稠密折相邻重叠~76%，随机切分下训练折与验证折在时间上重叠，含样本内泄漏，验证不再是严格样本外(gap人为收窄、验证超额被抬高)，系有意为之的口径。",
+            "折样本采用时间衰减权重：最旧折 0.5x，最新折 2.0x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
             "稠密折(每30交易日一折)与持有期高度重叠，会把胜率/IR当成独立样本而虚高；故 worst/CVaR/Sortino 等风险统计在'相邻保留折至少隔半个持有期'的去相关子样本(indep_folds)上计算。",
             "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
             "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。高点回撤(抄底)过滤按设定强制开启，高点至今跌幅下限在45~70%搜优；接飞刀尾部改由防御因子保底 + 下行目标(CVaR/回撤/最差折惩罚)约束，而非靠关闭抄底。",
@@ -1248,8 +1367,11 @@ def write_long_fold_paths_svg(
         raise ValueError("没有可用于画图的有效长线回测折。")
 
     paths = sorted(paths, key=lambda row: row["as_of"])
-    avg_portfolio = average_paths(paths, "portfolio_path")
-    avg_benchmark = average_paths(paths, "benchmark_path")
+    complete_paths = [path for path in paths if not path.get("partial")]
+    partial_paths = [path for path in paths if path.get("partial")]
+    avg_source = complete_paths or paths
+    avg_portfolio = average_paths(avg_source, "portfolio_path")
+    avg_benchmark = average_paths(avg_source, "benchmark_path")
 
     cols = 4
     rows = math.ceil(len(paths) / cols)
@@ -1290,7 +1412,10 @@ def write_long_fold_paths_svg(
             pad = (y_max - y_min) * 0.12
             y_min = max(0.0, y_min - pad)
             y_max += pad
-        max_idx = max(1, min(len(path["portfolio_path"]), len(path["benchmark_path"])) - 1)
+        max_idx = max(
+            1,
+            int(path.get("target_hold_td") or min(len(path["portfolio_path"]), len(path["benchmark_path"])) - 1),
+        )
 
         def x_scale(idx: int) -> float:
             return plot_x + plot_w * idx / max_idx
@@ -1316,12 +1441,15 @@ def write_long_fold_paths_svg(
     elements: List[str] = []
     elements.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#f8fafc"/>')
     elements.append(text(36, 42, "长线最优参数各折走势小图矩阵", 25, "700"))
+    fold_count_text = f"{len(complete_paths)} 个完整回测窗口"
+    if partial_paths:
+        fold_count_text += f" + {len(partial_paths)} 个未满持有期展示窗口"
     elements.append(
         text(
             36,
             72,
             (
-                f"{len(paths)} 个有效回测窗口 · 持有 {hold_td} 个交易日 · "
+                f"{fold_count_text} · 持有 {hold_td} 个交易日 · "
                 f"每 {LONG_FOLD_STEP_TD} 个交易日取一个起点 · "
                 "每个小图独立纵轴 · "
                 f"生成 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -1331,10 +1459,11 @@ def write_long_fold_paths_svg(
         )
     )
     elements.append(f'<line x1="36" y1="94" x2="74" y2="94" stroke="#b91c1c" stroke-width="4"/>')
-    elements.append(text(84, 99, f"组合等权平均期末 {avg_portfolio[-1]:.2f}x", 13, "600"))
+    avg_note = "完整折" if complete_paths else "展示折"
+    elements.append(text(84, 99, f"组合等权平均期末 {avg_portfolio[-1]:.2f}x（{avg_note}）", 13, "600"))
     elements.append(f'<line x1="286" y1="94" x2="324" y2="94" stroke="#1d4ed8" stroke-width="4"/>')
     elements.append(text(334, 99, f"{BENCHMARK_NAME}平均期末 {avg_benchmark[-1]:.2f}x", 13, "600"))
-    elements.append(text(640, 99, f"红线=组合等权 · 蓝线=基准({BENCHMARK_NAME})", 13, "400", color="#475569"))
+    elements.append(text(640, 99, f"红线=组合等权 · 蓝线=基准({BENCHMARK_NAME}) · 橙色虚线=未满持有期当前进度", 13, "400", color="#475569"))
 
     for idx, path in enumerate(paths):
         row = idx // cols
@@ -1347,11 +1476,14 @@ def write_long_fold_paths_svg(
         plot_h = cell_h - 104
         x_scale, y_scale, y_min, y_max = path_scale(path, plot_x, plot_y, plot_w, plot_h)
         excess_pct = path["excess_return"] * 100
-        title_color = "#b91c1c" if excess_pct >= 0 else "#475569"
+        is_partial = bool(path.get("partial"))
+        actual_hold_td = int(path.get("actual_hold_td") or max(0, len(path.get("dates", [])) - 1))
+        title_color = "#b45309" if is_partial else ("#b91c1c" if excess_pct >= 0 else "#475569")
+        window_label = f"未满 {actual_hold_td}/{hold_td}日" if is_partial else f"完整 {hold_td}日"
         stock_lines = holding_name_lines(path)
         stock_title = " · 股票：" + "、".join(stock_lines).replace(" · ", "、") if stock_lines else ""
         fold_title = (
-            f"起点 {path['as_of']} · 有效持仓 {path['stock_count']} 只 · "
+            f"起点 {path['as_of']} · {window_label} · 有效持仓 {path['stock_count']} 只 · "
             f"组合收益 {path['portfolio_return'] * 100:.2f}% · "
             f"基准收益 {path['benchmark_return'] * 100:.2f}% · "
             f"超额 {path['excess_return'] * 100:.2f}%"
@@ -1361,7 +1493,7 @@ def write_long_fold_paths_svg(
             f'<rect x="{cell_x:.2f}" y="{cell_y:.2f}" width="{cell_w:.2f}" height="{cell_h:.2f}" '
             'rx="4" fill="#ffffff" stroke="#dbe3ee"/>'
         )
-        elements.append(text(cell_x + 12, cell_y + 21, f"{idx + 1:02d}. {path['as_of']} · 超额 {excess_pct:+.1f}%", 12, "700", color=title_color))
+        elements.append(text(cell_x + 12, cell_y + 21, f"{idx + 1:02d}. {path['as_of']} · {window_label} · 超额 {excess_pct:+.1f}%", 12, "700", color=title_color))
         elements.append(
             text(
                 cell_x + 12,
@@ -1394,6 +1526,14 @@ def write_long_fold_paths_svg(
         elements.append(text(plot_x - 7, y_scale(y_min) + 4, f"{y_min:.1f}x", 9, "400", "end", "#64748b"))
         elements.append(text(plot_x, plot_y + plot_h + 14, "0", 9, "400", "middle", "#64748b"))
         elements.append(text(plot_x + plot_w, plot_y + plot_h + 14, str(hold_td), 9, "400", "middle", "#64748b"))
+        if is_partial:
+            progress_x = x_scale(actual_hold_td)
+            elements.append(
+                f'<line x1="{progress_x:.2f}" y1="{plot_y:.2f}" x2="{progress_x:.2f}" '
+                f'y2="{plot_y + plot_h:.2f}" stroke="#f59e0b" stroke-width="1.4" '
+                'stroke-dasharray="4 4"/>'
+            )
+            elements.append(text(progress_x, plot_y + plot_h + 28, f"{actual_hold_td}日", 9, "600", "middle", "#b45309"))
         if stock_lines:
             elements.append(text(cell_x + 12, plot_y + plot_h + 34, "股票：" + stock_lines[0], 9, "500", color="#334155"))
             if len(stock_lines) > 1:
@@ -1406,10 +1546,13 @@ def write_long_fold_paths_svg(
             '<polyline fill="none" stroke="#b91c1c" stroke-width="1.9" stroke-opacity="0.95" '
             f'points="{svg_points(path["portfolio_path"], x_scale, y_scale)}"><title>{html_escape("组合 " + fold_title)}</title></polyline>'
         )
-        elements.append(text(plot_x + plot_w - 2, y_scale(path["portfolio_path"][-1]) - 4, f"{path['portfolio_path'][-1]:.2f}", 9, "700", "end", "#b91c1c"))
-        elements.append(text(plot_x + plot_w - 2, y_scale(path["benchmark_path"][-1]) + 10, f"{path['benchmark_path'][-1]:.2f}", 9, "700", "end", "#1d4ed8"))
+        end_x = x_scale(actual_hold_td)
+        end_anchor = "end" if not is_partial else "start"
+        label_dx = -2 if not is_partial else 4
+        elements.append(text(end_x + label_dx, y_scale(path["portfolio_path"][-1]) - 4, f"{path['portfolio_path'][-1]:.2f}", 9, "700", end_anchor, "#b91c1c"))
+        elements.append(text(end_x + label_dx, y_scale(path["benchmark_path"][-1]) + 10, f"{path['benchmark_path'][-1]:.2f}", 9, "700", end_anchor, "#1d4ed8"))
 
-    elements.append(text(width / 2, height - 18, "每个小图横轴为买入后交易日，纵轴为当折净值倍数；纵轴为独立缩放，方便看清单折形态。", 12, "400", "middle", "#475569"))
+    elements.append(text(width / 2, height - 18, "每个小图横轴为买入后交易日，纵轴为当折净值倍数；未满持有期窗口只展示当前已走收益，不参与优化选优。", 12, "400", "middle", "#475569"))
 
     svg = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1423,7 +1566,9 @@ def write_long_fold_paths_svg(
     output_file.write_text(svg, encoding="utf-8")
     return {
         "file": str(output_file),
-        "folds": len(paths),
+        "folds": len(complete_paths),
+        "partial_folds": len(partial_paths),
+        "displayed_folds": len(paths),
         "hold_td": hold_td,
         "fold_interval_td": LONG_FOLD_STEP_TD,
         "chart_type": "small_multiples",
@@ -1450,14 +1595,10 @@ def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, A
     deep_codes = {code for code, rows in series.items() if len(rows) >= min_hist}
     broad_cfg = broad_long_candidate_config()
     fold_dates = [cal[-off] for off in long_anchor_offsets(hold_td) if off <= len(cal)]
+    partial_fold_dates = [cal[-off] for off in long_partial_anchor_offsets(hold_td) if off <= len(cal)]
     paths: List[Dict[str, Any]] = []
-    for as_of in fold_dates:
-        cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
-        prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-        picks = score_prepared_long_candidates(prepared, cfg)
-        path = portfolio_fold_path(picks, series, benchmark_series, as_of, hold_td)
-        if path is None:
-            continue
+
+    def attach_holdings(path: Dict[str, Any], picks: List[Dict[str, Any]]) -> Dict[str, Any]:
         path["top_codes"] = [pick["code"] for pick in picks[:5]]
         path["holdings"] = [
             {
@@ -1466,7 +1607,28 @@ def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, A
             }
             for pick in picks
         ]
-        paths.append(path)
+        return path
+
+    for as_of in fold_dates:
+        cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
+        prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
+        picks = score_prepared_long_candidates(prepared, cfg)
+        path = portfolio_fold_path(picks, series, benchmark_series, as_of, hold_td)
+        if path is None:
+            continue
+        paths.append(attach_holdings(path, picks))
+
+    for as_of in partial_fold_dates:
+        cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
+        prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
+        picks = score_prepared_long_candidates(prepared, cfg)
+        path = portfolio_fold_path(
+            picks, series, benchmark_series, as_of, hold_td, allow_partial=True
+        )
+        if path is None:
+            continue
+        path["partial"] = True
+        paths.append(attach_holdings(path, picks))
 
     return write_long_fold_paths_svg(paths, LONG_FOLD_PATH_CHART_FILE, hold_td)
 
@@ -1525,6 +1687,9 @@ LONG_SUMMARY_FIELDS = [
     ("folds", "有效回测窗口", ""),
     ("indep_folds", "去重叠独立折", ""),
     ("hold_td", "持有交易日", ""),
+    ("avg_fold_weight", "平均折权重", ""),
+    ("min_fold_weight", "最小折权重", ""),
+    ("max_fold_weight", "最大折权重", ""),
     ("avg_portfolio_return_pct", "平均组合收益", "%"),
     ("avg_benchmark_return_pct", "平均基准收益", "%"),
     ("avg_excess_pct", "平均超额收益", "%"),
@@ -1596,9 +1761,12 @@ def print_summary(result: Dict[str, Any]) -> None:
             print_metric_block("回测摘要", best["summary"], LONG_SUMMARY_FIELDS)
             chart = section.get("best_fold_path_chart")
             if chart:
+                fold_text = f"{chart.get('folds')} 完整折"
+                if chart.get("partial_folds"):
+                    fold_text += f" + {chart.get('partial_folds')} 个未满展示折"
                 print(
                     f"每折走势图: {chart.get('file')} · "
-                    f"{chart.get('folds')} 折 · 平均组合期末 {chart.get('avg_portfolio_final_nav')}x · "
+                    f"{fold_text} · 平均组合期末 {chart.get('avg_portfolio_final_nav')}x · "
                     f"平均基准期末 {chart.get('avg_benchmark_final_nav')}x"
                 )
         else:

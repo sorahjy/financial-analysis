@@ -324,15 +324,136 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         sparse_pairs = pairs[:20]
 
         _, sparse_detail = long_validation_adjusted_objective(
-            sparse_pairs[:12], sparse_pairs[12:], sparse_pairs, 250, 125
+            sparse_pairs[:12], sparse_pairs[12:], sparse_pairs, 125, 62
         )
         _, full_detail = long_validation_adjusted_objective(
-            pairs[:24], pairs[24:], pairs, 250, 125
+            pairs[:24], pairs[24:], pairs, 125, 62
         )
 
         expected_penalty = (LONG_SOFT_TARGET_FOLDS - len(sparse_pairs)) * LONG_FOLD_COUNT_PENALTY
         self.assertEqual(sparse_detail["fold_count_penalty"], round(expected_penalty, 5))
         self.assertEqual(full_detail["fold_count_penalty"], 0)
+
+    def test_recency_weights_make_recent_folds_heavier(self):
+        from stock_strategy_optimizer import apply_recency_weights, long_fold_summary
+
+        pairs = apply_recency_weights([
+            {
+                "as_of": "2024-01-01",
+                "cal_idx": 10,
+                "portfolio_return": -0.2,
+                "benchmark_return": 0.0,
+                "excess_return": -0.2,
+                "portfolio_max_drawdown": 0.1,
+                "benchmark_max_drawdown": 0.1,
+            },
+            {
+                "as_of": "2024-02-01",
+                "cal_idx": 20,
+                "portfolio_return": 0.0,
+                "benchmark_return": 0.0,
+                "excess_return": 0.0,
+                "portfolio_max_drawdown": 0.1,
+                "benchmark_max_drawdown": 0.1,
+            },
+            {
+                "as_of": "2024-03-01",
+                "cal_idx": 30,
+                "portfolio_return": 0.2,
+                "benchmark_return": 0.0,
+                "excess_return": 0.2,
+                "portfolio_max_drawdown": 0.1,
+                "benchmark_max_drawdown": 0.1,
+            },
+        ])
+
+        self.assertEqual([row["fold_weight"] for row in pairs], [0.5, 1.25, 2.0])
+        summary = long_fold_summary(pairs, 125)
+        self.assertEqual(summary["min_fold_weight"], 0.5)
+        self.assertEqual(summary["max_fold_weight"], 2.0)
+        self.assertEqual(summary["avg_excess_pct"], 8.0)
+        self.assertEqual(summary["hit_rate"], 53.33)
+
+    def test_partial_fold_path_is_chart_only(self):
+        from stock_strategy_optimizer import (
+            long_partial_anchor_offsets,
+            portfolio_fold_path,
+        )
+
+        self.assertEqual(long_partial_anchor_offsets(125), [96, 66, 36, 6])
+
+        benchmark = [
+            {"date": f"2026-01-{day:02d}", "close": 1.0 + day * 0.01}
+            for day in range(1, 6)
+        ]
+        rows = [
+            {"date": f"2026-01-{day:02d}", "close": 10.0 + day}
+            for day in range(1, 6)
+        ]
+        picks = [{"code": f"00000{idx}"} for idx in range(1, 6)]
+        series = {pick["code"]: rows for pick in picks}
+
+        self.assertIsNone(
+            portfolio_fold_path(picks, series, benchmark, "2026-01-03", 4)
+        )
+
+        partial = portfolio_fold_path(
+            picks, series, benchmark, "2026-01-03", 4, allow_partial=True
+        )
+
+        self.assertIsNotNone(partial)
+        self.assertTrue(partial["partial"])
+        self.assertEqual(partial["target_hold_td"], 4)
+        self.assertEqual(partial["actual_hold_td"], 2)
+        self.assertEqual(partial["dates"], ["2026-01-03", "2026-01-04", "2026-01-05"])
+
+    def test_svg_marks_partial_folds_as_display_only(self):
+        from stock_strategy_optimizer import write_long_fold_paths_svg
+
+        with tempfile.TemporaryDirectory() as tmp:
+            output = Path(tmp) / "folds.svg"
+            meta = write_long_fold_paths_svg(
+                [
+                    {
+                        "as_of": "2026-01-01",
+                        "dates": ["2026-01-01", "2026-01-02", "2026-01-03"],
+                        "target_hold_td": 2,
+                        "actual_hold_td": 2,
+                        "partial": False,
+                        "portfolio_path": [1.0, 1.1, 1.2],
+                        "benchmark_path": [1.0, 1.05, 1.1],
+                        "stock_count": 5,
+                        "portfolio_return": 0.196,
+                        "benchmark_return": 0.1,
+                        "excess_return": 0.096,
+                        "holdings": [{"name": "完整样本"}],
+                    },
+                    {
+                        "as_of": "2026-01-03",
+                        "dates": ["2026-01-03", "2026-01-04"],
+                        "target_hold_td": 2,
+                        "actual_hold_td": 1,
+                        "partial": True,
+                        "portfolio_path": [1.0, 1.3],
+                        "benchmark_path": [1.0, 1.0],
+                        "stock_count": 5,
+                        "portfolio_return": 0.296,
+                        "benchmark_return": 0.0,
+                        "excess_return": 0.296,
+                        "holdings": [{"name": "未满样本"}],
+                    },
+                ],
+                output,
+                2,
+            )
+
+            svg = output.read_text(encoding="utf-8")
+
+        self.assertEqual(meta["folds"], 1)
+        self.assertEqual(meta["partial_folds"], 1)
+        self.assertEqual(meta["displayed_folds"], 2)
+        self.assertIn("未满 1/2日", svg)
+        self.assertIn("组合等权平均期末 1.20x（完整折）", svg)
 
 
 if __name__ == "__main__":

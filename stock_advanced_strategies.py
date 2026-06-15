@@ -170,7 +170,7 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
-        "top_n": 10,
+        "top_n": 8,
         "min_score": 60,
         "min_market_cap_yi": 100,
         "min_listing_years": 5,
