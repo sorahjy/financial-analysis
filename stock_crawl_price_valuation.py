@@ -24,6 +24,7 @@ from pathlib import Path
 
 import akshare as ak
 
+import stock_storage as ss
 from stock_crawl_common import (
     strip_proxy_env,
     safe_print,
@@ -31,7 +32,6 @@ from stock_crawl_common import (
     retry_fetch as _retry_fetch,
     fetch_index_constituents,
     fetch_qfq_daily_records,
-    find_stock_json,
     daily_payload_from_history_records,
     history_record_has_daily_ohlcv,
     history_record_is_snapshot_only,
@@ -39,12 +39,8 @@ from stock_crawl_common import (
     latest_weekday_date,
     merge_records_by_date,
     prune_snapshot_only_history_records,
-    stock_json_path,
-    load_json_file,
-    write_json_file,
 )
 
-DATA_DIR = Path("data/stock_data")
 MAX_YEARS = 10
 MAX_RETRIES = 3
 DEFAULT_THREAD_COUNT = 16
@@ -82,39 +78,33 @@ def get_csi800_stocks():
     return result
 
 
-# ─── 文件 I/O（长历史写入 stock_data.history）──
-
-def find_stock_file(code, name=None):
-    return find_stock_json(DATA_DIR, code, name)
-
+# ─── 数据 I/O（长历史写入 stock_history，SQLite）──
 
 def load_stock_file(code, name):
-    fp = find_stock_json(DATA_DIR, code, name)
-    if fp is not None:
-        data = load_json_file(fp, {})
-        history = data.get("history") if isinstance(data, dict) else None
-        if isinstance(history, dict):
-            return history
-        if isinstance(data, dict) and isinstance(data.get("records"), list):
-            return data
-    return {}
+    conn = ss.thread_conn()
+    records = ss.load_history_records(conn, str(code).zfill(6))
+    if not records:
+        return {}
+    return {
+        "records": records,
+        "start_date": records[0]["date"],
+        "end_date": records[-1]["date"],
+    }
 
 
 def save_stock_file(code, name, data):
-    fp = find_stock_json(DATA_DIR, code, name) or stock_json_path(DATA_DIR, code, name)
-    payload = load_json_file(fp, {})
-    if not isinstance(payload, dict):
-        payload = {}
+    conn = ss.thread_conn()
     history = history_payload_from_records(
         code, name, data.get("records", []), "stock_crawl_price_valuation"
     )
-
+    # 读回整只(保留 fundamentals 写入的 financials/indicators/...)，只更新 history/daily
+    payload = ss.load_stock(conn, str(code).zfill(6)) or {}
     payload.setdefault("symbol", str(code).zfill(6))
     payload.setdefault("name", name)
     payload["history"] = history
     payload["daily"] = daily_payload_from_history_records(history.get("records", []))
     payload["history_refetched_at"] = datetime.now().isoformat()
-    write_json_file(fp, payload)
+    ss.save_stock(conn, payload)
 
 
 # ─── 数据爬取 ─────────────────────────────────────────────────
@@ -385,14 +375,21 @@ def fetch_csi300_etf(years=CSI300_ETF_YEARS):
     if not merged:
         raise RuntimeError("510310 爬取失败，无数据")
 
+    payload = {
+        "code": CSI300_ETF_CODE,
+        "target_years": years,
+        "start_date": merged[0]["date"],
+        "end_date": merged[-1]["date"],
+        "records": merged,
+    }
     with open(CSI300_FILE, "w", encoding="utf-8") as f:
-        json.dump({
-            "code": CSI300_ETF_CODE,
-            "target_years": years,
-            "start_date": merged[0]["date"],
-            "end_date": merged[-1]["date"],
-            "records": merged,
-        }, f, ensure_ascii=False)
+        json.dump(payload, f, ensure_ascii=False)
+    # 同步落库 index_nav（优化器基准走 DB，JSON 留作回滚）
+    nav_conn = ss.connect()
+    try:
+        ss.save_index_nav(nav_conn, payload)
+    finally:
+        nav_conn.close()
 
     safe_print(f"[沪深300] 共 {len(merged)} 条（{merged[0]['date']} ~ {merged[-1]['date']}）")
     return merged
@@ -402,7 +399,6 @@ def fetch_csi300_etf(years=CSI300_ETF_YEARS):
 
 def main():
     stocks = get_csi800_stocks()
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
 
     items = list(stocks.items())
     total = len(items)

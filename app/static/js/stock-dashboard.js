@@ -205,9 +205,9 @@
     }
 
     async function startOptimize() {
-      const msg = "将对长线/短线各运行 200 次参数搜索回测"
-        + "（相当于 python stock_strategy_optimizer.py --iterations 200），"
-        + "约需 1 分钟左右，期间页面将锁定。确定开始吗？";
+      const msg = "将对长线/短线各运行 300 次参数搜索回测"
+        + "（相当于 python stock_strategy_optimizer.py --iterations 300），"
+        + "约需 3 分钟左右，期间页面将锁定。确定开始吗？";
       if (!window.confirm(msg)) return;
       try {
         const resp = await fetch("/api/optimize", {method: "POST"});

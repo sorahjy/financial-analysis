@@ -82,7 +82,7 @@ def _run_optimizer_job() -> None:
     from stock_data_refresh import resolve_python
 
     started = time.time()
-    cmd = [resolve_python(), "-B", "stock_strategy_optimizer.py", "--iterations", "200"]
+    cmd = [resolve_python(), "-B", "stock_strategy_optimizer.py", "--iterations", "300"]
     ok = False
     error = ""
     try:

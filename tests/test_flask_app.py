@@ -54,11 +54,26 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("dataset.fundPageInitialized", fund_script)
         self.assertIn("reloadCurrentPageContent", fund_script)
         self.assertIn("await reloadCurrentPageContent()", fund_script)
+        self.assertLess(
+            fund_script.index('if (state.running) return "运行中";'),
+            fund_script.index('if (state.ok === null) return "空闲";'),
+        )
+        self.assertIn("let pollTask = null;", fund_script)
+        self.assertIn("if (pollTask) return pollTask;", fund_script)
+        self.assertIn("if (!disposed && data.refresh && data.refresh.running)", fund_script)
         self.assertIn("FinancialAnalysisPages.stock = initStockDashboard", stock_script)
         self.assertIn("dataset.stockDashboardInitialized", stock_script)
+        self.assertIn("将对长线/短线各运行 300 次参数搜索回测", stock_script)
+        self.assertIn("python stock_strategy_optimizer.py --iterations 300", stock_script)
+        self.assertIn("约需 3 分钟左右", stock_script)
+        self.assertNotIn("约需 2 分钟左右", stock_script)
         self.assertIn("clearTimeout(runTimer)", stock_script)
         self.assertIn("clearInterval(optimizeTimer)", stock_script)
         self.assertIn("clearInterval(refreshTimer)", stock_script)
+
+        stock_html = self.client.get("/stock").get_data(as_text=True)
+        self.assertIn("长线/短线各 300 次随机搜索回测", stock_html)
+        self.assertIn("约需 3 分钟左右", stock_html)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)

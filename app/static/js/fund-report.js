@@ -23,6 +23,7 @@
     window.FinancialAnalysisPages.cleanup = () => {
       disposed = true;
     };
+    let pollTask = null;
     const actionButtons = Array.from(document.querySelectorAll("[data-post-url]"));
     const logRoot = document.querySelector("[data-fund-log]");
     const logText = logRoot ? logRoot.querySelector('[data-field="job-log"]') : null;
@@ -41,8 +42,9 @@
     };
 
     const describeRefresh = (state) => {
-      if (!state || state.ok === null) return "空闲";
+      if (!state) return "空闲";
       if (state.running) return "运行中";
+      if (state.ok === null) return "空闲";
       if (state.ok === true) return `完成 ${state.elapsed_sec || 0}s`;
       if (state.ok === false) return `失败 ${state.error || ""}`;
       return "空闲";
@@ -108,24 +110,36 @@
     }
 
     async function pollUntilIdle() {
-      for (let i = 0; i < 900; i += 1) {
-        const data = await refreshStatus();
-        if (disposed) return;
-        if (!data.refresh.running) {
-          if (data.refresh.ok) {
-            await reloadCurrentPageContent();
+      if (pollTask) return pollTask;
+      pollTask = (async () => {
+        try {
+          for (let i = 0; i < 900; i += 1) {
+            const data = await refreshStatus();
+            if (disposed) return;
+            if (!(data.refresh && data.refresh.running)) {
+              if (data.refresh && data.refresh.ok) {
+                await reloadCurrentPageContent();
+              }
+              return;
+            }
+            await new Promise((resolve) => setTimeout(resolve, 2000));
           }
-          return;
+        } finally {
+          pollTask = null;
         }
-        await new Promise((resolve) => setTimeout(resolve, 2000));
-      }
+      })();
+      return pollTask;
     }
 
     actionButtons.forEach((button) => {
       button.addEventListener("click", () => postAction(button));
     });
 
-    refreshStatus();
+    refreshStatus().then((data) => {
+      if (!disposed && data.refresh && data.refresh.running) {
+        pollUntilIdle();
+      }
+    }).catch(() => {});
 
     function initFundEditor() {
       const openButton = document.querySelector("[data-fund-editor-open]");

@@ -21,6 +21,7 @@ from datetime import datetime
 
 import numpy as np
 
+import stock_storage
 from stock_crawl_common import daily_stats_from_history_records
 
 DATA_DIR = Path(__file__).parent / "data"
@@ -31,15 +32,12 @@ DATA_DIR = Path(__file__).parent / "data"
 # ═══════════════════════════════════════════════════════════
 
 def load_all_stocks():
-    """加载所有已爬取的股票数据（从 data/stock_data/ 目录逐文件读取）"""
-    all_stocks = {}
-
-    stock_dir = DATA_DIR / "stock_data"
-    if stock_dir.is_dir():
-        for f in stock_dir.glob("CN_*.json"):
-            code = f.stem.split("_")[1]
-            with open(f, "r", encoding="utf-8") as fp:
-                all_stocks[code] = json.load(fp)
+    """加载所有已爬取的股票数据（从 data/stock_data.sqlite3 读取）"""
+    conn = stock_storage.connect()
+    try:
+        all_stocks = {code: data for code, data in stock_storage.iter_stocks(conn)}
+    finally:
+        conn.close()
 
     print(f"共加载 {len(all_stocks)} 只股票数据")
     return all_stocks

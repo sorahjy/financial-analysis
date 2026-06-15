@@ -15,11 +15,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-import hashlib
 import json
 import math
 import threading
-import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -28,12 +26,12 @@ from pathlib import Path
 from statistics import mean
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
-from stock_crawl_common import analysis_records_from_history_records, daily_stats_from_history_records
+import stock_storage
+from stock_crawl_common import daily_stats_from_history_records
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-STOCK_DATA_DIR = DATA_DIR / "stock_data"
 CAPITAL_DIR = DATA_DIR / "capital"
 HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
 LEGACY_HOT_MONEY_SCORED_FILE = CAPITAL_DIR / "scored_stocks.json"
@@ -278,66 +276,23 @@ def load_json_file(path_text: str) -> Any:
     return _load_json_cached(path_text, _file_signature(Path(path_text)))
 
 
-_DIR_FINGERPRINT_TTL_SEC = 2.0
-_dir_fingerprint_cache: Dict[Tuple[str, str], Tuple[float, int]] = {}
 _candidate_cache_lock = threading.Lock()
 
 
-def _dir_fingerprint(directory: Path, pattern: str) -> int:
-    key = (str(directory), pattern)
-    now = time.monotonic()
-    cached = _dir_fingerprint_cache.get(key)
-    if cached is not None and now - cached[0] < _DIR_FINGERPRINT_TTL_SEC:
-        return cached[1]
-    fingerprint = 0
-    if directory.exists():
-        for fp in directory.glob(pattern):
-            try:
-                stat = fp.stat()
-            except OSError:
-                continue
-            fingerprint ^= hash((fp.name, stat.st_mtime_ns, stat.st_size))
-    _dir_fingerprint_cache[key] = (now, fingerprint)
-    return fingerprint
-
-
-def _dir_cache_signature(directory: Path, pattern: str) -> Dict[str, Any]:
-    digest = hashlib.blake2b(digest_size=16)
-    count = 0
-    total_size = 0
-    latest_mtime_ns = 0
-    if directory.exists():
-        for fp in sorted(directory.glob(pattern), key=lambda item: item.name):
-            try:
-                stat = fp.stat()
-            except OSError:
-                continue
-            count += 1
-            total_size += stat.st_size
-            latest_mtime_ns = max(latest_mtime_ns, stat.st_mtime_ns)
-            digest.update(fp.name.encode("utf-8", errors="ignore"))
-            digest.update(b"\0")
-            digest.update(str(stat.st_mtime_ns).encode("ascii"))
-            digest.update(b"\0")
-            digest.update(str(stat.st_size).encode("ascii"))
-            digest.update(b"\0")
-    return {
-        "count": count,
-        "total_size": total_size,
-        "latest_mtime_ns": latest_mtime_ns,
-        "digest": digest.hexdigest(),
-    }
-
-
 def invalidate_dir_fingerprints() -> None:
-    # Drops the TTL'd directory fingerprints so the next access re-scans
-    # immediately; loaded data is still reused when fingerprints are unchanged.
-    _dir_fingerprint_cache.clear()
-    try:
-        _build_live_long_candidates_cached.cache_clear()
-        _build_live_short_candidates_cached.cache_clear()
-    except NameError:
-        pass
+    # 清掉股票数据与派生候选的进程内 lru_cache，使下次访问从
+    # data/stock_data.sqlite3 重新载入（数据刷新后由 app 调用）。
+    # 名字沿用历史接口（app/services 依赖），实质是清 DB 数据缓存。
+    for cached in (
+        _load_cn_stock_index_cached,
+        _load_fundamental_stocks_cached,
+        _build_live_long_candidates_cached,
+        _build_live_short_candidates_cached,
+    ):
+        try:
+            cached.cache_clear()
+        except NameError:
+            pass
 
 
 def load_json_optional(path: Path, default: Any) -> Any:
@@ -858,51 +813,81 @@ def load_market_snapshot() -> Dict[str, Any]:
     return load_json_optional(DATA_DIR / "market_snapshot.json", {})
 
 
+# DB history 行(daily_* + 估值列) → 紧凑 analysis 记录的直接重命名。
+# DB 存的已是 safe_float 后的干净值，无需再过 safe_float，等价于
+# analysis_records_from_history_records 但省去对百万行的逐字段转换(实测 ~24s→~3s)。
+_DB_HISTORY_TO_ANALYSIS = (
+    ("open", "daily_open"), ("high", "daily_high"), ("low", "daily_low"), ("close", "daily_close"),
+    ("volume", "daily_volume"), ("amount", "daily_amount"),
+    ("change_pct", "daily_change_pct"), ("turnover_rate", "daily_turnover_rate"),
+    ("market_cap", "market_cap"), ("pe_ttm", "pe_ttm"), ("pe_static", "pe_static"),
+    ("pb", "pb"), ("pcf", "pcf"),
+)
+
+
+def _db_history_to_analysis_records(records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    return [
+        {"date": row["date"], **{ak: row[dk] for ak, dk in _DB_HISTORY_TO_ANALYSIS}}
+        for row in records
+    ]
+
+
+_cn_index_load_lock = threading.Lock()
+_fundamental_load_lock = threading.Lock()
+
+
 def load_cn_stock_index() -> Dict[str, Dict[str, Any]]:
-    return _load_cn_stock_index_cached(_dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"))
+    # 锁串行化首次加载：预热线程与首个请求并发时只算一次（lru 命中后锁开销可忽略）。
+    with _cn_index_load_lock:
+        return _load_cn_stock_index_cached()
 
 
 @lru_cache(maxsize=1)
-def _load_cn_stock_index_cached(fingerprint: int) -> Dict[str, Dict[str, Any]]:
+def _load_cn_stock_index_cached() -> Dict[str, Dict[str, Any]]:
     index: Dict[str, Dict[str, Any]] = {}
-    if STOCK_DATA_DIR.exists():
-        for fp in STOCK_DATA_DIR.glob("CN_*.json"):
-            try:
-                data = load_json_file(str(fp))
-            except (OSError, json.JSONDecodeError):
-                continue
-            if not isinstance(data, dict):
-                continue
-            history = data.get("history") or {}
-            records = history.get("records") if isinstance(history, dict) else None
-            if not records:
-                continue
-            code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
-            item = dict(history)
-            item["records"] = analysis_records_from_history_records(records)
-            item.setdefault("symbol", code)
-            item.setdefault("name", data.get("name") or history.get("name") or code)
-            item["_source"] = "stock_data.history"
+    conn = stock_storage.connect()
+    try:
+        for meta, records in stock_storage.iter_history(conn):
+            code = str(meta["code"]).zfill(6)
+            item: Dict[str, Any] = {
+                "symbol": meta["code"],
+                "name": meta["name"] or code,
+                "source": meta["history_source"],
+                "price_adjust": meta["price_adjust"] or "qfq",
+                "change_pct_basis": "close_to_close",
+                "records": _db_history_to_analysis_records(records),
+                "_source": "stock_data.history",
+            }
+            if meta["history_start_date"]:
+                item["start_date"] = meta["history_start_date"]
+            if meta["history_end_date"]:
+                item["end_date"] = meta["history_end_date"]
             index[code] = item
+    finally:
+        conn.close()
     return index
 
 
 def load_fundamental_stocks() -> Dict[str, Dict[str, Any]]:
-    return _load_fundamental_stocks_cached(_dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"))
+    with _fundamental_load_lock:
+        return _load_fundamental_stocks_cached()
+
+
+def warm_caches() -> None:
+    """预热数据 loader 缓存（供 server 启动时后台调用），把首个策略请求的 ~6s 冷载移出请求路径。"""
+    load_fundamental_stocks()
+    load_cn_stock_index()
 
 
 @lru_cache(maxsize=1)
-def _load_fundamental_stocks_cached(fingerprint: int) -> Dict[str, Dict[str, Any]]:
-    stocks: Dict[str, Dict[str, Any]] = {}
-    if STOCK_DATA_DIR.exists():
-        for fp in STOCK_DATA_DIR.glob("CN_*.json"):
-            try:
-                data = load_json_file(str(fp))
-            except (OSError, json.JSONDecodeError):
-                continue
-            code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
-            stocks[code] = data
-    return stocks
+def _load_fundamental_stocks_cached() -> Dict[str, Dict[str, Any]]:
+    # 不读日线：价格因子一律经 price_history_rows/combined_recent_rows 走 cn_index，
+    # 基本面 dict 里的 history 是冗余回退（无 cn_index 的票本就无日线），省去重建百万行。
+    conn = stock_storage.connect()
+    try:
+        return {code: data for code, data in stock_storage.iter_stocks(conn, include_history=False)}
+    finally:
+        conn.close()
 
 
 def latest_valuation_from_records(
@@ -1920,7 +1905,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     snapshot_signature = _file_signature(DATA_DIR / "market_snapshot.json")
     meta = {
         "config_key": key,
-        "stock_data": _dir_cache_signature(STOCK_DATA_DIR, "CN_*.json"),
+        "stock_data": stock_storage.db_signature(),
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
     }
@@ -1929,7 +1914,6 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         return cached
 
     candidates, notes = _build_live_long_candidates_cached(
-        _dir_fingerprint(STOCK_DATA_DIR, "CN_*.json"),
         universe_signature,
         snapshot_signature,
         key,
@@ -1940,12 +1924,13 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
 
 @lru_cache(maxsize=8)
 def _build_live_long_candidates_cached(
-        stock_data_fingerprint: int,
         universe_signature: Tuple[int, int],
         snapshot_signature: Tuple[int, int],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    _ = (stock_data_fingerprint, universe_signature, snapshot_signature)
+    # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
+    # 磁盘候选缓存另用 db_signature()(内容指纹) 校验，无需易变的文件指纹做 key。
+    _ = (universe_signature, snapshot_signature)
     return build_long_candidates(config_from_key(config_key))
 
 

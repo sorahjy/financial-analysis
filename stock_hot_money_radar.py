@@ -1,32 +1,40 @@
 """
-实验性：游资雷达 (Hot-Money Radar) —— 两种模式对应庄股三阶段
+实验性：游资雷达 (Hot-Money Radar) —— 双分制对应庄股三阶段
 
-按「潜伏(吸筹) → 拉升 → 出货」三阶段框架：
+按「潜伏(吸筹) → 拉升 → 出货」三阶段框架，对同一只股票同时给出两套分数：
 
-【默认模式·拉升雷达】盘中捕捉正在进攻的票（已进入拉升期，节奏快、风险高）：
-  盘口异动事件流 + 同花顺大单/即时资金流 + 涨停池 + 本地席位记忆。
+  ▎ 吸筹分↑ = BUY 信号（游资正在压价吸货，散户被洗出）
+  ▎ 拉升分↑ = SELL 信号（游资在表演吸引跟风盘，正是他们出货时点）
 
-【--ambush·潜伏雷达】★ 找游资正在吸筹、还没启动的票（第一阶段才赚大钱）：
-  核心指纹是「钱持续进、价格没动」+ 吸筹K线形态，盘后每天跑一次即可：
-  1. 多日资金流背离：同花顺 5/10/20 日资金净流入为正且占流通市值比高，
-     但同期阶段涨幅很小（钱进了价格没动 = 有人在压价吸货）
-  2. 吸筹K线形态（60日日线）：波动收敛、距前高有空间(低位)、温和放量
-     而非爆量、收盘强度高（盘中砸下去总被接回）、下影线频繁
-  3. 筹码集中：最近一期股东户数环比下降（散户被洗出、筹码向主力集中）
-  4. 试盘痕迹：15~90天前上过龙虎榜（游资试盘）之后回落横盘 + 席位记忆
-  硬剔除：近10日出现过涨停（已是拉升期，建仓风险大）、近10日涨幅>12%、
-  近60日涨幅>50%（高位出货区）、日均成交<3000万（流动性陷阱）。
+为什么拉升分不是 BUY 信号：
+  拉升雷达高分的特征是已封涨停、首封早、大笔买入频繁、连板中……这些信号出现时，
+  游资仓位早已建好，「进攻信号」同时也是他们吸引散户接盘的手段——不制造声势，
+  谁来给你接货？所以拉升分应该反过来读：自己潜伏期持仓的，拉升分触发=兑现时机；
+  没持仓的，拉升分高的票恰恰是风险最大的。
+
+【默认模式·盘中扫描】盘口异动+大单+涨停池主驱动 → 算 拉升分；
+  再用多日资金流+龙虎榜补算 吸筹分（无K线形态，故为快算版本）。
+
+【--ambush·盘后扫描】多日资金背离+K线吸筹形态主驱动 → 算 吸筹分；
+  再用同一K线+当日盘面+涨停池补算 拉升分（含K线代理，分数完整）。
+
+阶段判定（经验阈值，待用 IC 校准）：
+  吸筹≥50 & 拉升<30 → ★吸筹中   买入候选
+  吸筹≥50 & 拉升<50 → ▲待拉升   可考虑
+  吸筹≥30 & 拉升<30 → ◇酝酿中   观察
+  吸筹≥30 & 拉升≥50 → ⚠拉升中   持仓减仓
+  吸筹<30 & 拉升≥50 → ✗出货期   避让/清仓
 
 局限（实验性质，务必理解后再用）：
   - 盘中/盘后都不存在席位级实时数据，本质是「行为指纹」推断
-  - 吸筹是以天~周为单位的过程，潜伏分数高不代表马上启动，可能潜伏数周
+  - 吸筹是以天~周为单位的过程，分数高不代表马上启动，可能潜伏数周
   - 分数为启发式权重；先用 --verify / --ambush-verify 积累命中率再参考
 
 用法：
-  python stock_hot_money_radar.py                    # 拉升雷达，扫一次 Top 20
-  python stock_hot_money_radar.py --watch 60         # 拉升雷达，盘中每60秒刷新
-  python stock_hot_money_radar.py --verify           # 盘后用龙虎榜验证拉升雷达
-  python stock_hot_money_radar.py --ambush           # ★ 潜伏雷达（盘后跑）
+  python stock_hot_money_radar.py                    # 盘中扫描，扫一次 Top 20
+  python stock_hot_money_radar.py --watch 60         # 盘中扫描，每60秒刷新
+  python stock_hot_money_radar.py --verify           # 盘后用龙虎榜验证拉升驱动模式
+  python stock_hot_money_radar.py --ambush           # ★ 盘后扫描（吸筹驱动）
   python stock_hot_money_radar.py --ambush-verify --date 2026-06-13 --horizon 5
                                                      # N天后回看潜伏票的前向收益
 """
@@ -40,11 +48,6 @@ from datetime import datetime, timedelta
 from statistics import mean
 
 import akshare as ak
-
-from stock_crawl_common import (
-    analysis_records_from_history_records,
-    normalize_history_records,
-)
 
 from stock_crawl_hot_money import (
     CANDIDATES_FILE,
@@ -539,7 +542,8 @@ def score_candidate(code, flow, alerts, deals, pool, memory, float_rank_pct,
 
 
 def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2.0):
-    """单轮扫描：抓数据 → 过滤小票 → 评分排序，返回 picks 列表。"""
+    """单轮扫描：抓数据 → 过滤小票 → 评分排序，返回 picks 列表。
+    每只票同时输出 拉升分（主驱动）+ 吸筹分（多日资金补算，无K线形态）+ 阶段。"""
     print(f"[{datetime.now():%H:%M:%S}] 拉取盘中数据...")
     alerts_map = fetch_intraday_alerts()
     print(f"  盘口异动: {len(alerts_map)} 只")
@@ -555,6 +559,13 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
     print(f"  主力分级资金: {len(capital_map)} 只")
     industry_map, ind_src = build_industry_map()
     print(f"  行业映射({ind_src}): {len(industry_map)} 只")
+    # 双分层补算：多日资金 + 龙虎榜 → 吸筹分(无K线形态)
+    flow5_map = fetch_ths_flow_rank("5日排行")
+    flow10_map = fetch_ths_flow_rank("10日排行")
+    lhb_recent = fetch_lhb_recent_dates(days=90)
+    capital_10d_map = fetch_main_capital_flow(indicator="10日")
+    print(f"  双分补算: 5/10日资金 {len(flow5_map)}/{len(flow10_map)} · 近90日LHB {len(lhb_recent)}"
+          f" · 10日主力 {len(capital_10d_map)}")
 
     # 候选 = 有进攻信号的票（异动 ∪ 涨停池 ∪ 大单净买 ∪ 席位记忆），再做小票过滤
     candidate_codes = set(alerts_map) | set(pool_map) | set(memory_map)
@@ -602,25 +613,44 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
 
     picks = []
     for code, flow in candidates:
-        score, reasons, parts = score_candidate(
+        pump_score, pump_reasons, pump_parts = score_candidate(
             code, flow,
             alerts_map.get(code), deals_map.get(code),
             pool_map.get(code), memory_map.get(code),
             cap_rank(flow["float_cap_est"]),
             capital=capital_map.get(code), resonance_ctx=resonance_ctx,
         )
+        # 双分补算：吸筹分（多日资金+龙虎榜，无K线形态）
+        ambush_score, ambush_reasons, ambush_parts = score_ambush_quick(
+            code, flow["name"],
+            flow5_map.get(code), flow10_map.get(code),
+            flow["float_cap_est"],
+            lhb_info=lhb_recent.get(code),
+            memory=memory_map.get(code),
+            capital_10d=capital_10d_map.get(code),
+        )
+        stage, action = classify_stage(ambush_score, pump_score)
         picks.append({
             "code": code,
             "name": flow["name"],
             "price": flow["price"],
             "chg_pct": flow["chg_pct"],
             "float_cap_yi": round(flow["float_cap_est"] / 1e8, 1) if flow["float_cap_est"] else None,
-            "score": score,
-            "parts": parts,
-            "reasons": reasons[:5],
+            "score": pump_score,                   # 兼容旧字段(=拉升分)
+            "parts": pump_parts,
+            "reasons": pump_reasons[:5],
+            "pump_score": pump_score,
+            "pump_parts": pump_parts,
+            "pump_reasons": pump_reasons[:5],
+            "ambush_score": ambush_score,
+            "ambush_parts": ambush_parts,
+            "ambush_reasons": ambush_reasons[:3],
+            "stage": stage,
+            "action": action,
             "alert_last_time": (alerts_map.get(code) or {}).get("last_time", ""),
         })
-    picks.sort(key=lambda p: -p["score"])
+    # 排序：默认仍按拉升分（盘中主驱动）；用户可在前端按 ambush_score / stage 重排
+    picks.sort(key=lambda p: -p["pump_score"])
     return picks[:top_n], len(candidates)
 
 
@@ -629,38 +659,43 @@ def scan(top_n=20, max_float_cap_yi=150.0, min_float_cap_yi=50.0, min_chg_pct=-2
 def print_picks(picks, candidate_count):
     print()
     print("=" * 110)
-    print(f"  游资买入雷达（实验） · 候选 {candidate_count} → Top {len(picks)}"
-          f" · 攻/背/封/小/共/忆 = 资金攻击/主力背离/涨停行为/小票弹性/板块共振/席位记忆")
+    print(f"  游资雷达·盘中扫描（实验·双分制） · 候选 {candidate_count} → Top {len(picks)}")
+    print(f"  吸筹分↑=BUY信号(钱进价不动) · 拉升分↑=SELL信号(游资在表演吸引接盘)")
     print("=" * 110)
     header = (
         _pad_visual("代码", 8) + _pad_visual("名称", 12) + _pad_visual("现价", 8)
-        + _pad_visual("涨幅%", 8) + _pad_visual("流通亿", 8) + _pad_visual("总分", 7)
-        + _pad_visual("攻", 6) + _pad_visual("背", 6) + _pad_visual("封", 6)
-        + _pad_visual("小", 6) + _pad_visual("共", 6) + _pad_visual("忆", 6)
+        + _pad_visual("涨幅%", 8) + _pad_visual("流通亿", 8)
+        + _pad_visual("吸筹", 7) + _pad_visual("拉升", 7) + _pad_visual("阶段", 10)
         + "理由"
     )
     print(header)
     print("-" * 110)
     for p in picks:
+        amb = p.get("ambush_score", 0.0)
+        pump = p.get("pump_score", p.get("score", 0.0))
+        stage = p.get("stage", "—")
+        # 理由优先取阶段相关：拉升≥吸筹的票主理由用拉升的；反之用吸筹的
+        if pump >= amb:
+            reasons = (p.get("pump_reasons") or p.get("reasons") or [])[:4]
+        else:
+            reasons = (p.get("ambush_reasons") or []) + (p.get("pump_reasons") or [])
+            reasons = reasons[:4]
         print(
             _pad_visual(p["code"], 8)
             + _pad_visual(p["name"], 12)
             + _pad_visual(f"{p['price']:.2f}" if p["price"] else "-", 8)
             + _pad_visual(f"{p['chg_pct']:+.1f}" if p["chg_pct"] is not None else "-", 8)
             + _pad_visual(f"{p['float_cap_yi']:.0f}" if p["float_cap_yi"] else "-", 8)
-            + _pad_visual(f"{p['score']:.1f}", 7)
-            + _pad_visual(f"{p['parts']['attack']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['divergence']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['seal']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['size']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['resonance']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['memory']:.0f}", 6)
-            + " | ".join(p["reasons"])
+            + _pad_visual(f"{amb:.1f}", 7)
+            + _pad_visual(f"{pump:.1f}", 7)
+            + _pad_visual(stage, 10)
+            + " | ".join(reasons)
         )
     print("=" * 110)
     if not _is_trading_time():
         print("注: 当前非交易时间，以上为最近交易日的全天口径数据。")
-    print("注: 实验性推断，非席位级实锤；用 --verify 在盘后对照龙虎榜统计命中率。")
+    print("注: ★吸筹中=买入候选 / ▲待拉升=可考虑 / ◇酝酿中=观察 / ⚠拉升中=持仓减仓 / ✗出货期=避让")
+    print("注: 默认按拉升分排序(盘中主驱动)；--verify 在盘后对照龙虎榜统计命中率。")
 
 
 def persist_picks(picks, candidate_count):
@@ -944,6 +979,280 @@ def score_ambush(flow5, flow10, flow20, float_cap, shape, lhb_info, memory, as_o
     return round(sum(parts.values()), 1), reasons, parts
 
 
+# ─── 双分层：给任一只股票同时算 吸筹分 + 拉升分 + 阶段 ─────────────
+#
+# 设计动机：拉升分高 ≠ 买入信号；游资在「拉升」阶段需要散户接盘，所以涨停封单、
+# 大笔买入、首封早这些「进攻信号」恰恰是出货吸引跟风盘的手段。
+# 因此对同一只票同时给出两个分数，让用户看 阶段(吸筹/拉升/出货) 决策方向。
+#
+# - score_pump_from_eod: 从K线+EOD/盘中数据算拉升分；缺盘中数据时用K线代理。
+# - score_ambush_quick:  从多日资金+龙虎榜算吸筹分，不含K线形态（盘中扫描用）。
+# - classify_stage:      (吸筹, 拉升) → 阶段标签 + 操作建议。
+
+def score_pump_from_eod(records, idx, code, name=None, flow_now=None,
+                        capital_today=None, pool_info=None, alerts=None,
+                        deals=None, memory=None, float_rank_pct=0.5,
+                        resonance_ctx=None):
+    """从K线+可选实时盘面 → 拉升分(0-100)。
+
+    与 score_candidate 同结构(攻28/背14/封22/小16/共10/忆10)，
+    实时数据缺席时改用K线代理（近10日涨停数、近3日相对成交量、当日收盘强度等）。
+    供潜伏模式给同一票补算「已拉升程度」=「该减仓的程度」。
+    """
+    reasons = []
+    parts = {"attack": 0.0, "divergence": 0.0, "seal": 0.0, "size": 0.0,
+             "resonance": 0.0, "memory": 0.0}
+    if idx is None:
+        idx = len(records) - 1
+    if idx < 0 or idx >= len(records):
+        return 0.0, [], parts
+
+    last = records[idx]
+    past10 = records[max(0, idx - 9): idx + 1]
+    past25 = records[max(0, idx - 24): idx + 1]
+    limit_pct = 19.5 if code.startswith(("30", "68")) else 9.5
+
+    # 1) 攻击(0-28)：实时盘口异动事件；无则用K线代理(近期涨停+放量)
+    attack = 0.0
+    if alerts and alerts.get("events"):
+        for cat, cnt in alerts["events"].items():
+            attack += ALERT_CATEGORIES[cat] * min(cnt, 3)
+        attack = min(attack, 18.0)
+        top_events = "、".join(f"{c}×{n}" for c, n in alerts["events"].most_common(2))
+        if top_events:
+            reasons.append(top_events)
+    else:
+        zt_count = sum(1 for r in past10 if r["change_pct"] >= limit_pct)
+        if zt_count >= 1:
+            attack += min(zt_count * 5.0, 12.0)
+            reasons.append(f"近10日涨停{zt_count}次")
+        if len(past25) >= 6:
+            vols = [r["volume"] for r in past25]
+            base = mean(vols[:-3]) if len(vols) > 3 else mean(vols)
+            recent = mean(vols[-3:])
+            if base > 0 and recent / base >= 2.0:
+                attack += 4.0
+                reasons.append(f"近3日放量×{recent / base:.1f}")
+            elif base > 0 and recent / base >= 1.5:
+                attack += 2.0
+        if 5.0 <= last["change_pct"] < limit_pct:
+            attack += 3.0
+            reasons.append(f"当日{last['change_pct']:+.1f}%(攻击中)")
+
+    if deals and (deals["buy_cnt"] + deals["sell_cnt"]) >= 2:
+        attack += max(0.0, deals["net_ratio"]) * 8.0
+        if deals["net_ratio"] >= 0.3:
+            reasons.append(f"大单净买{deals['net_ratio'] * 100:.0f}%")
+
+    if flow_now and flow_now.get("amount", 0) > 0 and flow_now.get("net_inflow", 0) > 0:
+        inflow_ratio = flow_now["net_inflow"] / flow_now["amount"]
+        attack += min(inflow_ratio / 0.20, 1.0) * 4.0
+
+    parts["attack"] = round(min(attack, 28.0), 1)
+
+    # 2) 主力-散户背离(0-14)
+    div = 0.0
+    if capital_today:
+        main_ratio = capital_today.get("main_ratio")
+        main_net = capital_today.get("main_net")
+        small_net = capital_today.get("small_net")
+        if main_ratio is not None:
+            div += min(max(main_ratio, 0.0) / 10.0, 1.0) * 8.0
+            if main_ratio >= 3.0:
+                reasons.append(f"主力净占{main_ratio:.1f}%")
+        if main_net is not None and small_net is not None:
+            if main_net > 0 and small_net < 0:
+                div += 6.0
+                reasons.append("主力进散户出")
+            elif main_net < 0 and small_net > 0:
+                div = 0.0
+                reasons.append("⚠主力出散户进")
+    parts["divergence"] = round(min(div, 14.0), 1)
+
+    # 3) 涨停行为(0-22)：盘后涨停池数据；无则用K线代理(今/昨涨停 + 连板)
+    seal = 0.0
+    if pool_info:
+        if pool_info["float_cap"] > 0 and pool_info["seal_amount"] > 0:
+            ratio = pool_info["seal_amount"] / pool_info["float_cap"]
+            seal += min(ratio / 0.08, 1.0) * 11.0
+            if ratio >= 0.02:
+                reasons.append(f"封单/流通{ratio * 100:.1f}%")
+        first = pool_info["first_seal_time"].replace(":", "")
+        if first and first <= "100000":
+            seal += 7.0
+            reasons.append(f"首封{first[:2]}:{first[2:4]}")
+        elif first and first <= "133000":
+            seal += 4.0
+        if pool_info["break_times"] == 0:
+            seal += 4.0
+        else:
+            seal -= pool_info["break_times"] * 2.0
+            reasons.append(f"炸板{pool_info['break_times']}次")
+        consec_bonus = {1: 4.0, 2: 3.0, 3: 2.0}
+        seal += consec_bonus.get(pool_info["consecutive"], 0.0)
+        if pool_info["consecutive"] >= 1:
+            reasons.append(f"{pool_info['consecutive']}连板")
+    else:
+        if last["change_pct"] >= limit_pct:
+            seal += 11.0
+            consec = 0
+            for r in reversed(past10):
+                if r["change_pct"] >= limit_pct:
+                    consec += 1
+                else:
+                    break
+            seal += {1: 4.0, 2: 3.0, 3: 2.0}.get(consec, 0.0)
+            reasons.append(f"今日涨停" + (f"({consec}连)" if consec >= 2 else ""))
+        elif idx >= 1 and records[idx - 1]["change_pct"] >= limit_pct:
+            seal += 5.0
+            reasons.append("昨日涨停")
+        if last["high"] > last["low"]:
+            close_strength = (last["close"] - last["low"]) / (last["high"] - last["low"])
+            if close_strength >= 0.85 and last["change_pct"] >= 3.0:
+                seal += 3.0   # 高位收盘 + 中阳 ≈ 拉升痕迹
+    parts["seal"] = round(max(0.0, min(seal, 22.0)), 1)
+
+    # 4) 小票弹性(0-16)
+    size_pts = (1.0 - float_rank_pct) * 10.0
+    turnover = (flow_now or {}).get("turnover_pct") or last.get("turnover_rate")
+    if turnover is not None:
+        if 8.0 <= turnover <= 25.0:
+            size_pts += 6.0
+        elif 4.0 <= turnover < 8.0 or 25.0 < turnover <= 35.0:
+            size_pts += 3.0
+    parts["size"] = round(min(size_pts, 16.0), 1)
+
+    # 5) 板块共振(0-10)
+    res_pts = 0.0
+    if resonance_ctx:
+        ind = (resonance_ctx.get("industry_map") or {}).get(code)
+        if ind:
+            zt = (resonance_ctx.get("zt_counter") or {}).get(ind, 0)
+            cd = (resonance_ctx.get("cand_counter") or {}).get(ind, 0)
+            res_pts += {3: 6.0, 2: 4.0, 1: 2.0}.get(min(zt, 3), 0.0)
+            if cd >= 4:
+                res_pts += 4.0
+            elif cd >= 2:
+                res_pts += 2.0
+            if res_pts > 0:
+                reasons.append(f"{ind}板块涨停{zt}/候选{cd}")
+    parts["resonance"] = round(min(res_pts, 10.0), 1)
+
+    # 6) 席位记忆(0-10)
+    mem_pts = 0.0
+    if memory:
+        if memory["seats"] >= 2:
+            mem_pts += 5.0
+        elif memory["seats"] >= 1:
+            mem_pts += 3.0
+        mem_pts += min(memory["known"], 3) * 1.5
+        if memory["known"] > 0:
+            reasons.append(f"知名席位{memory['known']}个")
+    parts["memory"] = round(min(mem_pts, 10.0), 1)
+
+    return round(sum(parts.values()), 1), reasons, parts
+
+
+def score_ambush_quick(code, name, flow5, flow10, float_cap, lhb_info=None,
+                       memory=None, capital_10d=None):
+    """无K线快速吸筹分（潜35 + 背14 + 试20 = 上限69，因为缺形态/筹码 共45分缺失）。
+
+    供盘中扫描给同一票补算「之前是否被吸筹过」。形态/户数不评估，所以上限低于100。
+    重点防伪：5日涨幅>10% → 已脱离吸筹期，inflow 分大幅打折。
+    """
+    reasons = []
+    parts = {"inflow": 0.0, "divergence": 0.0, "shape": 0.0, "holder": 0.0,
+             "resonance": 0.0, "trail": 0.0, "freshness": 0.0}
+
+    if not flow5 or not flow10 or not float_cap or float_cap <= 0:
+        return 0.0, [], parts
+    if flow5.get("net_inflow", 0) <= 0 or flow10.get("net_inflow", 0) <= 0:
+        return 0.0, [], parts
+
+    # 1) 多日净流入占流通市值比
+    r5 = flow5["net_inflow"] / float_cap
+    r10 = flow10["net_inflow"] / float_cap
+    inflow = min(max(r5, 0.0) / 0.02, 1.0) * 15 + min(max(r10, 0.0) / 0.035, 1.0) * 12
+    chg5 = flow5.get("chg_pct")
+    if chg5 is not None:
+        if chg5 > 10:
+            inflow *= 0.3
+            reasons.append(f"⚠5日涨{chg5:+.1f}%(已脱离吸筹期)")
+        elif chg5 > 5:
+            inflow *= 0.6
+            reasons.append(f"5日资金进{flow5['net_inflow'] / 1e8:.2f}亿/涨{chg5:+.1f}%")
+        else:
+            reasons.append(
+                f"5日资金进{flow5['net_inflow'] / 1e8:.2f}亿(占流通{r5 * 100:.1f}%)涨幅仅{chg5:+.1f}%"
+            )
+    parts["inflow"] = round(min(inflow, 35.0), 1)
+
+    # 2) 主力-散户背离(10日分级资金)
+    if capital_10d:
+        div, dreason = ambush_divergence_pts(capital_10d)
+        parts["divergence"] = div
+        if dreason:
+            reasons.append(dreason)
+
+    # 3) 试盘痕迹
+    t = 0.0
+    today = datetime.now()
+    if lhb_info:
+        trail_days = []
+        for d in lhb_info["dates"]:
+            try:
+                ago = (today - datetime.strptime(d, "%Y-%m-%d")).days
+            except ValueError:
+                continue
+            if 15 <= ago <= 90:
+                trail_days.append(ago)
+        if trail_days:
+            t += 8.0
+            if lhb_info["net_buy"] > 0:
+                t += 4.0
+            reasons.append(f"{min(trail_days)}天前龙虎榜试盘")
+    if memory:
+        if memory["known"] > 0:
+            t += 8.0
+            reasons.append(f"知名席位{memory['known']}个买过")
+        elif memory["seats"] >= 1:
+            t += 4.0
+    parts["trail"] = round(min(t, 20.0), 1)
+
+    return round(sum(parts.values()), 1), reasons, parts
+
+
+# 阶段判定阈值（经验值，待回测IC校准；先用）
+STAGE_AMBUSH_HIGH = 50.0
+STAGE_AMBUSH_MID = 30.0
+STAGE_PUMP_HIGH = 50.0
+STAGE_PUMP_MID = 30.0
+
+
+def classify_stage(ambush_score, pump_score):
+    """(吸筹分, 拉升分) → (阶段标签, 操作建议)。
+
+    ★吸筹中  吸筹≥50 & 拉升<30   买入候选
+    ▲待拉升  吸筹≥50 & 拉升<50   可考虑
+    ⚠拉升中  吸筹≥30 & 拉升≥50   持仓减仓
+    ✗出货期  吸筹<30 & 拉升≥50   避让/清仓
+    ◇酝酿中  吸筹≥30 & 拉升<30   观察
+    —       其他                  —
+    """
+    a, p = ambush_score or 0.0, pump_score or 0.0
+    if a >= STAGE_AMBUSH_HIGH and p < STAGE_PUMP_MID:
+        return "★吸筹中", "买入候选"
+    if a >= STAGE_AMBUSH_HIGH and p < STAGE_PUMP_HIGH:
+        return "▲待拉升", "可考虑"
+    if a >= STAGE_AMBUSH_MID and p >= STAGE_PUMP_HIGH:
+        return "⚠拉升中", "持仓减仓"
+    if a < STAGE_AMBUSH_MID and p >= STAGE_PUMP_HIGH:
+        return "✗出货期", "避让/清仓"
+    if a >= STAGE_AMBUSH_MID and p < STAGE_PUMP_MID:
+        return "◇酝酿中", "观察"
+    return "—", "—"
+
+
 def ambush_scan(args):
     """潜伏雷达主流程：资金背离初筛 → K线形态终筛 → 股东户数加权 → Top N。"""
     print(f"[{datetime.now():%H:%M:%S}] 潜伏雷达：拉取多日资金流...")
@@ -1030,6 +1339,8 @@ def ambush_scan(args):
             "parts": parts,
             "reasons": reasons,
             "streak": streak,
+            "_records": records,    # 用于补算 拉升分；终态前 pop
+            "_now": now,            # 同上
         })
         if idx % 20 == 0:
             print(f"    K线进度 {idx}/{len(finalists)}")
@@ -1057,6 +1368,46 @@ def ambush_scan(args):
         p["score"] = round(p["score"] + res, 1)
         if res > 0:
             p["reasons"].append(f"{ind}板块{cd}只潜伏扎堆")
+
+    # 双分补算：对每个潜伏幸存者算 拉升分（K线 + 今日盘面 + 涨停池）。
+    # 拉升分高 = 卖出/避让信号；和吸筹分组合 → 阶段判定。
+    pool_map, pool_date = fetch_limit_pool()
+    capital_today_map = fetch_main_capital_flow(indicator="今日")
+    print(f"  双分补算: 涨停池({pool_date}) {len(pool_map)} 只 · 今日主力分级 {len(capital_today_map)} 只")
+    pump_zt_counter = Counter(d["industry"] for d in pool_map.values() if d.get("industry"))
+    pump_cand_counter = Counter(
+        industry_map.get(p["code"]) for p in survivors if industry_map.get(p["code"]))
+    pump_res_ctx = {
+        "industry_map": industry_map,
+        "zt_counter": pump_zt_counter,
+        "cand_counter": pump_cand_counter,
+    }
+    caps_sorted = sorted(p["float_cap_yi"] * 1e8 for p in survivors if p.get("float_cap_yi"))
+
+    def _cap_rank(value):
+        if not caps_sorted or not value:
+            return 0.5
+        return sum(1 for v in caps_sorted if v <= value) / len(caps_sorted)
+
+    for p in survivors:
+        records = p.get("_records") or []
+        if not records:
+            p["pump_score"] = 0.0
+            p["pump_parts"] = {}
+            p["pump_reasons"] = []
+            continue
+        pump_score, pump_reasons, pump_parts = score_pump_from_eod(
+            records, len(records) - 1, p["code"], p["name"],
+            flow_now=p.get("_now"),
+            capital_today=capital_today_map.get(p["code"]),
+            pool_info=pool_map.get(p["code"]),
+            memory=memory.get(p["code"]),
+            float_rank_pct=_cap_rank(p["float_cap_yi"] * 1e8 if p.get("float_cap_yi") else None),
+            resonance_ctx=pump_res_ctx,
+        )
+        p["pump_score"] = pump_score
+        p["pump_parts"] = pump_parts
+        p["pump_reasons"] = pump_reasons[:3]
 
     # 股东户数（筹码集中）只查中期排名靠前的，控制请求量
     survivors.sort(key=lambda p: -p["score"])
@@ -1087,45 +1438,55 @@ def ambush_scan(args):
     picks = survivors[: args.top]
     for p in picks:
         p["reasons"] = p["reasons"][:5]
+        p["ambush_score"] = p["score"]
+        p["ambush_parts"] = p["parts"]
+        p["ambush_reasons"] = p["reasons"]
+        stage, action = classify_stage(p["ambush_score"], p.get("pump_score", 0.0))
+        p["stage"], p["action"] = stage, action
+        p.pop("_records", None)
+        p.pop("_now", None)
     return picks, len(pre)
 
 
 def print_ambush(picks, candidate_count):
     print()
     print("=" * 112)
-    print(f"  潜伏雷达（实验·吸筹阶段） · 资金背离候选 {candidate_count} → Top {len(picks)}"
-          f" · 潜/背/形/筹/共/忆/鲜 = 资金潜入/主力背离/吸筹形态/筹码集中/板块共振/试盘痕迹/入选新鲜度")
+    print(f"  游资雷达·盘后扫描（实验·双分制） · 资金背离候选 {candidate_count} → Top {len(picks)}")
+    print(f"  吸筹分↑=BUY信号(钱进价不动+K线吸筹形态) · 拉升分↑=SELL信号(游资在表演吸引接盘)")
     print("=" * 112)
     header = (
         _pad_visual("代码", 8) + _pad_visual("名称", 12) + _pad_visual("现价", 8)
-        + _pad_visual("5日%", 8) + _pad_visual("流通亿", 8) + _pad_visual("总分", 7)
-        + _pad_visual("潜", 6) + _pad_visual("背", 6) + _pad_visual("形", 6) + _pad_visual("筹", 6)
-        + _pad_visual("共", 6) + _pad_visual("忆", 6) + _pad_visual("鲜", 6)
+        + _pad_visual("5日%", 8) + _pad_visual("流通亿", 8)
+        + _pad_visual("吸筹", 7) + _pad_visual("拉升", 7) + _pad_visual("阶段", 10)
         + "理由"
     )
     print(header)
     print("-" * 112)
     for p in picks:
+        amb = p.get("ambush_score", p.get("score", 0.0))
+        pump = p.get("pump_score", 0.0)
+        stage = p.get("stage", "—")
+        # 阶段=★/▲/◇ 时优先展示吸筹理由；⚠/✗ 时优先展示拉升理由
+        if pump > amb and stage in ("⚠拉升中", "✗出货期"):
+            reasons = (p.get("pump_reasons") or []) + (p.get("ambush_reasons") or p.get("reasons") or [])
+        else:
+            reasons = (p.get("ambush_reasons") or p.get("reasons") or []) + (p.get("pump_reasons") or [])
+        reasons = reasons[:4]
         print(
             _pad_visual(p["code"], 8)
             + _pad_visual(p["name"], 12)
             + _pad_visual(f"{p['price']:.2f}" if p["price"] else "-", 8)
             + _pad_visual(f"{p['chg5_pct']:+.1f}" if p["chg5_pct"] is not None else "-", 8)
             + _pad_visual(f"{p['float_cap_yi']:.0f}", 8)
-            + _pad_visual(f"{p['score']:.1f}", 7)
-            + _pad_visual(f"{p['parts']['inflow']:.0f}", 6)
-            + _pad_visual(f"{p['parts'].get('divergence', 0):.0f}", 6)
-            + _pad_visual(f"{p['parts']['shape']:.0f}", 6)
-            + _pad_visual(f"{p['parts']['holder']:.0f}", 6)
-            + _pad_visual(f"{p['parts'].get('resonance', 0):.0f}", 6)
-            + _pad_visual(f"{p['parts']['trail']:.0f}", 6)
-            + _pad_visual(f"{p['parts'].get('freshness', 0):+.0f}", 6)
-            + " | ".join(p["reasons"])
+            + _pad_visual(f"{amb:.1f}", 7)
+            + _pad_visual(f"{pump:.1f}", 7)
+            + _pad_visual(stage, 10)
+            + " | ".join(reasons)
         )
     print("=" * 112)
+    print("注: ★吸筹中=买入候选 / ▲待拉升=可考虑 / ◇酝酿中=观察 / ⚠拉升中=持仓减仓 / ✗出货期=避让")
     print("注: 潜伏≠马上启动，可能横盘数周；已硬剔除近10日涨停/涨幅>12%/60日涨幅>50%的票。")
-    print("注: 背/共为实盘实时维度，--ambush-backtest 回测不含（无历史快照）。")
-    print("注: 实验性推断；隔几天用 --ambush-verify 回看前向收益验证。")
+    print("注: 拉升分基于K线EOD+今日盘面+涨停池补算；隔几天用 --ambush-verify 回看前向收益验证。")
 
 
 def persist_ambush(picks, candidate_count):
@@ -1203,7 +1564,7 @@ def ambush_verify(date_str=None, horizon=5):
 #     形态/筹码/试盘三个分项与实盘口径完全相同。
 # 股东户数按"公告日期 ≤ 回放日"取数、龙虎榜按上榜日过滤，避免未来函数。
 
-AMBUSH_CACHE_DIR = DATA_DIR / "ambush_cache"
+AMBUSH_CACHE_DIR = DATA_DIR / "ambush_cache"  # 现仅存股东户数(gdhs_*.json)缓存；K线已改读 stock_history
 AMBUSH_BACKTEST_FILE = DATA_DIR / "ambush_backtest.json"
 
 
@@ -1242,59 +1603,21 @@ def _fetch_kline_history(code, days_back=300):
 
 
 def _load_kline_universe(universe):
-    """带磁盘缓存的批量历史K线。
+    """批量历史K线：直读 stock_history（不在库的票回退实时新浪抓）。
 
-    磁盘缓存保存 daily_* 日频字段；进入模型前转换为 open/high/low/close
-    这样的算法内部字段，避免持久化数据含糊。
+    不再维护 ambush_cache 磁盘缓存——日线已统一在 stock_history，且该缓存对在库票
+    从不提供额外新鲜度（_fetch_kline_history 本就先读 DB、对在库票直接返回）。
+    新鲜度随刷新节奏：跑 --ambush 前先做数据刷新即可拿到最新交易日的 K 线。
     """
-    AMBUSH_CACHE_DIR.mkdir(parents=True, exist_ok=True)
-    today = datetime.now().strftime("%Y-%m-%d")
     cache = {}
-    todo = []
-    for code, name in universe:
-        fp = AMBUSH_CACHE_DIR / f"{code}.json"
-        if fp.exists():
-            try:
-                with open(fp, encoding="utf-8") as f:
-                    saved = json.load(f)
-                if saved.get("fetched") == today and saved.get("records"):
-                    records = analysis_records_from_history_records(saved["records"])
-                    if not records and "close" in saved["records"][-1]:
-                        records = saved["records"]
-                    if records:
-                        cache[code] = {"name": saved.get("name") or name, "records": records}
-                        continue
-            except (OSError, json.JSONDecodeError):
-                pass
-        todo.append((code, name))
-
-    if todo:
-        print(f"  K线缓存命中 {len(cache)} 只，需要拉取 {len(todo)} 只"
-              f"（新浪源串行，预计约 {len(todo) // 2}~{len(todo)} 秒）...")
-    else:
-        print(f"  K线缓存全部命中（{len(cache)} 只）")
-    fetched_ok = 0
-    for i, (code, name) in enumerate(todo, 1):
-        records = _fetch_kline_history(code)
+    total = len(universe)
+    for i, (code, name) in enumerate(universe, 1):
+        records = _fetch_kline_history(code)  # stock_history 优先，缺失则实时抓
         if records:
-            stored_records = normalize_history_records(records, include_valuation=False)
-            with open(AMBUSH_CACHE_DIR / f"{code}.json", "w", encoding="utf-8") as f:
-                json.dump(
-                    {
-                        "fetched": today,
-                        "name": name,
-                        "schema": "daily_ohlcv.v1",
-                        "records": stored_records,
-                    },
-                    f,
-                    ensure_ascii=False,
-                )
             cache[code] = {"name": name, "records": records}
-            fetched_ok += 1
-        if i % 100 == 0:
-            # 本次成功只数这一轮真正拉到的，不含磁盘缓存命中（旧写法 len(cache) 会虚高/相减为负）
-            print(f"    拉取进度 {i}/{len(todo)}（本次成功 {fetched_ok}）")
-        time.sleep(0.05)
+        if i % 200 == 0:
+            print(f"    K线加载 {i}/{total}（已得 {len(cache)} 只）")
+    print(f"  K线加载：{len(cache)}/{total} 只（来源 stock_history，缺失实时回退）")
     # 预建 日期→下标 索引
     for info in cache.values():
         info["index"] = {r["date"]: i for i, r in enumerate(info["records"])}
@@ -1786,3 +2109,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

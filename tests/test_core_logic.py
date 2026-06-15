@@ -19,7 +19,6 @@ from fund_storage import (
 from stock_crawl_common import history_payload_from_records, merge_records_by_date
 from stock_crawl_price_valuation import (
     _decide_valuation_period,
-    find_stock_file,
     load_stock_file,
     records_need_ohlcv_backfill,
     save_stock_file,
@@ -203,9 +202,12 @@ class StockValuationDecisionTest(unittest.TestCase):
 
 
 class StockFilePathTest(unittest.TestCase):
-    def test_save_stock_file_sanitizes_name_and_load_finds_it(self):
+    def test_save_stock_file_round_trips_through_sqlite(self):
+        import stock_storage as ss
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("stock_crawl_price_valuation.DATA_DIR", Path(tmp)):
+            conn = ss.connect(Path(tmp) / "stock.sqlite3")
+            ss._thread_local.conns = {str(ss.DEFAULT_DB_FILE): conn}
+            try:
                 save_stock_file("000001", "坏/名字:测试", {"records": [{
                     "date": "2026-01-01",
                     "daily_open": 10,
@@ -216,18 +218,13 @@ class StockFilePathTest(unittest.TestCase):
                     "daily_amount": 1050,
                 }]})
 
-                files = list(Path(tmp).glob("CN_000001_*.json"))
-                self.assertEqual(len(files), 1)
-                self.assertNotIn("/", files[0].name)
-                self.assertEqual(load_stock_file("000001", "坏/名字:测试")["records"][0]["date"], "2026-01-01")
-
-    def test_find_stock_file_falls_back_to_code_when_name_changes(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            fp = Path(tmp) / "CN_000002_旧名.json"
-            fp.write_text(json.dumps({"records": []}), encoding="utf-8")
-
-            with patch("stock_crawl_price_valuation.DATA_DIR", Path(tmp)):
-                self.assertEqual(find_stock_file("000002", "新名"), fp)
+                # 主键是 6 位 code：名字异常或改名都不影响按 code 取回
+                loaded = load_stock_file("000001", "新名字")
+                self.assertEqual(loaded["records"][0]["date"], "2026-01-01")
+                self.assertEqual(loaded["records"][0]["daily_close"], 10.5)
+            finally:
+                ss._thread_local.conns = {}
+                conn.close()
 
 
 class StockRecordMergeTest(unittest.TestCase):
@@ -297,6 +294,48 @@ class StockHistorySchemaTest(unittest.TestCase):
         ]
 
         self.assertTrue(records_need_ohlcv_backfill(records))
+
+
+class StockStrategyOptimizerTest(unittest.TestCase):
+    def test_optuna_startup_trials_keeps_small_runs_exploratory(self):
+        from stock_strategy_optimizer import optuna_startup_trials
+
+        self.assertEqual(optuna_startup_trials(1), 1)
+        self.assertEqual(optuna_startup_trials(20), 20)
+        self.assertEqual(optuna_startup_trials(200), 70)
+        self.assertEqual(optuna_startup_trials(300), 105)
+
+    def test_long_objective_penalizes_sparse_fold_coverage(self):
+        from stock_strategy_optimizer import (
+            LONG_FOLD_COUNT_PENALTY,
+            LONG_SOFT_TARGET_FOLDS,
+            long_validation_adjusted_objective,
+        )
+
+        pairs = [
+            {
+                "as_of": f"2024-{(idx % 12) + 1:02d}-01",
+                "cal_idx": idx * 30,
+                "portfolio_return": 0.12,
+                "benchmark_return": 0.02,
+                "excess_return": 0.10,
+                "portfolio_max_drawdown": 0.10,
+                "benchmark_max_drawdown": 0.12,
+            }
+            for idx in range(LONG_SOFT_TARGET_FOLDS)
+        ]
+        sparse_pairs = pairs[:20]
+
+        _, sparse_detail = long_validation_adjusted_objective(
+            sparse_pairs[:12], sparse_pairs[12:], sparse_pairs, 250, 125
+        )
+        _, full_detail = long_validation_adjusted_objective(
+            pairs[:24], pairs[24:], pairs, 250, 125
+        )
+
+        expected_penalty = (LONG_SOFT_TARGET_FOLDS - len(sparse_pairs)) * LONG_FOLD_COUNT_PENALTY
+        self.assertEqual(sparse_detail["fold_count_penalty"], round(expected_penalty, 5))
+        self.assertEqual(full_detail["fold_count_penalty"], 0)
 
 
 class FundBacktestTest(unittest.TestCase):

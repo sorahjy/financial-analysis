@@ -3,7 +3,7 @@
 stock_crawl_price_valuation 共用，消除三者间的重复实现。
 
 包含：代理绕过、安全数值转换、带退避重试、交易所前缀、指数成分获取、
-JSON 读写、按日期合并，以及 CN_{code}_{name}.json 的路径/查找/读写工具。
+通用 JSON 读写、按日期合并、history 记录规范化等。
 
 注意语义差异（故意保留，各调用方依赖）：
   - safe_float: NaN/inf → None（财报/估值留空）。
@@ -17,7 +17,6 @@ import json
 import math
 import multiprocessing
 import os
-import re
 import statistics
 import threading
 from concurrent.futures import ProcessPoolExecutor
@@ -712,7 +711,7 @@ def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=
     raise last_err
 
 
-# ─── CN_{code}_{name}.json 文件工具（带 base_dir 参数）──────────
+# ─── 通用 JSON 文件工具 ───────────────────────────────────────
 
 def load_json_file(path, default=None):
     """读取 JSON 文件；不存在或损坏时返回 default。"""
@@ -757,43 +756,3 @@ def merge_records_by_date(existing, new_records, date_key="date", overwrite_none
     return sorted(by_date.values(), key=lambda item: str(item.get(date_key, "")))
 
 
-def safe_name_component(name):
-    """股票名清洗为安全文件名组件（替换非法字符）。"""
-    text = str(name).strip()
-    text = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", text)
-    return text.strip(" ._") or "UNKNOWN"
-
-
-def stock_json_path(base_dir, code, name):
-    return Path(base_dir) / f"CN_{code}_{safe_name_component(name)}.json"
-
-
-def find_stock_json(base_dir, code, name=None):
-    """在 base_dir 找 CN_{code}_*.json：优先精确名+legacy名，再按 code glob。"""
-    base = Path(base_dir)
-    candidates = []
-    if name is not None:
-        candidates.append(stock_json_path(base, code, name))
-        legacy = base / f"CN_{code}_{name}.json"
-        if legacy not in candidates:
-            candidates.append(legacy)
-    candidates.extend(sorted(base.glob(f"CN_{code}_*.json")))
-    for fp in candidates:
-        if fp.exists():
-            return fp
-    return None
-
-
-def load_stock_json(base_dir, code, name):
-    fp = find_stock_json(base_dir, code, name)
-    if fp is not None:
-        with open(fp, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
-
-
-def save_stock_json(base_dir, code, name, data):
-    fp = stock_json_path(base_dir, code, name)
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    with open(fp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)

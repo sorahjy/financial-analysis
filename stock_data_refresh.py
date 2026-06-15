@@ -9,7 +9,6 @@ stale strategy output by accident.
 from __future__ import annotations
 
 import argparse
-import glob
 import json
 import os
 import shutil
@@ -21,6 +20,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
+import stock_storage as ss
 from stock_crawl_common import (
     daily_payload_from_history_records,
     history_payload_from_records,
@@ -137,51 +137,40 @@ def _history_payload(code: str, name: str, records: List[Dict[str, Any]], source
 
 
 def fill_stock_history_from_local_data() -> Dict[str, Any]:
-    """Normalize stock_data.history and remove snapshot-only daily points.
+    """Normalize stock_history and remove snapshot-only daily points (now in SQLite).
 
-    The old fallback used daily.recent_daily and market_snapshot to synthesize
-    history rows. New stock_data.daily intentionally stores only stats, so this
-    step must not create close-only rows that later poison OHLCV checks.
+    Snapshot-only rows (close/valuation without daily market fields) poison OHLCV
+    completeness checks, so prune them; clean rows are a no-op.
     """
-    stock_files = sorted(glob.glob(str(DATA_DIR / "stock_data" / "CN_*.json")))
-    updated = 0
-    skipped = 0
-    removed_records = 0
+    conn = ss.connect()
+    try:
+        codes = ss.codes_with_history(conn)
+        updated = 0
+        skipped = 0
+        removed_records = 0
+        for code in codes:
+            existing = ss.load_history_records(conn, code)
+            cleaned, removed = prune_snapshot_only_history_records(existing)
+            if not removed:
+                skipped += 1
+                continue
+            stock = ss.load_stock(conn, code)
+            name = str(stock.get("name") or code)
+            stock["history"] = _history_payload(code, name, cleaned, "stock_data.history")
+            stock["daily"] = daily_payload_from_history_records(cleaned)
+            ss.save_stock(conn, stock)
+            updated += 1
+            removed_records += removed
 
-    for path_text in stock_files:
-        stock_path = Path(path_text)
-        stock = load_json_file(stock_path, {})
-        if not isinstance(stock, dict):
-            skipped += 1
-            continue
-        code = str(stock.get("symbol") or stock_path.name.split("_")[1]).zfill(6)
-        name = str(stock.get("name") or code)
-        existing = (stock.get("history") or {}).get("records", [])
-        cleaned, removed = prune_snapshot_only_history_records(existing)
-        if not removed:
-            skipped += 1
-            continue
-        stock["history"] = _history_payload(code, name, cleaned, "stock_data.history")
-        stock["daily"] = daily_payload_from_history_records(cleaned)
-        stock.pop("history_fallback_at", None)
-        stock["history_sanitized_at"] = datetime.now().isoformat()
-        write_json_file(stock_path, stock)
-        updated += 1
-        removed_records += removed
-
-    stock_history_files = 0
-    for fp in (DATA_DIR / "stock_data").glob("CN_*.json"):
-        payload = load_json_file(fp, {})
-        if isinstance(payload, dict) and (payload.get("history") or {}).get("records"):
-            stock_history_files += 1
-
-    return {
-        "updated": updated,
-        "skipped": skipped,
-        "removed_snapshot_only_records": removed_records,
-        "source_files": len(stock_files),
-        "stock_history_files": stock_history_files,
-    }
+        return {
+            "updated": updated,
+            "skipped": skipped,
+            "removed_snapshot_only_records": removed_records,
+            "source_files": ss.table_count(conn, "stock_meta"),
+            "stock_history_files": len(codes),
+        }
+    finally:
+        conn.close()
 
 
 def local_step_result(name: str, command: str, func) -> StepResult:
@@ -268,15 +257,15 @@ def refresh_csi300_benchmark() -> Dict[str, Any]:
 
 
 def collect_data_health() -> Dict[str, Any]:
-    stock_data_count = len(list((DATA_DIR / "stock_data").glob("CN_*.json")))
-    stock_history_count = 0
-    for fp in (DATA_DIR / "stock_data").glob("CN_*.json"):
-        stock = load_json_file(fp, {})
-        if isinstance(stock, dict) and (stock.get("history") or {}).get("records"):
-            stock_history_count += 1
+    conn = ss.connect()
+    try:
+        stock_data_count = ss.table_count(conn, "stock_meta")
+        stock_history_count = len(ss.codes_with_history(conn))
+        csi300 = ss.load_index_nav(conn, "510310")
+    finally:
+        conn.close()
     capital = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
     strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
-    csi300 = load_json_file(DATA_DIR / "csi300_etf_nav.json", {})
     csi300_records = csi300.get("records", []) if isinstance(csi300, dict) else []
     candidate_cache = load_json_file(DATA_DIR / "stock_strategy_candidate_cache.json", {})
     long_cache = candidate_cache.get("long") if isinstance(candidate_cache, dict) else {}

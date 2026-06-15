@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.3
+当前版本：v3.1.4
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -134,14 +134,14 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 
 `stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。组合等权收益减成本减同期 510310 沪深300ETF累计净值基准得到每折超额，折再奇偶切成训练/验证两半，选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、折数不足和验证折为负；有效折数过少的配置会出局，避免少数折的彩票式配置夺魁。
 
-> 注意：受本地约 10 年日线与 510310 基准覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 200 次，通常约 1 分钟内完成。
+> 注意：受本地约 10 年日线与 510310 基准覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 300 次，通常约 3 分钟内完成。
 
 Dashboard 支持：
 
 - 长线/短线 tabs 切换。
 - 调整硬过滤参数、因子权重、输出数量和最低分。
 - 运行策略、保存配置、重置参数。
-- 直接触发 200 次参数搜索，并查看后台搜索状态。
+- 直接触发 300 次参数搜索，并查看后台搜索状态。
 - 展示候选数、入选数、平均分、分数区间、数据覆盖率、筛选解释和主要因子贡献。
 
 
@@ -151,7 +151,7 @@ Dashboard 支持：
 
 ```bash
 python stock_data_refresh.py --mode full --no-proxy
-python stock_strategy_optimizer.py --iterations 200
+python stock_strategy_optimizer.py --iterations 300
 ```
 
 股票数据刷新
@@ -170,7 +170,7 @@ python stock_advanced_strategies.py --persist
 python stock_advanced_strategies.py --persist --rebuild-cache
 python stock_advanced_strategies.py --strategy long --json
 python stock_advanced_strategies.py --strategy short --json
-python stock_strategy_optimizer.py --iterations 200
+python stock_strategy_optimizer.py --iterations 300
 ```
 
 `stock_data_refresh.py` 会在刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成最新策略结果并预构建候选池缓存。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
@@ -342,6 +342,9 @@ python industry_cycle_extractor.py
 
 #### Update v3.1.3  2026.6.15
 基金核心缓存迁移到 `data/fund_data.sqlite3`：新增 `fund_storage.py` 管理 SQLite schema、历史净值、实时估算和 Scrapy 基金概况快照，`fund_fetch_data.py`、`fund_technical_analysis.py`、`fund_generate_output.py`、`fund_backtest.py` 与天天基金 Scrapy pipeline 统一改读写 SQLite，替代旧的 `nav_store.json`、`nav_history.json`、`realtime_estimate.json` 和 `temp.json` 文件链路；补充 SQLite 存储单测，保证净值、实时估算和基金概况快照可往返读写。股票数据刷新同步提速：日线源支持进程池隔离腾讯/新浪 fallback，基础面爬取并发财报/指标阶段并输出阶段耗时，刷新默认股票线程数和指数 workers 上调，并保留兼容的 fallback CLI 参数。
+
+#### Update v3.1.4  2026.6.15
+股票策略优化器默认搜索次数从 200 提升到 300，Flask 股票策略台触发的后台优化同步改为 `python -B stock_strategy_optimizer.py --iterations 300`，页面确认弹窗与运行遮罩提示调整为约 3 分钟；CLI 优化过程增加 `tqdm` 进度条，README 命令示例和参数搜索说明同步更新。
 
 ## 12. Acknowledgment
 

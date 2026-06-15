@@ -21,11 +21,10 @@ from pathlib import Path
 
 import akshare as ak
 
+import stock_storage
 from stock_crawl_common import (
     analysis_records_from_history_records,
-    find_stock_json,
     history_record_has_daily_ohlcv,
-    load_json_file,
     normalize_history_records,
     retry_fetch_or_none as _retry,
     safe_num as _num,
@@ -37,7 +36,6 @@ KLINE_LOOKBACK = 60      # 取最近 60 个交易日（足够算 MA20 / RSI / �
 MAX_RETRIES = 3
 THREAD_COUNT = 6         # 不要调高：>6 易被龙虎榜/K线接口限流甚至跑挂
 DATA_DIR = Path("data/capital")
-STOCK_DATA_DIR = Path("data/stock_data")
 CANDIDATES_FILE = DATA_DIR / "hot_money_candidates.json"
 KNOWN_SEAT_TOP_N = 100   # 营业部排行前 N 标记为高活跃/知名席位
 
@@ -342,15 +340,12 @@ def _has_complete_ohlcv(records):
 
 
 def load_local_kline_records(code, name=None, *, lookback=None, start_date=None):
-    """Read complete OHLCV rows from data/stock_data.history when available."""
-    fp = find_stock_json(STOCK_DATA_DIR, str(code).zfill(6), name)
-    if fp is None:
+    """Read complete OHLCV rows from stock_data.sqlite3 (stock_history) when available."""
+    conn = stock_storage.thread_conn()
+    stored = stock_storage.load_history_records(conn, str(code).zfill(6))
+    if not stored:
         return []
-    payload = load_json_file(fp, {})
-    records = normalize_history_records(
-        (payload.get("history") or {}).get("records", []),
-        include_valuation=False,
-    )
+    records = normalize_history_records(stored, include_valuation=False)
     if start_date:
         records = [row for row in records if row.get("date") >= start_date]
     records = [row for row in records if history_record_has_daily_ohlcv(row)]

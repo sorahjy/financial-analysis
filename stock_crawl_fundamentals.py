@@ -30,6 +30,7 @@ import akshare as ak
 import numpy as np
 import pandas as pd
 
+import stock_storage as ss
 from stock_crawl_common import (
     strip_proxy_env,
     safe_print,
@@ -38,19 +39,15 @@ from stock_crawl_common import (
     is_bse_stock,
     fetch_index_constituents,
     fetch_qfq_daily_records,
-    find_stock_json,
     daily_payload_from_history_records,
     daily_stats_from_history_records,
     history_payload_from_records,
     latest_weekday_date,
-    load_json_file,
     merge_records_by_date,
     normalize_history_records,
-    write_json_file,
 )
 
 DATA_DIR = Path(__file__).parent / "data"
-OUTPUT_DIR = DATA_DIR / "stock_data"
 CONS_FILE = DATA_DIR / "index_constituents.json"
 SNAPSHOT_FILE = DATA_DIR / "market_snapshot.json"
 UNIVERSE_FILE = DATA_DIR / "stock_universe.json"
@@ -339,34 +336,16 @@ def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
     return data
 
 
-def _stock_file(symbol, name):
-    safe_name = name.replace("/", "_").replace("\\", "_")
-    return OUTPUT_DIR / f"CN_{symbol}_{safe_name}.json"
-
-
 def load_existing():
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    existing = set()
-    for f in OUTPUT_DIR.glob("CN_*.json"):
-        try:
-            with open(f, "r", encoding="utf-8") as fp:
-                data = json.load(fp)
-            if not all(key in data for key in ("financials", "indicators", "dividends")):
-                continue
-            code = f.stem.split("_")[1]
-            existing.add(code)
-        except (json.JSONDecodeError, ValueError, KeyError):
-            print(f"  数据损坏，已删除: {f.name}")
-            f.unlink()
-    return existing
+    conn = ss.thread_conn()
+    return ss.existing_codes(conn)
 
 
 def save_stock(symbol, data):
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    path = find_stock_json(OUTPUT_DIR, symbol, data.get("name")) or _stock_file(symbol, data.get("name", symbol))
-    existing = load_json_file(path, {})
-    if isinstance(existing, dict):
-        existing_records = (existing.get("history") or {}).get("records", [])
+    conn = ss.thread_conn()
+    symbol = str(symbol).zfill(6)
+    existing_records = ss.load_history_records(conn, symbol)
+    if existing_records:
         incoming_records = (data.get("history") or {}).get("records", [])
         merged_records = merge_records_by_date(existing_records, incoming_records, overwrite_none=False)
         if merged_records:
@@ -377,9 +356,10 @@ def save_stock(symbol, data):
                 "stock_data.history+stock_crawl_fundamentals.daily",
             )
             data["daily"] = daily_payload_from_history_records(merged_records)
-    if isinstance(existing, dict) and "history_refetched_at" in existing and "history_refetched_at" not in data:
-        data["history_refetched_at"] = existing["history_refetched_at"]
-    write_json_file(path, data)
+    prev_refetched = ss.history_refetched_at(conn, symbol)
+    if prev_refetched and "history_refetched_at" not in data:
+        data["history_refetched_at"] = prev_refetched
+    ss.save_stock(conn, data)
 
 
 def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
@@ -484,8 +464,8 @@ def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
         with open(DATA_DIR / "crawl_errors.json", "w", encoding="utf-8") as f:
             json.dump(errors, f, ensure_ascii=False, indent=2)
 
-    file_count = len(list(OUTPUT_DIR.glob("CN_*.json")))
-    print(f"\n数据目录: {OUTPUT_DIR} ({file_count} 个文件)")
+    stock_count = ss.table_count(ss.thread_conn(), "stock_meta")
+    print(f"\n数据库: {ss.DEFAULT_DB_FILE} ({stock_count} 只股票)")
 
 
 # ═══════════════════════════════════════════════════════════
@@ -766,11 +746,6 @@ def pre_screen_candidates(snapshot):
 # 财报加深重爬（PIT 回测用，跳过日线）
 # ═══════════════════════════════════════════════════════════
 
-def _find_stock_data_file(code):
-    matches = sorted(OUTPUT_DIR.glob(f"CN_{code}_*.json"))
-    return matches[0] if matches else None
-
-
 def refetch_financials(codes=None, workers=8):
     """只重拉三大报表+指标+分红(跳过日线)，把现有 stock_data 文件的财报加深到
     FINANCIAL_YEARS 年。日线长历史已在 stock_data.history，这里不动，避免重爬慢接口。
@@ -778,27 +753,21 @@ def refetch_financials(codes=None, workers=8):
     codes=None 时取带 history.records 的 stock_data 文件，正是 PIT 回测要 join 的股票池。
     """
     if codes is None:
-        codes = []
-        for fp in OUTPUT_DIR.glob("CN_*.json"):
-            data = load_json_file(fp, {})
-            if isinstance(data, dict) and (data.get("history") or {}).get("records"):
-                codes.append(str(data.get("symbol") or fp.name.split("_")[1]).zfill(6))
-        codes = sorted(set(codes))
+        codes = ss.codes_with_history(ss.thread_conn())
     print(f"重拉财报到 {FINANCIAL_YEARS} 年(跳过日线): {len(codes)} 只 / {workers} 线程\n")
 
     def _worker(code):
-        fp = _find_stock_data_file(code)
-        if fp is None:
-            return code, False, "无 stock_data 文件"
+        conn = ss.thread_conn()
+        data = ss.load_stock(conn, code)
+        if not data:
+            return code, False, "无 stock_data 记录"
         try:
-            with open(fp, encoding="utf-8") as f:
-                data = json.load(f)
             data["financials"] = fetch_financial_reports(code)
             data["indicators"] = fetch_financial_indicators(code)
             data["dividends"] = fetch_dividend_history(code)
             data["financials_refetched_at"] = datetime.now().isoformat()
-            with open(fp, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            # 只改财报/指标/分红，不重写 stock_history（187 万行无谓重写）
+            ss.save_stock(conn, data, write_history=False)
             return code, True, ""
         except Exception as e:
             return code, False, str(e)
@@ -823,23 +792,24 @@ def refetch_financials(codes=None, workers=8):
 def refetch_daily(codes=None, years=1, workers=8, limit=0):
     """只重拉已有 stock_data 文件的 daily 字段，用于统一日线复权和涨跌幅口径。"""
     if codes is None:
-        files = sorted(OUTPUT_DIR.glob("CN_*.json"))
+        codes = ss.list_codes(ss.thread_conn())
     else:
-        files = [fp for code in codes if (fp := _find_stock_data_file(code)) is not None]
+        conn = ss.thread_conn()
+        codes = [str(c).zfill(6) for c in codes if ss.stock_exists(conn, c)]
     if limit and limit > 0:
-        files = files[:limit]
+        codes = codes[:limit]
 
-    print(f"重拉前复权日线到 {years} 年: {len(files)} 只 / {workers} 线程\n")
+    print(f"重拉前复权日线到 {years} 年: {len(codes)} 只 / {workers} 线程\n")
 
     failed = []
     done = 0
     lock = threading.Lock()
 
-    def _worker(fp):
-        data = load_json_file(fp, {})
-        if not isinstance(data, dict):
-            return fp.name, False, "JSON 非对象"
-        code = str(data.get("symbol") or fp.name.split("_")[1]).zfill(6)
+    def _worker(code):
+        conn = ss.thread_conn()
+        data = ss.load_stock(conn, code)
+        if not data:
+            return code, False, "无 stock_data 记录"
         try:
             daily = fetch_daily_price(code, years=years)
             new_records = daily.pop("history_records", [])
@@ -853,23 +823,23 @@ def refetch_daily(codes=None, years=1, workers=8, limit=0):
             )
             data["daily"] = daily_payload_from_history_records(merged_records)
             data["daily_refetched_at"] = datetime.now().isoformat()
-            write_json_file(fp, data)
+            ss.save_stock(conn, data)
             return code, True, ""
         except Exception as e:
             return code, False, str(e)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        futures = [pool.submit(_worker, fp) for fp in files]
+        futures = [pool.submit(_worker, c) for c in codes]
         for fut in as_completed(futures):
             code, ok, err = fut.result()
             with lock:
                 done += 1
                 if not ok:
                     failed.append((code, err))
-                if done % 50 == 0 or done == len(files):
-                    print(f"  进度 {done}/{len(files)} (失败 {len(failed)})")
+                if done % 50 == 0 or done == len(codes):
+                    print(f"  进度 {done}/{len(codes)} (失败 {len(failed)})")
 
-    print(f"\n完成: {len(files) - len(failed)}/{len(files)} 成功, {len(failed)} 失败")
+    print(f"\n完成: {len(codes) - len(failed)}/{len(codes)} 成功, {len(failed)} 失败")
     for code, err in failed[:10]:
         print(f"  ✗ {code}: {err}")
     if len(failed) > 10:
