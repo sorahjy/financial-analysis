@@ -2,9 +2,8 @@
 统一基金数据抓取脚本。
 
 默认一次完成两类数据：
-  1. 从天天基金 F10DataApi 增量抓取历史净值，写入 data/nav_store.json，
-     并导出 data/nav_history.json 供 fund_technical_analysis.py 使用。
-  2. 从天天基金估值接口抓取实时净值估算，写入 data/realtime_estimate.json。
+  1. 从天天基金 F10DataApi 增量抓取历史净值，写入 data/fund_data.sqlite3，
+  2. 从天天基金估值接口抓取实时净值估算，写入 SQLite。
 """
 
 from __future__ import annotations
@@ -20,6 +19,14 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import requests
 
+from fund_storage import (
+    connect as connect_fund_db,
+    import_nav_store_payload,
+    load_nav_store as db_load_nav_store,
+    save_nav_entry,
+    save_realtime_estimates,
+)
+
 
 FUND_CODES_FILE = os.path.join("data", "fund_codes.json")
 
@@ -31,8 +38,6 @@ NAV_HEADERS = {
     "Referer": "https://fundf10.eastmoney.com/",
 }
 NAV_API_URL = "https://fundf10.eastmoney.com/F10DataApi.aspx"
-NAV_STORE_FILE = os.path.join("data", "nav_store.json")
-NAV_EXPORT_FILE = os.path.join("data", "nav_history.json")
 
 ESTIMATE_HEADERS = {
     "User-Agent": (
@@ -42,7 +47,6 @@ ESTIMATE_HEADERS = {
     "Referer": "https://fund.eastmoney.com/",
 }
 ESTIMATE_API_URL = "https://fundgz.1234567.com.cn/js/{code}.js"
-ESTIMATE_OUTPUT_FILE = os.path.join("data", "realtime_estimate.json")
 
 MAX_RETRIES = 3
 META_RE = re.compile(r"records:(\d+),pages:(\d+),curpage:(\d+)")
@@ -138,22 +142,19 @@ def merge_records(existing: Iterable[Dict[str, Any]], new_records: Iterable[Dict
 
 
 def load_store() -> Dict[str, Any]:
-    if os.path.exists(NAV_STORE_FILE):
-        with open(NAV_STORE_FILE, encoding="utf-8") as f:
-            return json.load(f)
-    return {}
+    conn = connect_fund_db()
+    try:
+        return db_load_nav_store(conn)
+    finally:
+        conn.close()
 
 
 def save_store(store: Dict[str, Any]) -> None:
-    os.makedirs("data", exist_ok=True)
-    with open(NAV_STORE_FILE, "w", encoding="utf-8") as f:
-        json.dump(store, f, ensure_ascii=False)
-
-
-def export_nav_history(store: Dict[str, Any]) -> None:
-    export = {code: entry["records"] for code, entry in store.items()}
-    with open(NAV_EXPORT_FILE, "w", encoding="utf-8") as f:
-        json.dump(export, f, ensure_ascii=False)
+    conn = connect_fund_db()
+    try:
+        import_nav_store_payload(conn, store)
+    finally:
+        conn.close()
 
 
 def fetch_fund_incremental(code: str, entry: Dict[str, Any]) -> Dict[str, Any]:
@@ -240,7 +241,11 @@ def fetch_fund_incremental(code: str, entry: Dict[str, Any]) -> Dict[str, Any]:
 
 def fetch_nav_history(codes: Optional[List[str]] = None) -> Dict[str, Any]:
     codes = codes or load_fund_codes()
-    store = load_store()
+    conn = connect_fund_db()
+    try:
+        store = db_load_nav_store(conn)
+    finally:
+        conn.close()
     total = len(codes)
 
     print("\n========== 基金历史净值 ==========")
@@ -260,9 +265,14 @@ def fetch_nav_history(codes: Optional[List[str]] = None) -> Dict[str, Any]:
         else:
             print("  - 无新增")
 
-        save_store(store)
+        if updated.get("records"):
+            conn = connect_fund_db()
+            try:
+                save_nav_entry(conn, code, updated)
+            finally:
+                conn.close()
 
-    export_nav_history(store)
+    store = load_store()
 
     print(f"\n历史净值完成！共 {len(store)} 只基金")
     for code in codes:
@@ -316,9 +326,11 @@ def fetch_realtime_estimates(codes: Optional[List[str]] = None) -> Dict[str, Dic
         if index < total - 1:
             time.sleep(random.uniform(0.1, 0.3))
 
-    os.makedirs("data", exist_ok=True)
-    with open(ESTIMATE_OUTPUT_FILE, "w", encoding="utf-8") as f:
-        json.dump(estimates, f, ensure_ascii=False, indent=2)
+    conn = connect_fund_db()
+    try:
+        save_realtime_estimates(conn, estimates)
+    finally:
+        conn.close()
 
     print(f"\n实时估算完成！共获取 {len(estimates)}/{total} 只基金")
     return estimates

@@ -7,6 +7,15 @@ from unittest.mock import patch
 from fund_backtest import backtest_fund
 from fund_generate_output import esc, parse_percent
 from fund_technical_analysis import analyze_fund, calc_percentile
+from fund_storage import (
+    connect as connect_fund_db,
+    load_nav_entry,
+    load_profile_snapshots,
+    load_realtime_estimates,
+    save_nav_entry,
+    save_profile_snapshots,
+    save_realtime_estimates,
+)
 from stock_crawl_common import history_payload_from_records, merge_records_by_date
 from stock_crawl_price_valuation import (
     _decide_valuation_period,
@@ -55,6 +64,91 @@ class TechnicalAnalysisTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result["nav_percentile"], 50.0)
+
+
+class FundSQLiteStorageTest(unittest.TestCase):
+    def test_schema_keeps_only_core_fund_cache_tables(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                tables = {
+                    row["name"]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type = 'table'"
+                    )
+                }
+            finally:
+                conn.close()
+
+        self.assertIn("fund_nav_records", tables)
+        self.assertIn("fund_nav_meta", tables)
+        self.assertIn("fund_realtime_estimates", tables)
+        self.assertIn("fund_profile_snapshots", tables)
+        self.assertNotIn("fund_reports", tables)
+        self.assertNotIn("fund_backtest_results", tables)
+        self.assertNotIn("fund_signals", tables)
+
+    def test_nav_entry_round_trips_with_meta(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_nav_entry(conn, "000001", {
+                    "start_date": "2026-01-01",
+                    "end_date": "2026-01-02",
+                    "records": [
+                        {"date": "2026-01-02", "nav": "1.1", "nav_acc": "1.2", "daily_growth_rate": "1.00"},
+                        {"date": "2026-01-01", "nav": "1.0", "nav_acc": "1.1", "daily_growth_rate": "0.00"},
+                    ],
+                })
+
+                entry = load_nav_entry(conn, "000001")
+            finally:
+                conn.close()
+
+        self.assertEqual(entry["start_date"], "2026-01-01")
+        self.assertEqual(entry["end_date"], "2026-01-02")
+        self.assertEqual([row["date"] for row in entry["records"]], ["2026-01-01", "2026-01-02"])
+        self.assertEqual(entry["records"][1]["nav_acc"], "1.2")
+
+    def test_realtime_estimates_replace_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_realtime_estimates(conn, {
+                    "000001": {"gsz": "1.1", "gszzl": "1.0", "gztime": "2026-01-01 15:00", "dwjz": "1.0"},
+                    "000002": {"gsz": "2.1", "gszzl": "2.0", "gztime": "2026-01-01 15:00", "dwjz": "2.0"},
+                })
+                save_realtime_estimates(conn, {
+                    "000002": {"gsz": "2.2", "gszzl": "2.1", "gztime": "2026-01-02 15:00", "dwjz": "2.0"},
+                })
+
+                estimates = load_realtime_estimates(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(list(estimates.keys()), ["000002"])
+        self.assertEqual(estimates["000002"]["gsz"], "2.2")
+
+    def test_profile_snapshot_save_replaces_absent_rows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "fund.sqlite3"
+
+            conn = connect_fund_db(db_file)
+            try:
+                self.assertEqual(save_profile_snapshots(conn, [
+                    {"fundCode": "000001", "name": "基金A"},
+                    {"fundCode": "000002", "name": "基金B"},
+                ]), 2)
+
+                self.assertEqual(save_profile_snapshots(conn, [
+                    {"fundCode": "000002", "name": "基金B2"},
+                ]), 1)
+                profiles = load_profile_snapshots(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(list(profiles.keys()), ["000002"])
+        self.assertEqual(profiles["000002"]["name"], "基金B2")
 
 
 class StockValuationDecisionTest(unittest.TestCase):

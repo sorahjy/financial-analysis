@@ -54,7 +54,12 @@
 """
 import json
 import math
-import os
+
+from fund_storage import (
+    connect as connect_fund_db,
+    load_nav_history,
+    load_realtime_estimates,
+)
 
 
 # ============================================================
@@ -754,19 +759,27 @@ def analyze_fund(nav_records, estimate=None):
     }
 
 
+def load_analysis_inputs():
+    conn = connect_fund_db()
+    try:
+        history = load_nav_history(conn)
+        estimate_data = load_realtime_estimates(conn)
+    finally:
+        conn.close()
+
+    if not history:
+        raise RuntimeError('SQLite 中没有基金历史净值数据，请先运行 fund_fetch_data.py')
+
+    return history, estimate_data
+
+
 def main():
     with open('data/fund_codes.json', encoding='utf-8') as f:
         fund_codes = set(json.load(f))
 
-    with open('data/nav_history.json', encoding='utf-8') as f:
-        history = json.load(f)
+    history, estimate_data = load_analysis_inputs()
 
-    # 加载实时估算数据（可选）
-    estimate_data = {}
-    estimate_file = os.path.join('data', 'realtime_estimate.json')
-    if os.path.exists(estimate_file):
-        with open(estimate_file, encoding='utf-8') as f:
-            estimate_data = json.load(f)
+    if estimate_data:
         print(f'已加载 {len(estimate_data)} 只基金的实时估算数据')
 
     signals = {}

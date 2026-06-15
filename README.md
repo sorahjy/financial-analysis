@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.2.post1
+当前版本：v3.1.3
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -87,6 +87,7 @@ http://127.0.0.1:8765
 
 - `funds.py`：配置基金列表、持仓列表和比较基准。
 - `fund_fetch_data.py`：统一抓取历史净值和实时估算。
+- `fund_storage.py`：基金 SQLite 核心缓存，保存历史净值、实时估算和 Scrapy 基金概况快照。
 - `fund_technical_analysis.py`：生成技术指标和买卖信号。
 - `fund_generate_output.py`：生成 `data/fund_report_data.json`（HTML 由 Flask `/fund` 页面渲染）。
 - `fund_backtest.py`：基金买卖信号的回测逻辑。
@@ -232,8 +233,7 @@ python industry_cycle_extractor.py
 | --- | --- |
 | `data/fund_report_data.json` | 基金超额收益和技术信号报告数据，由 Flask `/fund` 页面渲染（生成物，不入库） |
 | `data/signals.json` | 基金技术信号 |
-| `data/nav_history.json` / `data/nav_store.json` | 基金历史净值缓存 |
-| `data/realtime_estimate.json` | 基金实时估算缓存 |
+| `data/fund_data.sqlite3` | 基金核心缓存，包含历史净值、实时估算和 Scrapy 基金概况快照 |
 | `data/stock_advanced_strategy_results.json` | A 股长线/短线策略结果 |
 | `data/stock_strategy_candidate_cache.json` | A 股长线/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
@@ -252,6 +252,7 @@ python industry_cycle_extractor.py
 ├── app/                           # Flask 统一工作台、路由、模板和静态资源
 ├── run.py                         # Flask 本地启动入口
 ├── fund_*.py                     # 基金数据、技术分析、回测和报告生成
+├── fund_storage.py                # 基金 SQLite 缓存 schema、读写和导入工具
 ├── funds.py                      # 基金列表和基准配置
 ├── stock_advanced_strategies.py   # A 股长线/短线策略引擎
 ├── stock_strategy_optimizer.py    # 参数搜索和代理回测
@@ -338,6 +339,9 @@ python industry_cycle_extractor.py
 
 #### Update v3.1.2.post1  2026.6.15
 修复 `stock_data_refresh.py` 运行过程中触发行情 fallback 时可能遇到的 `safe_print` 未定义问题：将线程安全打印函数下沉到 `stock_crawl_common.py`，`stock_crawl_fundamentals.py` 与 `stock_crawl_price_valuation.py` 统一复用；删除已经失效的 `stock_strategy_dashboard.py` 旧兼容入口，A 股策略台统一通过 `python run.py --port 8765` 启动。
+
+#### Update v3.1.3  2026.6.15
+基金核心缓存迁移到 `data/fund_data.sqlite3`：新增 `fund_storage.py` 管理 SQLite schema、历史净值、实时估算和 Scrapy 基金概况快照，`fund_fetch_data.py`、`fund_technical_analysis.py`、`fund_generate_output.py`、`fund_backtest.py` 与天天基金 Scrapy pipeline 统一改读写 SQLite，替代旧的 `nav_store.json`、`nav_history.json`、`realtime_estimate.json` 和 `temp.json` 文件链路；补充 SQLite 存储单测，保证净值、实时估算和基金概况快照可往返读写。股票数据刷新同步提速：日线源支持进程池隔离腾讯/新浪 fallback，基础面爬取并发财报/指标阶段并输出阶段耗时，刷新默认股票线程数和指数 workers 上调，并保留兼容的 fallback CLI 参数。
 
 ## 12. Acknowledgment
 

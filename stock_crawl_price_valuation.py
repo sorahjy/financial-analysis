@@ -9,7 +9,7 @@
         — 来自百度接口，只覆盖近5年（非逐日，约914点），更早记录该字段为 None
 存储路径: data/stock_data/CN_{code}_{name}.json 的 history 字段
 增量更新: 已有文件只补充 end_date+1 至今的缺失数据
-并发: 默认6线程，可通过 STOCK_THREAD_COUNT 环境变量调整
+并发: 默认16线程，可通过 STOCK_THREAD_COUNT 环境变量调整
 
 附带:
   - fetch_csi300_etf(): 爬取 510310 沪深300 ETF 累计净值作为基准，供数据刷新的基准对比
@@ -17,9 +17,7 @@
 
 import json
 import os
-import random
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -49,7 +47,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data/stock_data")
 MAX_YEARS = 10
 MAX_RETRIES = 3
-DEFAULT_THREAD_COUNT = 6   # 不要调高：>6 易被东财/百度等境内接口限流甚至跑挂
+DEFAULT_THREAD_COUNT = 16
 VALUATION_FRESH_DAYS = 7   # 最近一条估值在该天数内则跳过重抓（百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略）
 
 
@@ -124,9 +122,6 @@ def save_stock_file(code, name, data):
 
 def fetch_daily_range(symbol, start_date, end_date):
     """爬取 [start_date, end_date] 的日频数据，返回 records 列表。
-
-    数据源回退链：东财 → 腾讯 → 新浪。腾讯无换手率；
-    腾讯/新浪的涨跌幅由相邻收盘价推算，新浪源串行兜底以避免 MiniRacer 并发崩溃。
     """
     return fetch_qfq_daily_records(
         symbol,
@@ -171,8 +166,6 @@ def fetch_valuation_data(symbol, period="近五年"):
             d = row["date"]
             date_str = d.isoformat() if hasattr(d, "isoformat") else str(d)[:10]
             by_date.setdefault(date_str, {})[field] = _safe_float(row["value"])
-
-        time.sleep(random.uniform(0.1, 0.25))
 
     return by_date
 
@@ -422,7 +415,6 @@ def main():
         idx_local, (code, name) = args
         try:
             process_stock(code, name, idx_local, total)
-            time.sleep(random.uniform(0.1, 0.3))
         except Exception as e:
             safe_print(f"[ERROR] {code} {name}: {e}")
             with counter_lock:

@@ -58,6 +58,8 @@ UNIVERSE_FILE = DATA_DIR / "stock_universe.json"
 # 财报历史深度：10 年。PIT 回测要 join 多年日线，财报需同样深。
 FINANCIAL_YEARS = 10
 FINANCIAL_QUARTERS = FINANCIAL_YEARS * 4
+STAGE_TIMING_REPORT_EVERY = 100
+STAGE_TIMING_ORDER = ("daily", "financials", "indicators", "dividends", "save", "total")
 
 
 # 科技主题行业关键词（中证二级/三级行业），用于科技100指数筛选科技行业股票
@@ -128,8 +130,21 @@ def fetch_financial_reports(stock_code):
     """获取三大财务报表（利润表、资产负债表、现金流量表）"""
     result = {}
 
-    # 利润表
-    df_income = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="利润表")
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        income_future = pool.submit(
+            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="利润表"
+        )
+        balance_future = pool.submit(
+            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="资产负债表"
+        )
+        cashflow_future = pool.submit(
+            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="现金流量表"
+        )
+
+        df_income = income_future.result()
+        df_balance = balance_future.result()
+        df_cashflow = cashflow_future.result()
+
     income_cols = {
         "revenue": ["营业总收入", "营业收入"],  # 银行股用"营业收入"
         "operating_cost": ["营业总成本", "营业支出"],  # 银行股用"营业支出"
@@ -140,10 +155,6 @@ def fetch_financial_reports(stock_code):
     }
     result["income"] = _df_to_records(df_income, income_cols)[:FINANCIAL_QUARTERS]  # 近10年(40个季度)
 
-    time.sleep(0.3)
-
-    # 资产负债表
-    df_balance = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="资产负债表")
     balance_cols = {
         "total_equity_parent": ["归属于母公司股东权益合计", "归属于母公司股东的权益"],
         "minority_equity": "少数股东权益",
@@ -153,10 +164,6 @@ def fetch_financial_reports(stock_code):
     }
     result["balance"] = _df_to_records(df_balance, balance_cols)[:FINANCIAL_QUARTERS]
 
-    time.sleep(0.3)
-
-    # 现金流量表
-    df_cashflow = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="现金流量表")
     cashflow_cols = {
         "operating_cashflow_net": "经营活动产生的现金流量净额",
         "operating_cashflow_in": "经营活动现金流入小计",
@@ -288,7 +295,7 @@ def fetch_pledge_data_bulk():
         return {}
 
 
-def fetch_one_stock(symbol, name, pledge_map):
+def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
     """爬取单只股票的全部数据:
     - daily: 日频行情(收盘价/成交量/波动率等)
     - financials: 三大财务报表(利润表/资产负债表/现金流量表)
@@ -298,22 +305,31 @@ def fetch_one_stock(symbol, name, pledge_map):
     """
     data = {"symbol": symbol, "name": name, "fetch_time": datetime.now().isoformat()}
 
-    daily = fetch_daily_price(symbol)
+    def _record_timing(stage, start):
+        if timing_callback:
+            timing_callback(stage, time.perf_counter() - start)
+
+    def _timed_call(stage, func, *args):
+        start = time.perf_counter()
+        try:
+            return func(*args)
+        finally:
+            _record_timing(stage, start)
+
+    daily = _timed_call("daily", fetch_daily_price, symbol)
     history_records = daily.pop("history_records", [])
     data["daily"] = daily
     data["history"] = history_payload_from_records(
         symbol, name, history_records, "stock_crawl_fundamentals.daily"
     )
-    time.sleep(0.5)
 
-    data["financials"] = fetch_financial_reports(symbol)
-    time.sleep(0.5)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        financials_future = pool.submit(_timed_call, "financials", fetch_financial_reports, symbol)
+        indicators_future = pool.submit(_timed_call, "indicators", fetch_financial_indicators, symbol)
+        data["financials"] = financials_future.result()
+        data["indicators"] = indicators_future.result()
 
-    data["indicators"] = fetch_financial_indicators(symbol)
-    time.sleep(0.5)
-
-    data["dividends"] = fetch_dividend_history(symbol)
-    time.sleep(0.3)
+    data["dividends"] = _timed_call("dividends", fetch_dividend_history, symbol)
 
     data["pledge"] = pledge_map.get(symbol, {
         "pledge_ratio": None, "pledge_count": None,
@@ -385,18 +401,72 @@ def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
     total = existing + len(todo)
     errors = {}
     done_count = [existing]
+    processed_count = [0]
+    progress_lock = threading.Lock()
+    timing_lock = threading.Lock()
+    stage_timings = {}
+
+    def _record_stage_timing(stage, elapsed):
+        with timing_lock:
+            stats = stage_timings.setdefault(stage, {"count": 0, "total": 0.0, "max": 0.0})
+            stats["count"] += 1
+            stats["total"] += elapsed
+            stats["max"] = max(stats["max"], elapsed)
+
+    def _format_stage_timing_summary():
+        with timing_lock:
+            snapshot = {
+                stage: dict(values)
+                for stage, values in stage_timings.items()
+                if values["count"] > 0
+            }
+        parts = []
+        for stage in STAGE_TIMING_ORDER:
+            values = snapshot.get(stage)
+            if not values:
+                continue
+            avg = values["total"] / values["count"]
+            parts.append(f"{stage} avg={avg:.2f}s max={values['max']:.2f}s")
+        return " | ".join(parts)
+
+    def _maybe_print_stage_timing(processed):
+        if not todo:
+            return
+        if processed % STAGE_TIMING_REPORT_EVERY != 0 and processed != len(todo):
+            return
+        summary = _format_stage_timing_summary()
+        if summary:
+            safe_print(f"  [耗时] 已处理 {processed}/{len(todo)}: {summary}")
 
     def _worker(symbol, info):
         name = info["name"]
+        worker_start = time.perf_counter()
+        ok = False
         try:
-            stock_data = fetch_one_stock(symbol, name, pledge_map)
+            stock_data = fetch_one_stock(symbol, name, pledge_map, timing_callback=_record_stage_timing)
             stock_data["candidate_for"] = info.get("candidate_for", [])
+            start = time.perf_counter()
             save_stock(symbol, stock_data)
-            done_count[0] += 1
-            print(f"  ✓ {name}({symbol}) 完成 ({done_count[0]}/{total})")
+            _record_stage_timing("save", time.perf_counter() - start)
+            ok = True
         except Exception as e:
-            errors[symbol] = {"name": name, "error": str(e)}
-            print(f"  ✗ {name}({symbol}) 失败: {e}")
+            error = e
+        finally:
+            _record_stage_timing("total", time.perf_counter() - worker_start)
+            with progress_lock:
+                processed_count[0] += 1
+                processed = processed_count[0]
+                if ok:
+                    done_count[0] += 1
+                    done = done_count[0]
+                else:
+                    errors[symbol] = {"name": name, "error": str(error)}
+                    done = done_count[0]
+            if ok:
+                safe_print(f"  ✓ {name}({symbol}) 完成 ({done}/{total})")
+            else:
+                safe_print(f"  ✗ {name}({symbol}) 失败: {error}")
+            _maybe_print_stage_timing(processed)
 
     print(f"待爬取: {len(todo)} 只, 线程数: {workers}\n")
     with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -816,8 +886,8 @@ def main():
                         help="full=全量爬取, staged=分步粗筛(默认)")
     parser.add_argument("--limit", type=int, default=0,
                         help="限制爬取数量, 0=不限 (full模式默认20)")
-    parser.add_argument("--workers", type=int, default=20,
-                        help="并发线程数(默认20)")
+    parser.add_argument("--workers", type=int, default=40,
+                        help="并发线程数(默认40)")
     parser.add_argument("--refetch-financials", action="store_true",
                         help="只把已有 stock_data 的财报加深重拉到10年(跳过日线), 用于PIT回测")
     parser.add_argument("--refetch-daily", action="store_true",

@@ -1,4 +1,3 @@
-
 """
 Data refresh orchestration for the local stock strategy server.
 
@@ -76,6 +75,23 @@ def resolve_python(explicit: Optional[str] = None) -> str:
 
 def command_text(cmd: Iterable[str]) -> str:
     return " ".join(str(part) for part in cmd)
+
+
+def env_text(names, default: str) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+def env_int(names, default: int) -> int:
+    if isinstance(names, str):
+        names = (names,)
+    try:
+        return int(env_text(names, str(default)) or str(default))
+    except ValueError:
+        return default
 
 
 def run_step(
@@ -288,19 +304,25 @@ def refresh_before_server(
     strict: bool = False,
     timeout: Optional[int] = None,
     python: Optional[str] = None,
-    index_workers: int = 20,
+    index_workers: int = 40,
     index_limit: int = 0,
     capital_days: int = 14,
     capital_top_yyb: int = 30,
     capital_min_followers: int = 1,
     capital_score_top: int = 100,
     no_proxy: bool = False,
+    daily_process_workers: int = 32,
+    daily_process_sources: str = "腾讯,新浪",
 ) -> Dict[str, Any]:
     python_bin = resolve_python(python)
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TQDM_DISABLE", "1")
-    env.setdefault("STOCK_THREAD_COUNT", "6")
+    env.setdefault("STOCK_THREAD_COUNT", "16")
+    env["STOCK_DAILY_PROCESS_WORKERS"] = str(max(daily_process_workers, 0))
+    env["STOCK_DAILY_PROCESS_SOURCES"] = daily_process_sources
+    env["STOCK_DAILY_FALLBACK_PROCESS_WORKERS"] = env["STOCK_DAILY_PROCESS_WORKERS"]
+    env["STOCK_DAILY_FALLBACK_PROCESS_SOURCES"] = env["STOCK_DAILY_PROCESS_SOURCES"]
     if no_proxy:
         # 数据源均为境内接口，绕过本地代理直连；NO_PROXY=* 同时屏蔽系统代理
         for var in ("http_proxy", "https_proxy", "all_proxy",
@@ -429,12 +451,24 @@ def main() -> None:
     parser.add_argument("--strict", action="store_true")
     parser.add_argument("--timeout", type=int, default=1800, help="per-step timeout seconds, 0=disabled")
     parser.add_argument("--python", default=None, help="python executable used for crawler subprocesses")
-    parser.add_argument("--index-workers", type=int, default=20)
+    parser.add_argument("--index-workers", type=int, default=40)
     parser.add_argument("--index-limit", type=int, default=0)
     parser.add_argument("--capital-days", type=int, default=14)
     parser.add_argument("--capital-top-yyb", type=int, default=30)
     parser.add_argument("--capital-min-followers", type=int, default=1)
     parser.add_argument("--capital-score-top", type=int, default=100)
+    parser.add_argument("--daily-process-workers", type=int,
+                        default=env_int(("STOCK_DAILY_PROCESS_WORKERS",
+                                         "STOCK_DAILY_FALLBACK_PROCESS_WORKERS"), 32),
+                        help="日线源进程池大小；<=1 表示关闭，默认 32")
+    parser.add_argument("--daily-process-sources",
+                        default=env_text(("STOCK_DAILY_PROCESS_SOURCES",
+                                          "STOCK_DAILY_FALLBACK_PROCESS_SOURCES"), "腾讯,新浪"),
+                        help="需要进程池隔离的日线源，逗号分隔，默认 腾讯,新浪")
+    parser.add_argument("--fallback-process-workers", dest="daily_process_workers", type=int,
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--fallback-process-sources", dest="daily_process_sources",
+                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     parser.add_argument("--no-proxy", action="store_true",
                         help="绕过系统代理直连境内数据源（东财/腾讯/新浪/百度）")
     args = parser.parse_args()
@@ -451,6 +485,8 @@ def main() -> None:
         capital_min_followers=args.capital_min_followers,
         capital_score_top=args.capital_score_top,
         no_proxy=args.no_proxy,
+        daily_process_workers=args.daily_process_workers,
+        daily_process_sources=args.daily_process_sources,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

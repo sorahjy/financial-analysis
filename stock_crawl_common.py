@@ -8,18 +8,20 @@ JSON 读写、按日期合并，以及 CN_{code}_{name}.json 的路径/查找/�
 注意语义差异（故意保留，各调用方依赖）：
   - safe_float: NaN/inf → None（财报/估值留空）。
   - safe_num: None/NaN/非数字 → 0.0（短线资金与雷达填零）。
-  - retry_fetch: 末次失败 raise + 指数退避。
-  - retry_fetch_or_none: 末次失败返回 None + 短退避抖动。
+  - retry_fetch: 末次失败 raise。
+  - retry_fetch_or_none: 末次失败返回 None。
 """
 
+import atexit
 import json
 import math
+import multiprocessing
 import os
-import random
 import re
 import statistics
 import threading
-import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timedelta
 from pathlib import Path
 
@@ -120,26 +122,23 @@ def safe_num(val, default=0.0):
 
 
 def retry_fetch(func, *args, retries=MAX_RETRIES, **kwargs):
-    """带指数退避的数据获取；末次失败抛出异常（应对连接不稳定）。"""
+    """重试数据获取；末次失败抛出异常（应对连接不稳定）。"""
     for attempt in range(retries):
         try:
             return func(*args, **kwargs)
         except Exception:
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt + 1)
-            else:
+            if attempt == retries - 1:
                 raise
 
 
 def retry_fetch_or_none(func, *args, retries=MAX_RETRIES, **kwargs):
-    """带短退避抖动的数据获取；末次失败返回 None，适合非关键行情补充。"""
+    """重试数据获取；末次失败返回 None，适合非关键行情补充。"""
     for attempt in range(retries):
         try:
             return func(*args, **kwargs)
         except Exception:
             if attempt == retries - 1:
                 return None
-            time.sleep(0.5 * (attempt + 1) + random.uniform(0, 0.5))
     return None
 
 
@@ -514,10 +513,12 @@ DAILY_QFQ_SOURCES = (
     ("新浪", _fetch_daily_sina_qfq),
 )
 _DAILY_QFQ_SOURCE_MAP = {source: fetcher for source, fetcher in DAILY_QFQ_SOURCES}
+DAILY_QFQ_PRIORITY = [["新浪", "腾讯"], ["东财"]]
 
 _DAILY_SOURCE_LOCK = threading.Lock()
 _DAILY_SOURCE_FAILURES = {source: 0 for source, _ in DAILY_QFQ_SOURCES}
 _DAILY_SOURCE_DISABLED = set()
+_DAILY_PRIORITY_CURSORS = {}
 try:
     _DAILY_SOURCE_DISABLE_AFTER = max(
         1,
@@ -526,17 +527,67 @@ try:
 except ValueError:
     _DAILY_SOURCE_DISABLE_AFTER = 6
 
+def _env_text(names, default):
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
 
-def _enabled_daily_sources(include_trading_value=False):
+
+try:
+    _DAILY_PROCESS_WORKERS = max(
+        0,
+        int(
+            _env_text(
+                ("STOCK_DAILY_PROCESS_WORKERS", "STOCK_DAILY_FALLBACK_PROCESS_WORKERS"),
+                "32",
+            )
+        ),
+    )
+except ValueError:
+    _DAILY_PROCESS_WORKERS = 32
+
+_DAILY_PROCESS_SOURCES = {
+    item.strip()
+    for item in _env_text(
+        ("STOCK_DAILY_PROCESS_SOURCES", "STOCK_DAILY_FALLBACK_PROCESS_SOURCES"),
+        "腾讯,新浪",
+    ).split(",")
+    if item.strip()
+}
+_DAILY_PROCESS_POOL = None
+_DAILY_PROCESS_POOL_LOCK = threading.Lock()
+
+
+def _enabled_daily_source_groups(include_trading_value=False):
     with _DAILY_SOURCE_LOCK:
         disabled = set(_DAILY_SOURCE_DISABLED)
-    preferred = ("东财", "腾讯", "新浪")
-    active = [
+    active_groups = []
+    for group in DAILY_QFQ_PRIORITY:
+        active = tuple(source for source in group if source not in disabled)
+        if active:
+            active_groups.append(active)
+    return active_groups or [tuple(group) for group in DAILY_QFQ_PRIORITY]
+
+
+def _enabled_daily_sources(include_trading_value=False):
+    return [
         (source, _DAILY_QFQ_SOURCE_MAP[source])
-        for source in preferred
-        if source not in disabled
+        for group in _enabled_daily_source_groups(include_trading_value=include_trading_value)
+        for source in group
     ]
-    return active or list(DAILY_QFQ_SOURCES)
+
+
+def _ordered_daily_group_sources(group):
+    group = tuple(group)
+    if len(group) <= 1:
+        return group
+    with _DAILY_SOURCE_LOCK:
+        cursor = _DAILY_PRIORITY_CURSORS.get(group, 0)
+        _DAILY_PRIORITY_CURSORS[group] = cursor + 1
+    start = cursor % len(group)
+    return group[start:] + group[:start]
 
 
 def _record_daily_source_success(source):
@@ -554,27 +605,110 @@ def _record_daily_source_failure(source):
     return False
 
 
+def _daily_source_uses_process(source):
+    return (
+        _DAILY_PROCESS_WORKERS > 1
+        and source in _DAILY_PROCESS_SOURCES
+        and multiprocessing.current_process().name == "MainProcess"
+    )
+
+
+def _daily_process_start_method():
+    method = _env_text(
+        ("STOCK_DAILY_PROCESS_START_METHOD", "STOCK_DAILY_FALLBACK_PROCESS_START_METHOD"),
+        "spawn",
+    ).strip()
+    methods = multiprocessing.get_all_start_methods()
+    if method in methods:
+        return method
+    return "spawn" if "spawn" in methods else methods[0]
+
+
+def _get_daily_process_pool():
+    global _DAILY_PROCESS_POOL
+    with _DAILY_PROCESS_POOL_LOCK:
+        if _DAILY_PROCESS_POOL is None:
+            ctx = multiprocessing.get_context(_daily_process_start_method())
+            _DAILY_PROCESS_POOL = ProcessPoolExecutor(
+                max_workers=_DAILY_PROCESS_WORKERS,
+                mp_context=ctx,
+            )
+        return _DAILY_PROCESS_POOL
+
+
+def _reset_daily_process_pool():
+    global _DAILY_PROCESS_POOL
+    with _DAILY_PROCESS_POOL_LOCK:
+        pool = _DAILY_PROCESS_POOL
+        _DAILY_PROCESS_POOL = None
+    if pool is not None:
+        pool.shutdown(wait=False, cancel_futures=True)
+
+
+def _shutdown_daily_process_pool():
+    _reset_daily_process_pool()
+
+
+atexit.register(_shutdown_daily_process_pool)
+
+
+def _fetch_daily_source_worker(source, symbol, start_date, end_date, include_trading_value):
+    fetcher = _DAILY_QFQ_SOURCE_MAP[source]
+    return fetcher(
+        symbol,
+        start_date,
+        end_date,
+        include_trading_value=include_trading_value,
+    )
+
+
+def _fetch_daily_source(source, symbol, start_date, end_date, include_trading_value=False):
+    if not _daily_source_uses_process(source):
+        return _fetch_daily_source_worker(
+            source,
+            symbol,
+            start_date,
+            end_date,
+            include_trading_value,
+        )
+    pool = _get_daily_process_pool()
+    try:
+        return pool.submit(
+            _fetch_daily_source_worker,
+            source,
+            symbol,
+            start_date,
+            end_date,
+            include_trading_value,
+        ).result()
+    except BrokenProcessPool:
+        _reset_daily_process_pool()
+        raise
+
+
 def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=False, warn=None):
     """A 股前复权日线，change_pct 统一为 close-to-close 日涨跌幅。"""
     last_err = None
-    for source, fetcher in _enabled_daily_sources(include_trading_value=include_trading_value):
-        try:
-            records = retry_fetch(
-                fetcher,
-                symbol,
-                start_date,
-                end_date,
-                include_trading_value=include_trading_value,
-            )
-            _record_daily_source_success(source)
-            return records
-        except Exception as exc:
-            last_err = exc
-            disabled_now = _record_daily_source_failure(source)
-            if warn:
-                warn(f"{symbol} {source}行情失败({exc})，切换下一数据源")
-                if disabled_now:
-                    warn(f"{source}行情连续失败，当前进程后续请求将先跳过该源")
+    for group in _enabled_daily_source_groups(include_trading_value=include_trading_value):
+        for source in _ordered_daily_group_sources(group):
+            try:
+                records = retry_fetch(
+                    _fetch_daily_source,
+                    source,
+                    symbol,
+                    start_date,
+                    end_date,
+                    include_trading_value=include_trading_value,
+                )
+                _record_daily_source_success(source)
+                return records
+            except Exception as exc:
+                last_err = exc
+                disabled_now = _record_daily_source_failure(source)
+                if warn:
+                    warn(f"{symbol} {source}行情失败({exc})，切换下一数据源")
+                    if disabled_now:
+                        warn(f"{source}行情连续失败，当前进程后续请求将先跳过该源")
     raise last_err
 
 

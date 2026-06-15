@@ -4,6 +4,10 @@ import html
 import warnings
 from datetime import datetime
 from funds import get_funds, get_funds_bond
+from fund_storage import (
+    connect as connect_fund_db,
+    load_profile_snapshots,
+)
 
 
 PERIOD_KEYS = [
@@ -117,7 +121,7 @@ def compute_excess_table(fund_list, compare_index, tmp_data, highlight_red, high
     rows = []
     for item in fund_list:
         if item not in tmp_data:
-            warnings.warn(f'{item}: temp.json 中缺少该基金，报告数据中以 -- 占位', RuntimeWarning)
+            warnings.warn(f'{item}: SQLite 基金概况快照中缺少该基金，报告数据中以 -- 占位', RuntimeWarning)
             rows.append({
                 'code': item,
                 'name': MISSING_VALUE,
@@ -251,16 +255,19 @@ def write_report_data(tmp_data, equity_config, bond_config, change_manager, sign
     return output_path, payload
 
 
+def load_profile_items():
+    conn = connect_fund_db()
+    try:
+        return load_profile_snapshots(conn)
+    finally:
+        conn.close()
+
+
 if __name__ == '__main__':
     tmp_data = {}
-    with open('data/temp.json', encoding='utf8') as file:
-        for line in file:
-            line = line.strip()
-            if not line:
-                continue
-            data = json.loads(line)
-            item = process_item(data)
-            tmp_data[item[0]] = item
+    for data in load_profile_items().values():
+        item = process_item(data)
+        tmp_data[item[0]] = item
 
     equity_config = get_funds()
     bond_config = get_funds_bond()

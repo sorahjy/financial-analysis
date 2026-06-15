@@ -16,6 +16,8 @@ import json
 import os
 import unicodedata
 
+from fund_storage import connect as connect_fund_db, load_profile_snapshots
+
 # ============================================================
 # 回测参数
 # ============================================================
@@ -151,22 +153,13 @@ def backtest_fund(sig):
 
 
 def load_fund_names():
-    """从 data/temp.json (JSONL) 加载基金名称映射 {code: name}。"""
-    names = {}
-    path = os.path.join('data', 'temp.json')
-    if not os.path.exists(path):
-        return names
-    with open(path, encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-                names[obj['fundCode']] = obj.get('name', '')
-            except (json.JSONDecodeError, KeyError):
-                continue
-    return names
+    """从 SQLite 基金概况快照加载基金名称映射 {code: name}。"""
+    conn = connect_fund_db()
+    try:
+        profiles = load_profile_snapshots(conn)
+    finally:
+        conn.close()
+    return {code: item.get('name', '') for code, item in profiles.items()}
 
 
 def main():
