@@ -26,6 +26,7 @@ from pathlib import Path
 import akshare as ak
 
 MAX_RETRIES = 3
+_PRINT_LOCK = threading.Lock()
 
 HISTORY_DAILY_FIELD_ALIASES = {
     "daily_open": ("daily_open", "open"),
@@ -88,6 +89,12 @@ def strip_proxy_env():
         os.environ.pop(var, None)
     os.environ["NO_PROXY"] = "*"
     os.environ["no_proxy"] = "*"
+
+
+def safe_print(*args, **kwargs):
+    """Thread-safe print used by concurrent crawlers."""
+    with _PRINT_LOCK:
+        print(*args, **kwargs)
 
 
 def safe_float(val):

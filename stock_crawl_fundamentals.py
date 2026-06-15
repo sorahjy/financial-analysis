@@ -32,6 +32,7 @@ import pandas as pd
 
 from stock_crawl_common import (
     strip_proxy_env,
+    safe_print,
     safe_float as _safe_float,
     retry_fetch as _retry_fetch,
     is_bse_stock,

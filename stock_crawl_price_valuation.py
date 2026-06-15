@@ -28,6 +28,7 @@ import akshare as ak
 
 from stock_crawl_common import (
     strip_proxy_env,
+    safe_print,
     safe_float as _safe_float,
     retry_fetch as _retry_fetch,
     fetch_index_constituents,
@@ -71,13 +72,6 @@ THREAD_COUNT = _env_int("STOCK_THREAD_COUNT", DEFAULT_THREAD_COUNT, maximum=20)
 
 
 strip_proxy_env()
-
-_print_lock = threading.Lock()
-
-
-def safe_print(*args, **kwargs):
-    with _print_lock:
-        print(*args, **kwargs)
 
 
 # ─── 中证800成分股 ────────────────────────────────────────────

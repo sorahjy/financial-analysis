@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.2
+当前版本：v3.1.2.post1
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -254,7 +254,6 @@ python industry_cycle_extractor.py
 ├── fund_*.py                     # 基金数据、技术分析、回测和报告生成
 ├── funds.py                      # 基金列表和基准配置
 ├── stock_advanced_strategies.py   # A 股长线/短线策略引擎
-├── stock_strategy_dashboard.py    # 兼容旧命令的启动壳，委托给 run.py
 ├── stock_strategy_optimizer.py    # 参数搜索和代理回测
 ├── stock_data_refresh.py          # 股票数据刷新编排
 ├── stock_crawl_common.py          # 股票爬虫公共文件、JSON、历史行情和日线统计工具
@@ -336,6 +335,9 @@ python industry_cycle_extractor.py
 
 #### Update v3.1.2  2026.6.15
 重构 A 股数据刷新与策略缓存链路：`data/stock_data/CN_*.json` 统一承载个股基本面、历史行情、估值和日线统计，清理旧 `CN_stock` 依赖；`stock_crawl_common.py` 下沉 JSON 文件工具、历史行情合并、日线统计和快照清洗逻辑，减少多个 `stock_crawl_*` 爬虫重复实现；`stock_data_refresh.py` 的刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成 `data/stock_advanced_strategy_results.json` 和 `data/stock_strategy_candidate_cache.json`，Flask 启动时不再预热或加载上次策略结果；A 股策略台打开后直接基于候选池缓存运行策略，刷新日志和刷新确认保留，因子权重、最低分、输出数量调整时复用候选池快速重打分，避免页面卡死；短线策略移除爬虫阶段的二次评分依赖，改由策略层统一按龙虎榜/游资原始信号打分；`stock_hot_money_radar.py` 同步适配新的 OHLCV 与 `daily.stats` 数据结构；新增 `industry_cycle_extractor.py` 行业指数周期位置能力骨架，为后续宽基、行业、大宗商品、聪明资金行为和景气度模型预留接口；补充相关单元测试和 README 文件结构、命令、输出文件说明。
+
+#### Update v3.1.2.post1  2026.6.15
+修复 `stock_data_refresh.py` 运行过程中触发行情 fallback 时可能遇到的 `safe_print` 未定义问题：将线程安全打印函数下沉到 `stock_crawl_common.py`，`stock_crawl_fundamentals.py` 与 `stock_crawl_price_valuation.py` 统一复用；删除已经失效的 `stock_strategy_dashboard.py` 旧兼容入口，A 股策略台统一通过 `python run.py --port 8765` 启动。
 
 ## 12. Acknowledgment
 
