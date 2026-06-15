@@ -1,10 +1,7 @@
 import unittest
-import json
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
 
-from fund_backtest import backtest_fund
 from fund_generate_output import esc, parse_percent
 from fund_technical_analysis import analyze_fund, calc_percentile
 from fund_storage import (
@@ -336,28 +333,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         expected_penalty = (LONG_SOFT_TARGET_FOLDS - len(sparse_pairs)) * LONG_FOLD_COUNT_PENALTY
         self.assertEqual(sparse_detail["fold_count_penalty"], round(expected_penalty, 5))
         self.assertEqual(full_detail["fold_count_penalty"], 0)
-
-
-class FundBacktestTest(unittest.TestCase):
-    def test_buy_signal_adds_capital_and_computes_excess_return(self):
-        sig = {
-            "recent_navs": [1.0, 1.0, 2.0],
-            "recent_dates": ["2026-01-01", "2026-01-02", "2026-01-03"],
-            "buy_markers": [(1, 1.0)],
-            "sell_markers": [],
-            "force_sell_markers": [],
-        }
-
-        with patch("fund_backtest.INIT_CAPITAL", 100), \
-             patch("fund_backtest.TRADE_AMOUNT", 50), \
-             patch("fund_backtest.MAX_CAPITAL", 150), \
-             patch("fund_backtest.MIN_CAPITAL", 0):
-            result = backtest_fund(sig)
-
-        self.assertEqual(result["buy_count"], 1)
-        self.assertEqual(result["strategy_value"], 250.0)
-        self.assertEqual(result["benchmark_value"], 200.0)
-        self.assertEqual(result["excess_return"], 50.0)
 
 
 if __name__ == "__main__":

@@ -90,7 +90,6 @@ http://127.0.0.1:8765
 - `fund_storage.py`：基金 SQLite 核心缓存，保存历史净值、实时估算和 Scrapy 基金概况快照。
 - `fund_technical_analysis.py`：生成技术指标和买卖信号。
 - `fund_generate_output.py`：生成 `data/fund_report_data.json`（HTML 由 Flask `/fund` 页面渲染）。
-- `fund_backtest.py`：基金买卖信号的回测逻辑。
 
 ### 4.3 基金分析命令行工具
 
