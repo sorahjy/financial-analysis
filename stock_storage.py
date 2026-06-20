@@ -21,9 +21,11 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
 from stock_crawl_common import (
+    HISTORY_DAILY_OHLCV_FIELDS,
     HISTORY_PRICE_FIELDS,
     HISTORY_VALUATION_FIELDS,
     load_json_file,
+    normalize_history_records,
     safe_float,
 )
 
@@ -288,7 +290,77 @@ def save_stock(
                         _HISTORY_INSERT_SQL,
                         [_history_value_tuple(code, record) for record in records],
                     )
+                _sync_sw3_member_market_cap_from_history(conn, code)
     return code
+
+
+def upsert_history_records(
+    conn: sqlite3.Connection,
+    code: str,
+    name: str,
+    records: Sequence[Mapping[str, Any]],
+    *,
+    source: str = "stock_history_upsert",
+    price_adjust: str = "qfq",
+) -> int:
+    """只增量写入 stock_history，并保留 stock_meta 里的财报/指标等 JSON blob。
+
+    适合短线/雷达这类临时补 K 线场景：不需要构造整只股票 payload，也不能因为补日线
+    把已有 financials_json / indicators_json / dividends_json 覆盖成空。
+    """
+    code = _normalize_code(code)
+    if not code:
+        return 0
+    rows = _sorted_records(normalize_history_records(records, include_valuation=True))
+    if not rows:
+        return 0
+
+    start_date = rows[0]["date"]
+    end_date = rows[-1]["date"]
+    now = datetime.now().isoformat()
+    display_name = str(name or code)
+
+    with _WRITE_LOCK:
+        with conn:
+            existing = conn.execute(
+                "SELECT history_start_date, history_end_date FROM stock_meta WHERE code = ?",
+                (code,),
+            ).fetchone()
+            if existing:
+                old_start = _optional_text(existing["history_start_date"])
+                old_end = _optional_text(existing["history_end_date"])
+                merged_start = min([d for d in (old_start, start_date) if d])
+                merged_end = max([d for d in (old_end, end_date) if d])
+                conn.execute(
+                    """
+                    UPDATE stock_meta
+                    SET name = ?,
+                        history_refetched_at = ?,
+                        history_source = ?,
+                        history_start_date = ?,
+                        history_end_date = ?,
+                        price_adjust = ?,
+                        updated_at = CURRENT_TIMESTAMP
+                    WHERE code = ?
+                    """,
+                    (display_name, now, source, merged_start, merged_end, price_adjust, code),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO stock_meta
+                    (code, name, fetch_time, history_refetched_at, history_source,
+                     history_start_date, history_end_date, price_adjust, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    (code, display_name, now, now, source, start_date, end_date, price_adjust),
+                )
+            conn.executemany(
+                _HISTORY_INSERT_SQL,
+                [_history_value_tuple(code, row) for row in rows],
+            )
+            _sync_sw3_member_market_cap_from_history(conn, code)
+    return len(rows)
 
 
 def save_index_nav(conn: sqlite3.Connection, payload: Mapping[str, Any], *, name: Optional[str] = None) -> int:
@@ -580,14 +652,56 @@ def mark_sw3_leaders(conn: sqlite3.Connection, codes: Sequence[str]) -> int:
     return updated
 
 
+def _latest_history_market_caps(conn: sqlite3.Connection, codes: Sequence[str]) -> Dict[str, float]:
+    """取指定股票在 stock_history 中最新一条非空总市值(亿元)。"""
+    norm = sorted({_normalize_code(c) for c in codes if _normalize_code(c)})
+    out: Dict[str, float] = {}
+    for i in range(0, len(norm), 500):
+        chunk = norm[i:i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT h.code, h.market_cap
+            FROM stock_history h
+            JOIN (
+                SELECT code, MAX(date) AS date
+                FROM stock_history
+                WHERE market_cap IS NOT NULL AND code IN ({placeholders})
+                GROUP BY code
+            ) latest ON latest.code = h.code AND latest.date = h.date
+            """,
+            chunk,
+        ).fetchall()
+        for row in rows:
+            cap = safe_float(row["market_cap"])
+            if cap is not None:
+                out[row["code"]] = cap
+    return out
+
+
+def _sync_sw3_member_market_cap_from_history(conn: sqlite3.Connection, code: str) -> int:
+    """把该股票 stock_history 最新非空 market_cap 同步到 sw3_member.market_cap_yi。"""
+    norm = _normalize_code(code)
+    if not norm:
+        return 0
+    cap = _latest_history_market_caps(conn, [norm]).get(norm)
+    if cap is None:
+        return 0
+    cur = conn.execute(
+        "UPDATE sw3_member SET market_cap_yi = ? WHERE code = ?",
+        (cap, norm),
+    )
+    return cur.rowcount
+
+
 def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """当前被标记为细分龙头(is_leader=1)的成分股，含所属三级行业与最新总市值(亿元)。供主力雷达取候选池。"""
+    """当前细分龙头，市值优先取 sw3_member，缺失时用 stock_history 最新非空 market_cap 回补。"""
     rows = conn.execute(
         "SELECT m.code, m.name, m.market_cap_yi, m.segment_code, s.segment_name, s.parent_segment "
         "FROM sw3_member m LEFT JOIN sw3_segment s ON s.segment_code = m.segment_code "
         "WHERE m.is_leader = 1 ORDER BY m.segment_code, m.code"
     ).fetchall()
-    return [
+    leaders = [
         {
             "code": row["code"],
             "name": row["name"],
@@ -598,6 +712,13 @@ def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         }
         for row in rows
     ]
+    missing = [item["code"] for item in leaders if item["market_cap_yi"] is None]
+    if missing:
+        history_caps = _latest_history_market_caps(conn, missing)
+        for item in leaders:
+            if item["market_cap_yi"] is None:
+                item["market_cap_yi"] = history_caps.get(item["code"])
+    return leaders
 
 
 # ─── 读取 ──────────────────────────────────────────────────────
@@ -773,6 +894,42 @@ def stock_exists(conn: sqlite3.Connection, code: str) -> bool:
 def load_history_records(conn: sqlite3.Connection, code: str) -> List[Dict[str, Any]]:
     """只取该 code 的日线记录（daily_* + 估值列），不解析财报 blob。"""
     return _load_history_records(conn, _normalize_code(code))
+
+
+def load_recent_history_records(
+    conn: sqlite3.Connection,
+    code: str,
+    *,
+    limit: int,
+    start_date: Optional[str] = None,
+    require_ohlcv: bool = False,
+) -> List[Dict[str, Any]]:
+    """按 (code,date) 主键直接取最近 N 根日线，避免先读全历史再切片。"""
+    code = _normalize_code(code)
+    if not code or limit <= 0:
+        return []
+    where = ["code = ?"]
+    params: List[Any] = [code]
+    if start_date:
+        where.append("date >= ?")
+        params.append(str(start_date))
+    if require_ohlcv:
+        where.extend(f"{field} IS NOT NULL" for field in HISTORY_DAILY_OHLCV_FIELDS)
+    params.append(int(limit))
+    rows = conn.execute(
+        f"""
+        SELECT date, {', '.join(HISTORY_COLUMNS)}
+        FROM stock_history
+        WHERE {' AND '.join(where)}
+        ORDER BY date DESC
+        LIMIT ?
+        """,
+        params,
+    ).fetchall()
+    return [
+        {"date": row["date"], **{col: row[col] for col in HISTORY_COLUMNS}}
+        for row in reversed(rows)
+    ]
 
 
 def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:

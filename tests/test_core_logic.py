@@ -1,6 +1,8 @@
 import unittest
 import tempfile
 import sys
+import os
+import io
 from pathlib import Path
 from unittest.mock import patch
 import sqlite3
@@ -141,6 +143,188 @@ class DataRefreshMirrorTest(unittest.TestCase):
             run_steps.index("segment_leader_fundamentals"),
         )
         self.assertEqual(step_commands["segment_leader_fundamentals"][-2:], ["--segment-refresh-slice", "0"])
+
+
+class StockShortStrategyTest(unittest.TestCase):
+    def test_no_proxy_flag_sets_env_before_stripping_proxy(self):
+        import plate_crawl_history as short_strategy
+
+        with patch.dict(os.environ, {
+            "HTTP_PROXY": "http://127.0.0.1:7897",
+            "https_proxy": "http://127.0.0.1:7897",
+        }, clear=False), \
+            patch.object(short_strategy, "fetch_sw2_daily_analysis", return_value={
+                "fetched": 0,
+                "inserted": 0,
+                "updated": 0,
+                "total_records": 0,
+                "latest_trade_date": None,
+                "errors": [],
+            }) as fetch_mock, \
+            patch.object(sys, "argv", [
+                "plate_crawl_history.py",
+                "--start-date", "20260601",
+                "--end-date", "20260601",
+                "--no-proxy",
+            ]):
+            short_strategy.main()
+
+            self.assertEqual(os.environ.get("STOCK_CRAWL_NO_PROXY"), "1")
+            self.assertEqual(os.environ.get("NO_PROXY"), "*")
+            self.assertNotIn("HTTP_PROXY", os.environ)
+            self.assertNotIn("https_proxy", os.environ)
+            fetch_mock.assert_called_once()
+
+    def test_resolve_incremental_start_uses_latest_trade_date(self):
+        import plate_crawl_history as short_strategy
+
+        start = short_strategy.parse_yyyymmdd("20160101")
+        end = short_strategy.parse_yyyymmdd("20260620")
+
+        self.assertEqual(
+            short_strategy.resolve_incremental_start("2026-06-18", start, end),
+            short_strategy.parse_yyyymmdd("20260619"),
+        )
+        self.assertIsNone(
+            short_strategy.resolve_incremental_start("2026-06-20", start, end)
+        )
+
+
+class PlateStorageTest(unittest.TestCase):
+    def test_schema_has_daily_meta_comments_without_crawl_runs(self):
+        import plate_storage
+
+        conn = plate_storage.connect(":memory:")
+        try:
+            tables = {
+                row["name"]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertIn("plate_meta", tables)
+            self.assertIn("plate_daily", tables)
+            self.assertIn("plate_column_comments", tables)
+            self.assertNotIn("plate_crawl_runs", tables)
+
+            daily_cols = {
+                row["name"]
+                for row in conn.execute("PRAGMA table_info(plate_daily)")
+            }
+            comment_cols = {
+                row["column_name"]
+                for row in conn.execute(
+                    "SELECT column_name FROM plate_column_comments WHERE table_name = 'plate_daily'"
+                )
+            }
+            self.assertTrue(daily_cols <= comment_cols)
+        finally:
+            conn.close()
+
+    def test_save_sw2_daily_rows_upserts_and_refreshes_meta(self):
+        import plate_storage
+
+        conn = plate_storage.connect(":memory:")
+        try:
+            row = {
+                "swindexcode": "801125",
+                "swindexname": "白酒Ⅱ",
+                "bargaindate": "2026-06-18",
+                "closeindex": "34766.94",
+                "bargainamount": "1.97",
+                "markup": "-2.08",
+                "turnoverrate": "2.37",
+                "pe": "18.66",
+                "pb": "3.46",
+                "meanprice": "98.1",
+                "bargainsumrate": "0.54",
+                "negotiablessharesum1": "9301.09",
+                "negotiablessharesum2": "489.53",
+                "dp": "4.91",
+            }
+
+            stats = plate_storage.save_sw2_daily_rows(conn, [row])
+            self.assertEqual(stats, {"fetched": 1, "inserted": 1, "updated": 0})
+            stats = plate_storage.save_sw2_daily_rows(conn, [row])
+            self.assertEqual(stats, {"fetched": 1, "inserted": 0, "updated": 1})
+
+            daily = conn.execute("SELECT * FROM plate_daily").fetchone()
+            self.assertEqual(daily["plate_type"], "sw2")
+            self.assertEqual(daily["plate_code"], "801125")
+            self.assertEqual(daily["trade_date"], "2026-06-18")
+            self.assertEqual(daily["float_market_cap"], 9301.09)
+            self.assertIn("negotiablessharesum1", daily["raw_json"])
+
+            meta = conn.execute("SELECT * FROM plate_meta").fetchone()
+            self.assertEqual(meta["first_date"], "2026-06-18")
+            self.assertEqual(meta["last_date"], "2026-06-18")
+            self.assertEqual(meta["record_count"], 1)
+        finally:
+            conn.close()
+
+
+class HotMoneyPatternsPrintTest(unittest.TestCase):
+    def test_table_uses_chinese_headers_and_renders_cjk(self):
+        import stock_hot_money_patterns as patterns
+
+        rows = [{
+            "code": "600826",
+            "name": "兰生股份",
+            "pattern_stage": "ambush",
+            "opportunity_score": 65.6,
+            "ambush_score": 79,
+            "ignite_score": 49,
+            "relay_score": 35,
+            "distribution_score": 0,
+            "market_cap_yi": 75,
+            "trading_theme": "工程咨询服务Ⅱ",
+            "evidence": ["价格处于中低位", "低位筹码集中"],
+        }]
+        buffer = io.StringIO()
+        patterns._console(file=buffer, width=220).print(patterns.build_pattern_table(rows, 1))
+        text = buffer.getvalue()
+
+        self.assertIn("排名", text)
+        self.assertIn("机会", text)
+        self.assertIn("依据", text)
+        self.assertIn("工程咨询服务Ⅱ", text)
+        self.assertIn("潜伏", text)
+        self.assertNotIn("rank", text)
+
+
+class ThemeCandidatesPrintTest(unittest.TestCase):
+    def test_stock_table_uses_chinese_headers_and_renders_cjk(self):
+        import stock_theme_candidates as theme
+
+        rows = [{
+            "code": "603303",
+            "name": "得邦照明",
+            "score": 88.1,
+            "stage": "启动/加速",
+            "climax_risk": "低",
+            "trading_theme": "光学光电子",
+            "static_sw2": "照明设备Ⅱ",
+            "market_cap_yi": 147.7,
+            "ret_corr": 0.48,
+            "turnover_corr": 0.60,
+            "relative_20d": 29.0,
+            "relative_60d": 91.9,
+            "stock_ret_20d": 41.8,
+            "stock_ret_60d": 123.5,
+            "latest_turnover": 1.76,
+            "turn_percentile": 97,
+            "activation_score": 98.5,
+            "latest_date": "2026-06-18",
+        }]
+        buffer = io.StringIO()
+        theme._console(file=buffer, width=240).print(theme.build_stock_table(rows))
+        text = buffer.getvalue()
+
+        self.assertIn("排名", text)
+        self.assertIn("交易题材", text)
+        self.assertIn("静态二级", text)
+        self.assertIn("照明设备Ⅱ", text)
+        self.assertNotIn("rank", text)
 
 
 class SegmentLeaderStorageConnectionTest(unittest.TestCase):
@@ -361,6 +545,44 @@ class StockFilePathTest(unittest.TestCase):
                 self.assertEqual(row["daily_volume"], 100)
                 self.assertEqual(row["daily_amount"], 1050)
                 self.assertEqual(row["market_cap"], 1234)
+            finally:
+                ss._thread_local.conns = {}
+                conn.close()
+
+    def test_save_stock_file_syncs_latest_market_cap_to_sw3_member(self):
+        import stock_storage as ss
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = ss.connect(Path(tmp) / "stock.sqlite3")
+            ss._thread_local.conns = {str(ss.DEFAULT_DB_FILE): conn}
+            try:
+                ss.save_sw3_membership(conn, {
+                    "segments": [{
+                        "segment_code": "850111.SI",
+                        "segment_name": "种子",
+                        "parent_segment": "种植业",
+                        "members": [{"code": "000001", "name": "平安银行", "market_cap_yi": None}],
+                    }],
+                })
+
+                save_stock_file("000001", "平安银行", {"records": [
+                    {
+                        "date": "2026-01-01", "open": 9.8, "high": 10.2, "low": 9.7,
+                        "close": 10.0, "volume": 1000, "market_cap": 100.0,
+                    },
+                    {
+                        "date": "2026-01-02", "open": 10.1, "high": 10.7, "low": 10.0,
+                        "close": 10.5, "volume": 1200, "market_cap": 123.4,
+                    },
+                    {
+                        "date": "2026-01-03", "open": 10.6, "high": 10.9, "low": 10.4,
+                        "close": 10.8, "volume": 1100, "market_cap": None,
+                    },
+                ]})
+
+                cap = conn.execute(
+                    "SELECT market_cap_yi FROM sw3_member WHERE code = ?", ("000001",)
+                ).fetchone()["market_cap_yi"]
+                self.assertEqual(cap, 123.4)
             finally:
                 ss._thread_local.conns = {}
                 conn.close()

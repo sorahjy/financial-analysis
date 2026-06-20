@@ -12,8 +12,6 @@
 
 import argparse
 import json
-import threading
-import time
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -24,16 +22,15 @@ import akshare as ak
 import stock_storage
 from stock_crawl_common import (
     analysis_records_from_history_records,
-    history_record_has_daily_ohlcv,
-    normalize_history_records,
+    fetch_qfq_daily_records,
+    latest_weekday_date,
     retry_fetch_or_none as _retry,
     safe_num as _num,
     strip_proxy_env,
-    symbol_with_prefix as _symbol_with_prefix,
 )
 
 KLINE_LOOKBACK = 60      # 取最近 60 个交易日（足够算 MA20 / RSI / 距高点）
-MAX_RETRIES = 3
+KLINE_FETCH_CALENDAR_DAYS = 140  # 首次补 K 线取约半年自然日，覆盖 60 个交易日和长假
 THREAD_COUNT = 6         # 不要调高：>6 易被龙虎榜/K线接口限流甚至跑挂
 DATA_DIR = Path("data/capital")
 CANDIDATES_FILE = DATA_DIR / "hot_money_candidates.json"
@@ -41,10 +38,6 @@ KNOWN_SEAT_TOP_N = 100   # 营业部排行前 N 标记为高活跃/知名席位
 
 
 strip_proxy_env()
-
-# 新浪 K 线接口底层走 mini_racer / V8 执行 JS 加密，V8 不是线程安全
-# 多线程并发会 segfault → 用全局锁串行化 JS 执行段。
-_kline_lock = threading.Lock()
 
 
 def _visual_width(s):
@@ -342,23 +335,23 @@ def _has_complete_ohlcv(records):
 def load_local_kline_records(code, name=None, *, lookback=None, start_date=None):
     """Read complete OHLCV rows from stock_data.sqlite3 (stock_history) when available."""
     conn = stock_storage.thread_conn()
-    stored = stock_storage.load_history_records(conn, str(code).zfill(6))
+    stored = stock_storage.load_recent_history_records(
+        conn,
+        str(code).zfill(6),
+        limit=lookback or KLINE_LOOKBACK,
+        start_date=start_date,
+        require_ohlcv=True,
+    )
     if not stored:
         return []
-    records = normalize_history_records(stored, include_valuation=False)
-    if start_date:
-        records = [row for row in records if row.get("date") >= start_date]
-    records = [row for row in records if history_record_has_daily_ohlcv(row)]
-    if lookback:
-        records = records[-lookback:]
-        if len(records) < lookback:
-            return []
-    analysis_records = analysis_records_from_history_records(records)
+    if lookback and len(stored) < lookback:
+        return []
+    analysis_records = analysis_records_from_history_records(stored)
     return analysis_records if _has_complete_ohlcv(analysis_records) else []
 
 
 def fetch_stock_data(code, name):
-    """拉取最近 `KLINE_LOOKBACK` 个交易日的前复权日 K 线（新浪源）。
+    """拉取最近 `KLINE_LOOKBACK` 个交易日的前复权日 K 线。
 
     Returns:
         dict | None: {code, name, records: [{date,open,high,low,close,volume,
@@ -368,30 +361,31 @@ def fetch_stock_data(code, name):
     if local_records:
         return {"code": code, "name": name, "records": local_records}
 
-    with _kline_lock:
-        df = _retry(ak.stock_zh_a_daily,
-                    symbol=_symbol_with_prefix(code), adjust="qfq")
-    if df is None or df.empty:
+    end_date = latest_weekday_date()
+    start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(
+        days=KLINE_FETCH_CALENDAR_DAYS
+    )).strftime("%Y-%m-%d")
+    fetched = _retry(
+        fetch_qfq_daily_records,
+        str(code).zfill(6),
+        start_date,
+        end_date,
+        include_trading_value=True,
+    )
+    if not fetched:
         return None
 
-    df = df.tail(KLINE_LOOKBACK).reset_index(drop=True)
-    records = []
-    prev_close = None
-    for _, row in df.iterrows():
-        close = _num(row["close"])
-        change_pct = ((close / prev_close - 1) * 100) if prev_close else 0.0
-        records.append({
-            "date":          str(row["date"])[:10],
-            "open":          _num(row["open"]),
-            "high":          _num(row["high"]),
-            "low":           _num(row["low"]),
-            "close":         close,
-            "volume":        _num(row["volume"]),
-            "amount":        _num(row["amount"]),
-            "change_pct":    round(change_pct, 4),
-            "turnover_rate": _num(row.get("turnover", 0)) * 100,
-        })
-        prev_close = close
+    conn = stock_storage.thread_conn()
+    stock_storage.upsert_history_records(
+        conn,
+        str(code).zfill(6),
+        name,
+        fetched,
+        source="stock_crawl_hot_money",
+    )
+    records = analysis_records_from_history_records(fetched)[-KLINE_LOOKBACK:]
+    if len(records) < KLINE_LOOKBACK or not _has_complete_ohlcv(records):
+        return None
     return {"code": code, "name": name, "records": records}
 
 

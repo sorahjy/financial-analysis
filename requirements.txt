@@ -9,3 +9,4 @@ akshare
 Flask
 optuna
 tqdm
+rich

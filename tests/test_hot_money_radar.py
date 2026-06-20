@@ -103,8 +103,13 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertIsNotNone(acc["sub_scores"]["divergence"])
         self.assertIsNotNone(acc["sub_scores"]["cmf"])
         self.assertIsNotNone(acc["sub_scores"]["chip"])
+        self.assertIsNotNone(acc["sub_scores"]["chip_peak_low"])
+        self.assertIsNotNone(acc["sub_scores"]["chip_price_near_peak"])
+        self.assertIsNotNone(acc["sub_scores"]["chip_winner_mid_low"])
         self.assertGreater(acc["signals"]["cmf"], 0)          # 收盘买压为正
         self.assertLess(acc["signals"]["close_pctile"], 0.6)  # 中低位
+        self.assertIsNotNone(acc["signals"]["chip_peak_pctile"])
+        self.assertIsNotNone(acc["signals"]["chip_price_to_peak"])
         self.assertGreaterEqual(by_code["600001"]["signals"]["close_pctile"], 0.9)  # 已拉升在高位
         # 封板：识别到一字封死板并打折、状态标记已启动
         self.assertEqual(by_code["600003"]["signals"]["sealed_recent"], 1)
@@ -196,6 +201,98 @@ class Sw3LeaderFlagTest(unittest.TestCase):
         self.assertEqual(stock_storage.mark_sw3_leaders(conn, ["600598"]), 1)
         self.assertEqual([l["code"] for l in stock_storage.leader_members(conn)], ["600598"])
         conn.close()
+
+    def test_leader_members_fills_missing_market_cap_from_history(self):
+        conn = stock_storage.connect(":memory:")
+        stock_storage.save_sw3_membership(conn, {
+            "segments": [{
+                "segment_code": "850111.SI", "segment_name": "种子", "parent_segment": "种植业",
+                "members": [{"code": "000998", "name": "隆平高科", "market_cap_yi": None}],
+            }],
+        })
+        stock_storage.mark_sw3_leaders(conn, ["000998"])
+        conn.executemany(
+            "INSERT INTO stock_history (code, date, market_cap) VALUES (?, ?, ?)",
+            [
+                ("000998", "2026-01-01", 111.0),
+                ("000998", "2026-01-02", 222.5),
+                ("000998", "2026-01-03", None),
+            ],
+        )
+
+        leaders = stock_storage.leader_members(conn)
+
+        self.assertEqual(leaders[0]["market_cap_yi"], 222.5)
+        conn.close()
+
+
+def _pat_bar(t, o, h, l, c, vol, prev):
+    chg = (c / prev - 1.0) * 100.0 if prev else 0.0
+    return {"date": (date(2024, 1, 1) + timedelta(days=t)).isoformat(),
+            "open": o, "high": h, "low": l, "close": c,
+            "volume": vol, "amount": c * vol, "chg": chg, "turnover": vol / 1000.0}
+
+
+class PatternMatchTest(unittest.TestCase):
+    def test_accumulation_bars_fire_buy_pattern(self):
+        # 先 16→9 阴跌 60 日，再低位横盘 9.0 共 30 日 → 应命中 P1 低位横盘磨人
+        bars = []
+        prev = 16.0
+        for t in range(90):
+            c = 16 - (16 - 9) * t / 59 if t < 60 else 9.0 + (0.04 if t % 2 else -0.04)
+            o = prev
+            bars.append(_pat_bar(t, o, max(o, c) * 1.004, min(o, c) * 0.992,
+                                 c, 1000.0 if t < 85 else 3000.0, prev))
+            prev = c
+        fired = radar.match_patterns("600000", bars)
+        self.assertTrue(any(p["phase"] == "吸筹" and p["signal"] == "buy" for p in fired),
+                        msg=f"fired={[p['code'] for p in fired]}")
+
+    def test_distribution_bars_fire_sell_pattern(self):
+        # 单边走高 8→20，最后一根高位巨量大阴（灌压出货）→ 应命中 sell 形态
+        bars = []
+        prev = 8.0
+        for t in range(89):
+            c = 8 + 12 * t / 88
+            o = prev
+            vol = 3000.0 if t >= 84 else 1000.0
+            bars.append(_pat_bar(t, o, max(o, c) * 1.005, min(o, c) * 0.995, c, vol, prev))
+            prev = c
+        o = prev
+        c = o * 0.90
+        bars.append(_pat_bar(89, o, o * 1.01, c * 0.99, c, 5000.0, prev))
+        fired = radar.match_patterns("600000", bars)
+        self.assertTrue(any(p["signal"] == "sell" for p in fired),
+                        msg=f"fired={[p['code'] for p in fired]}")
+
+    def test_patterns_mode_runs(self):
+        codes = ["600000", "600001", "600002", "600003", "600004", "600005"]
+
+        def seed(conn):
+            stock_storage.save_sw3_membership(conn, {"segments": [{
+                "segment_code": "850111.SI", "segment_name": "测试", "parent_segment": "测试",
+                "members": [{"code": c, "name": f"票{c}"} for c in codes],
+            }]})
+            stock_storage.mark_sw3_leaders(conn, codes)
+            for k, c in enumerate(codes):
+                _seed_history(conn, c, _gen_bars(k))
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "t.sqlite3"
+            out_file = Path(tmpdir) / "patterns.json"
+            conn = stock_storage.connect(db_file)
+            seed(conn)
+            conn.close()
+            with patch.object(radar, "DB_FILE", db_file), \
+                 patch.object(radar, "PATTERNS_RESULT_FILE", out_file), \
+                 patch.object(radar, "VERIFY_STEP", 5):
+                payload = radar.main(["patterns"])
+            self.assertTrue(out_file.exists())
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(len(payload["patterns"]), len(radar.PATTERNS))
+        for p in payload["patterns"]:
+            for h in radar.VERIFY_HORIZONS:
+                self.assertIn(str(h), p["horizons"])
 
 
 if __name__ == "__main__":
