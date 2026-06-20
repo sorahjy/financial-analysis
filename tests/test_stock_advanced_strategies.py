@@ -62,20 +62,19 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertGreaterEqual(len(registry["long"]), 20)
         self.assertGreaterEqual(len(registry["short"]), 20)
 
-    def test_csi300_persistence_proxy_rewards_current_member_and_age(self):
-        old_member = csi300_persistence_proxy(True, True, 12)
-        young_member = csi300_persistence_proxy(True, True, 1)
-        old_non_member = csi300_persistence_proxy(False, True, 12)
+    def test_csi300_persistence_proxy_rewards_current_member(self):
+        current_member = csi300_persistence_proxy(True, True)
+        broad_member = csi300_persistence_proxy(False, True)
+        non_member = csi300_persistence_proxy(False, False)
 
-        self.assertGreater(old_member, young_member)
-        self.assertGreater(old_member, old_non_member)
+        self.assertGreater(current_member, broad_member)
+        self.assertGreater(broad_member, non_member)
 
     def test_csi300_persistence_does_not_hard_filter_long_pool(self):
         item = {
             "name": "测试股份",
             "raw_factors": {
                 "market_cap": 500,
-                "listing_age": 8,
                 "csi300_current": 0.0,
                 "csi300_persistence": 0.0,
             },
@@ -83,7 +82,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         config = {
             "exclude_st": True,
             "min_market_cap_yi": 100,
-            "min_listing_years": 5,
             "min_csi300_persistence": 100,
             "require_csi300": False,
             "require_high_drawdown": False,
@@ -168,7 +166,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         base.update({
             "require_csi300": False,
             "min_market_cap_yi": 500,
-            "min_listing_years": 12,
             "min_high_drawdown_pct": 10,
             "min_score": 0,
             "top_n": 9999,
@@ -193,7 +190,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         base = get_default_config()["long"]
         base.update({
             "min_market_cap_yi": 500,
-            "min_listing_years": 12,
             "min_score": 0,
             "top_n": 9999,
         })
@@ -217,7 +213,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         base = get_default_config()["long"]
         base.update({
             "require_csi300": False,
-            "min_listing_years": 12,
             "min_score": 0,
             "top_n": 9999,
         })
@@ -253,10 +248,10 @@ class StockAdvancedStrategyTest(unittest.TestCase):
 
     def test_compute_long_factors_pit_uses_only_visible_reports(self):
         live = compute_long_raw_factors(
-            "X", PIT_SYNTH_STOCK, {}, False, False, 5.0, 1e10, None,
+            "X", PIT_SYNTH_STOCK, {}, False, False, 1e10, None,
         )
         pit = compute_long_raw_factors(
-            "X", PIT_SYNTH_STOCK, {}, False, False, 5.0, 1e10, None, as_of="2025-06-01",
+            "X", PIT_SYNTH_STOCK, {}, False, False, 1e10, None, as_of="2025-06-01",
         )
         # 实盘 roe_mean 用全部记录(均值20)；PIT 只看 2024 年报已可见(=10)
         self.assertAlmostEqual(live["roe_mean"], 20.0)

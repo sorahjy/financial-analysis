@@ -2,7 +2,7 @@
 
 一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.1.4
+当前版本：v3.2.0
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
 
@@ -43,9 +43,9 @@
 | --- | --- | --- |
 | 基金超额收益报告 | 对持仓基金和关注基金做跨周期超额收益比较，并提示基金经理变动 | `data/fund_report_data.json`（Flask `/fund` 页面渲染） |
 | 基金技术分析 | 结合 MA、RSI、MACD、KDJ、布林带、ADX、ATR、百分位和止盈逻辑生成买卖信号 | `data/signals.json` |
-| A 股长线策略 | 面向 2-5 年持有期，筛选质量、价值、盈利、低波、反转/动量等多因子候选 | `data/stock_advanced_strategy_results.json` |
+| A 股长线策略 | 面向 2-5 年持有期，从细分行业龙头池中筛选质量、价值、盈利、低波、反转/动量等多因子候选 | `data/stock_advanced_strategy_results.json` |
 | A 股短线策略 | 面向 1-5 个交易日，围绕龙虎榜、游资席位、机构共振、价量和风控因子选股 | 同上 |
-| 参数搜索 | 对长线/短线策略做随机搜索和代理回测，写入优化后的默认参数 | `data/stock_strategy_optimized_config.json` |
+| 参数搜索 | 对长线/短线策略做 Optuna/TPE 搜索和代理回测，写入优化后的默认参数 | `data/stock_strategy_optimized_config.json` |
 | 统一 Flask 工作台 | 在本地网页中查看基金报告、调参运行 A 股策略、保存配置、查看入选股票和关键因子 | `python run.py --port 8765`（`/`、`/fund`、`/stock`） |
 | 游资雷达 | 实验性识别盘中拉升票和盘后潜伏吸筹票，并支持命中率验证 | `data/capital/hot_money_*.json` |
 
@@ -111,9 +111,9 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 
 ### 5.1 长线大盘股策略
 
-长线策略面向 2-5 年持有期，核心目标是筛选财务质量稳定、有一定安全边际、流动性足够、估值和风险相对合理的股票。v3.1 扩展了更多学术和实务因子，包括：
+长线策略面向 2-5 年持有期，核心目标是从申万三级细分行业龙头池中筛选财务质量稳定、有一定安全边际、流动性足够、估值和风险相对合理的股票。v3.2.0 起，细分行业龙头池先按行业内规模、ROE、成长打分，再交给长线多因子模型二次筛选；其中规模口径优先使用具体市值，若该行业任一成员缺失市值，则统一回退到官方接口返回的“市值占比”。主要因子包括：
 
-- 规模与流动性：总市值、小市值弹性、成交额、行业规模地位。
+- 规模与流动性：总市值、小市值弹性、成交额、行业规模地位、细分行业龙头分。
 - 质量与盈利：ROE 稳定性、ROA、经营盈利能力、毛利资产比、现金流质量、低应计、Piotroski F 分。
 - 价值与股东回报：账面市值比、盈利收益率、现金流收益率、营收市值比、股息率、连续分红。
 - 风险与稳健性：低波动、低负债、低质押、杠杆改善、资产扩张约束。
@@ -131,15 +131,15 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 
 ### 5.3 股票数据持久化
 
-v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
+v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
 
-股票爬虫、刷新、策略、游资雷达和优化器都改为优先读写 SQLite：`stock_crawl_fundamentals.py` 只更新 meta 时不会重写历史行情，`stock_crawl_price_valuation.py` 把长历史写入 `stock_history` 并同步 ETF NAV，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_hot_money_radar.py` 回放 K 线优先读 `stock_history`，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
+股票爬虫、刷新、策略、游资雷达和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 随后只补齐龙头股票的基本面，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_hot_money_radar.py` 回放 K 线优先读 `stock_history`，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
 
 ### 5.4 参数搜索与可视化
 
-`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。组合等权收益减成本减同期 510310 沪深300ETF累计净值基准得到每折超额，折再奇偶切成训练/验证两半，选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、折数不足和验证折为负；有效折数过少的配置会出局，避免少数折的彩票式配置夺魁。
+`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.2.0 当前口径为每 30 个交易日取一个折起点、固定持有 30 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并对越接近现在的折给更高权重；选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。
 
-> 注意：受本地约 10 年日线与 510310 基准覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 300 次，通常约 3 分钟内完成。
+> 注意：受本地约 10 年日线与基准 ETF 覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 300 次，运行时间取决于本地缓存规模。
 
 Dashboard 支持：
 
@@ -178,7 +178,7 @@ python stock_advanced_strategies.py --strategy short --json
 python stock_strategy_optimizer.py --iterations 300
 ```
 
-`stock_data_refresh.py` 会在刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成最新策略结果并预构建候选池缓存。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
+`stock_data_refresh.py` 的 full 流程会先刷新细分行业龙头行情与估值，再补齐龙头股票基本面，随后刷新基准 ETF、指数成分、龙虎榜/游资候选，最后自动运行 `stock_advanced_strategies.py --persist --rebuild-cache` 生成最新策略结果并预构建候选池缓存。申万三级 membership 默认每轮滚动刷新最旧 15 个行业：legulegu 总表可用时优先使用 legulegu 成分接口，成员接口失败才回退官方；总表不可用时直接用官方数据刷新最旧 15 个。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
 
 ## 6. 游资雷达
 
@@ -245,7 +245,8 @@ python industry_cycle_extractor.py
 | `data/stock_strategy_candidate_cache.json` | A 股长线/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
 | `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数 |
-| `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
+| `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
+| `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member` 存申万三级成分和官方市值占比，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
 | `data/stock_data/CN_*.json` | 旧版个股 JSON 缓存；v3.1.4 主流程不再依赖，可通过 `stock_storage.import_stock_data_dir()` 批量导入 SQLite |
 | `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时和失败信息 |
 | `data/capital/hot_money_candidates.json` | 龙虎榜/游资候选池原始信号，短线最终分数由 `stock_advanced_strategies.py` 计算 |
@@ -267,6 +268,7 @@ python industry_cycle_extractor.py
 ├── stock_data_refresh.py          # 股票数据刷新编排
 ├── stock_crawl_common.py          # 股票爬虫公共文件、JSON、历史行情和日线统计工具
 ├── stock_storage.py               # A 股 SQLite 持久化层、schema、导入和读写工具
+├── stock_crawl_segment_leaders.py # 申万三级行业 membership 与细分行业龙头池
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
 ├── stock_hot_money_radar.py       # 游资拉升/潜伏雷达
 ├── industry_cycle_extractor.py    # 行业指数周期位置提取能力骨架
@@ -329,33 +331,34 @@ python industry_cycle_extractor.py
 修复基金爬虫阻塞请求、数据缺失静默吞错、百分位边界、股票文件名兼容与股票抓取失败可见性问题；新增核心纯函数单测。
 
 #### Update v3.0  2026.6.6
-上线 A 股长线/短线策略 v3.0：新增多因子策略引擎、龙虎榜/游资共振短线模型、T+1/T+2 回测、数据刷新编排、参数搜索和本地可视化配置台；优化股票行情爬取的代理控制、数据源回退和历史回补；补充股票策略使用文档与单元测试；同步刷新基金报告输出。
+上线 A 股长线/短线策略：引入多因子选股、龙虎榜短线模型、数据刷新、参数搜索和本地策略配置台。
 
 #### Update v3.0.1  2026.6.12
-优化基金报告链路：移除 Excel 输出和 openpyxl 依赖，报告统一输出为 `fund_report.html`；增强 `fund_run.sh` 失败即停和境内数据源直连能力；基金净值、实时估值与天天基金爬虫增加重试、原子写入和空数据保护，避免失败数据覆盖历史结果；修正回测卖出份额、基金经理规模缺失展示、实时估算累计净值计算、百分位排名和短历史基金信号评估逻辑；移除重复的股票独立说明文档；同步刷新基金报告。
+优化基金报告生成与数据抓取稳定性，修复净值、估值、回测和短历史信号中的若干边界问题。
 
 #### Update v3.1  2026.6.13
-新增实验性游资雷达，支持盘中拉升扫描、盘后潜伏吸筹扫描、命中率验证和潜伏回放；扩展长线/短线因子库，引入更多质量、价值、反转、动量、换手、Piotroski F 分、龙虎榜买方主导和流通市值归一等因子；将长线参数搜索升级为 Point-in-Time (PIT) walk-forward 回测（财报按法定披露截止日、价格/估值/分红按当时可见切片重算因子），消除前视偏差，并把财报历史加深到 10 年；Dashboard 新增后台参数搜索入口与状态查询；美化基金 HTML 报告主题、排版、表格留白和响应式滚动体验。
+新增实验性游资雷达，扩展长线/短线因子库，并将长线参数搜索升级为 PIT walk-forward 回测以降低前视偏差。
 
 #### Update v3.1.1  2026.6.13
-优化长线策略参数搜索与报告展示：510310 沪深300ETF 基准纳入股票数据刷新流程并扩展到近 12 年，长线默认输出数量固定为 10、默认搜索次数调整为 200，回测折起点间隔改为 30 个交易日，并生成每折组合走势与 510310 基准对比图；补充真实净值曲线最大回撤与基准最大回撤，`worst_fold_pct` 更名为 `worst_fold_excess_pct` 以避免与净值回撤混淆；移除“成分稳定分”硬过滤，仅保留沪深300稳定代理因子参与打分，避免与“必须当前沪深300”逻辑重叠；继续优化基金 HTML 报告的深色主题、筛选、排序和持仓过滤体验，移除强/弱超额筛选项并修复持仓筛选影响技术分析展示的问题。将基金报告与 A 股策略台统一到单一 Flask 工作台（`python run.py --port 8765`，路由 `/`、`/fund`、`/stock`），基金报告改为 `data/fund_report_data.json` 经 Flask 服务端渲染；清理迁移后的冗余——删除独立 HTML 报告链（`stock_generate_output.py` / `stock_report.html` / `stock_run.sh` / `fund_report.html`）与 `stock_crawl_top_800_data.py` 中已无消费者的回撤选股、选股回测代码（保留 510310 沪深300 ETF 基准），去重 `file_status`、合并 Flask 启动器、清理死配置，生成物 HTML 不再入库；基金净值与实时估值抓取脚本合并为单一 `fund_fetch_data.py`；新增 MIT LICENSE。
+优化长线回测展示和基准对比，统一基金报告与 A 股策略台到同一个本地工作台，并清理旧报告链路。
 
 #### Update v3.1.1.post1  2026.6.14
-优化股票部分爬虫逻辑，降低爬取时间；三个爬虫脚本更名为 `stock_crawl_hot_money` / `stock_crawl_fundamentals` / `stock_crawl_price_valuation`（原 `stock_crawl_capital` / `stock_crawl_index_all_stock_data` / `stock_crawl_top_800_data`），并抽出公共模块 `stock_crawl_common` 去除重复实现。小幅优化游资雷达逻辑，开发中。重构 Flask 页面逻辑，新增 Live2D 小组件。
+优化股票爬虫速度和复用结构，小幅调整游资雷达与 Flask 页面体验。
 
 #### Update v3.1.2  2026.6.15
-重构 A 股数据刷新与策略缓存链路：`data/stock_data/CN_*.json` 统一承载个股基本面、历史行情、估值和日线统计，清理旧 `CN_stock` 依赖；`stock_crawl_common.py` 下沉 JSON 文件工具、历史行情合并、日线统计和快照清洗逻辑，减少多个 `stock_crawl_*` 爬虫重复实现；`stock_data_refresh.py` 的刷新流程末尾自动运行 `stock_advanced_strategies.py --persist --rebuild-cache`，生成 `data/stock_advanced_strategy_results.json` 和 `data/stock_strategy_candidate_cache.json`，Flask 启动时不再预热或加载上次策略结果；A 股策略台打开后直接基于候选池缓存运行策略，刷新日志和刷新确认保留，因子权重、最低分、输出数量调整时复用候选池快速重打分，避免页面卡死；短线策略移除爬虫阶段的二次评分依赖，改由策略层统一按龙虎榜/游资原始信号打分；`stock_hot_money_radar.py` 同步适配新的 OHLCV 与 `daily.stats` 数据结构；新增 `industry_cycle_extractor.py` 行业指数周期位置能力骨架，为后续宽基、行业、大宗商品、聪明资金行为和景气度模型预留接口；补充相关单元测试和 README 文件结构、命令、输出文件说明。
+重构 A 股刷新与策略缓存链路，让 Dashboard 复用候选池快速重打分，并为行业周期特征预留能力骨架。
 
 #### Update v3.1.2.post1  2026.6.15
-修复 `stock_data_refresh.py` 运行过程中触发行情 fallback 时可能遇到的 `safe_print` 未定义问题：将线程安全打印函数下沉到 `stock_crawl_common.py`，`stock_crawl_fundamentals.py` 与 `stock_crawl_price_valuation.py` 统一复用；删除已经失效的 `stock_strategy_dashboard.py` 旧兼容入口，A 股策略台统一通过 `python run.py --port 8765` 启动。
+修复股票刷新 fallback 的打印问题，并移除旧策略台入口，统一从本地工作台启动。
 
 #### Update v3.1.3  2026.6.15
-基金核心缓存迁移到 `data/fund_data.sqlite3`：新增 `fund_storage.py` 管理 SQLite schema、历史净值、实时估算和 Scrapy 基金概况快照，`fund_fetch_data.py`、`fund_technical_analysis.py`、`fund_generate_output.py`、`fund_backtest.py` 与天天基金 Scrapy pipeline 统一改读写 SQLite，替代旧的 `nav_store.json`、`nav_history.json`、`realtime_estimate.json` 和 `temp.json` 文件链路；补充 SQLite 存储单测，保证净值、实时估算和基金概况快照可往返读写。股票数据刷新同步提速：日线源支持进程池隔离腾讯/新浪 fallback，基础面爬取并发财报/指标阶段并输出阶段耗时，刷新默认股票线程数和指数 workers 上调，并保留兼容的 fallback CLI 参数。
+基金核心缓存迁移到 SQLite；股票数据刷新同步提速，增强行情 fallback、并发抓取和阶段耗时输出。
 
 #### Update v3.1.4  2026.6.15
-A 股主数据读写迁移到 SQLite：新增 `stock_storage.py` 和 `data/stock_data.sqlite3`，用 `stock_meta` 保存个股级财报/指标/分红/日线统计/质押等 JSON blob，用 `stock_history` 保存按 `(code, date)` 正规化的长历史 OHLCV 与估值序列，用 `index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV；股票代码成为稳定主键，股票改名不再影响缓存命中，并保留 `stock_storage.import_stock_data_dir()` 将旧 `data/stock_data/CN_*.json` 批量导入 SQLite。`stock_crawl_fundamentals.py`、`stock_crawl_price_valuation.py`、`stock_crawl_hot_money.py`、`stock_data_refresh.py`、`stock_sorahjy_index.py`、`stock_advanced_strategies.py`、`stock_hot_money_radar.py` 和 `stock_strategy_optimizer.py` 均已适配新的读写路径，策略候选池缓存改用 DB signature 失效，刷新健康检查和 fallback 也改为面向 SQLite 表。
+A 股主数据迁移到 SQLite，股票代码成为稳定主键；长线搜索升级为 300 次 Optuna/TPE，游资雷达改为吸筹分/拉升分双分制。
 
-优化长线参数搜索：默认搜索次数从 200 提升到 300，Flask 股票策略台后台命令同步改为 `python -B stock_strategy_optimizer.py --iterations 300`，页面确认弹窗与运行遮罩提示调整为约 3 分钟；CLI 增加 `tqdm` 进度条，引入 Optuna/TPE 搜索、折数不足/验证折为负/高回撤惩罚和更宽的高回撤阈值候选，基准优先读取 SQLite `index_nav`。游资雷达升级为吸筹分/拉升分双分制，默认扫描和 `--ambush` 都输出阶段判断与操作建议，历史 K 线优先读取 `stock_history`。Flask 启动时增加股票缓存异步预热，基金 `/fund` 页面修复已有任务重新进入后不继续轮询日志、运行中误显示空闲的问题。补充 SQLite 股票存储、优化器惩罚、Flask 基金轮询和 300 次/3 分钟提示相关单元测试。
+#### Update v3.2.0  2026.6.20
+长线候选改为细分行业龙头池优先，龙头分简化为规模/ROE/成长，缺市值时用官方市值占比兜底。刷新链路先补龙头行情再补龙头基本面；优化器改为 30 日持有/30 日折间隔、混合宽基基准，并搜索高点回撤过滤开关与 40%-70% 阈值范围。
 
 ## 12. Acknowledgment
 

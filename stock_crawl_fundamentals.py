@@ -1,8 +1,8 @@
 """
-爬取三指数候选池全部股票数据
+爬取股票基本面与近端日线数据
 
 两种模式:
-  --mode full    全量爬取: 中证全指+全A股合并 → 逐只爬取详细数据
+  --mode full    全量爬取: 细分行业龙头池(segment leader) → 逐只爬取详细数据
   --mode staged  分步粗筛(默认): 先获取全市场快照做粗筛, 再只爬通过粗筛的股票
 
 爬取内容（数据获取底层函数见本文件「单股数据获取」段，原 stock_fetch_data.py 已并入）：
@@ -57,6 +57,25 @@ FINANCIAL_YEARS = 10
 FINANCIAL_QUARTERS = FINANCIAL_YEARS * 4
 STAGE_TIMING_REPORT_EVERY = 100
 STAGE_TIMING_ORDER = ("daily", "financials", "indicators", "dividends", "save", "total")
+# full 模式的跳过条件要按“已回补较长日线”判断，避免一年短日线被误判为完整。
+MIN_COMPLETE_DAILY_ROWS = 200
+DAILY_FRESH_MAX_GAP_DAYS = 20
+
+
+def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw is not None and str(raw).strip() != "" else default
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        value = max(minimum, value)
+    if maximum is not None:
+        value = min(maximum, value)
+    return value
+
+
+SEGMENT_REFRESH_SLICE = _env_int("STOCK_SEGMENT_REFRESH_SLICE", 15, minimum=0, maximum=336)
 
 
 # 科技主题行业关键词（中证二级/三级行业），用于科技100指数筛选科技行业股票
@@ -124,23 +143,15 @@ def fetch_daily_price(symbol, years=1):
 
 
 def fetch_financial_reports(stock_code):
-    """获取三大财务报表（利润表、资产负债表、现金流量表）"""
+    """获取三大财务报表（利润表、资产负债表、现金流量表）。
+
+    顺序拉取——上层已有 stock 级线程池并行，单只内部不再嵌套子线程池(避免线程爆炸)。
+    """
     result = {}
 
-    with ThreadPoolExecutor(max_workers=3) as pool:
-        income_future = pool.submit(
-            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="利润表"
-        )
-        balance_future = pool.submit(
-            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="资产负债表"
-        )
-        cashflow_future = pool.submit(
-            _retry_fetch, ak.stock_financial_report_sina, stock=stock_code, symbol="现金流量表"
-        )
-
-        df_income = income_future.result()
-        df_balance = balance_future.result()
-        df_cashflow = cashflow_future.result()
+    df_income = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="利润表")
+    df_balance = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="资产负债表")
+    df_cashflow = _retry_fetch(ak.stock_financial_report_sina, stock=stock_code, symbol="现金流量表")
 
     income_cols = {
         "revenue": ["营业总收入", "营业收入"],  # 银行股用"营业收入"
@@ -320,13 +331,12 @@ def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
         symbol, name, history_records, "stock_crawl_fundamentals.daily"
     )
 
-    with ThreadPoolExecutor(max_workers=2) as pool:
-        financials_future = pool.submit(_timed_call, "financials", fetch_financial_reports, symbol)
-        indicators_future = pool.submit(_timed_call, "indicators", fetch_financial_indicators, symbol)
-        data["financials"] = financials_future.result()
-        data["indicators"] = indicators_future.result()
-
+    # 顺序拉取——上层已有 stock 级线程池并行，单只内部不再开子线程池
+    data["financials"] = _timed_call("financials", fetch_financial_reports, symbol)
+    data["indicators"] = _timed_call("indicators", fetch_financial_indicators, symbol)
     data["dividends"] = _timed_call("dividends", fetch_dividend_history, symbol)
+    data["daily_refetched_at"] = datetime.now().isoformat()
+    data["financials_refetched_at"] = datetime.now().isoformat()
 
     data["pledge"] = pledge_map.get(symbol, {
         "pledge_ratio": None, "pledge_count": None,
@@ -336,14 +346,142 @@ def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
     return data
 
 
+# ─── 财报增量刷新（龙头池：检测=yjbb 公告日，仅对新报告/超期的票逐只爬）─────
+
+FUNDAMENTALS_EXPIRE_DAYS = 90  # 兜底：超过该天数未刷强制刷一次(yjbb 出新报告会更早触发)
+
+
+def fetch_fundamentals(symbol, pledge_info=None):
+    """只爬财报相关(financials/indicators/dividends + 可选 pledge)，不含日线。
+
+    供 stock_crawl_price_valuation 的龙头池 per-stock 爬取嵌入调用：日线/估值它自己有，
+    这里只补财务三表/指标/分红，并盖上 financials_refetched_at 作新鲜度时间戳。
+    """
+    out = {
+        "financials": fetch_financial_reports(symbol),
+        "indicators": fetch_financial_indicators(symbol),
+        "dividends": fetch_dividend_history(symbol),
+        "financials_refetched_at": datetime.now().isoformat(),
+    }
+    if pledge_info is not None:
+        out["pledge"] = pledge_info
+    return out
+
+
+def _recent_report_periods(today=None, count=1):
+    """最近 count 个'法定披露截止日已过'的报告期(YYYYMMDD)，最新在前。
+
+    报告期→截止日：Q1(0331)→0430，半年(0630)→0831，三季(0930)→1031，年报(1231)→次年0430。
+    """
+    today = today or datetime.now().date()
+    quarters = (("0331", "0430", 0), ("0630", "0831", 0),
+                ("0930", "1031", 0), ("1231", "0430", 1))
+    passed = []
+    for year in (today.year, today.year - 1):
+        for mmdd, dl_mmdd, dl_off in quarters:
+            period_end = datetime.strptime(f"{year}{mmdd}", "%Y%m%d").date()
+            deadline = datetime.strptime(f"{year + dl_off}{dl_mmdd}", "%Y%m%d").date()
+            if deadline <= today:
+                passed.append(period_end)
+    passed.sort(reverse=True)
+    return [d.strftime("%Y%m%d") for d in passed[:count]]
+
+
+def fetch_latest_report_announce_dates(periods=None):
+    """bulk 拉最近报告期的业绩报表(yjbb) → {code: 最新公告日期 YYYY-MM-DD}。
+
+    一次 bulk 覆盖全市场(约 5800 只)，仅取 '最新公告日期' 做'有没有出新报告'的检测，
+    不取其它字段当数据源(单期/缺资产负债表，口径不全)。接口失败返回空，不影响兜底刷新。
+    """
+    if periods is None:
+        periods = _recent_report_periods()
+    out = {}
+    for period in periods:
+        try:
+            df = _retry_fetch(ak.stock_yjbb_em, date=period)
+        except Exception as exc:
+            safe_print(f"  [yjbb] 报告期 {period} 拉取失败: {exc}")
+            continue
+        if df is None or df.empty or "最新公告日期" not in df.columns:
+            continue
+        for _, row in df.iterrows():
+            code = str(row.get("股票代码", "")).zfill(6)
+            ann = row.get("最新公告日期")
+            ann = str(ann)[:10] if ann is not None and str(ann) != "nan" else None
+            if code and ann and (code not in out or ann > out[code]):
+                out[code] = ann
+    return out
+
+
+def needs_fundamentals_refresh(refetched_at, announce_date, *,
+                               expire_days=FUNDAMENTALS_EXPIRE_DAYS, today=None):
+    """单只票是否要重爬财报：从没爬过 / yjbb 出了新报告(公告日>上次刷新) / 超 expire_days 兜底。"""
+    if not refetched_at:
+        return True
+    refetched_day = str(refetched_at)[:10]
+    if announce_date and announce_date > refetched_day:
+        return True
+    try:
+        gap = ((today or datetime.now().date())
+               - datetime.strptime(refetched_day, "%Y-%m-%d").date()).days
+    except ValueError:
+        return True
+    return gap > expire_days
+
+
 def load_existing():
+    """已完整爬过的股票集合。
+
+    只看财报三件套会误跳过“只有估值/市值 history、没有 OHLCV 日线”的股票。
+    full 模式现在要补 segment leader 的基本面+日线，所以跳过条件收紧为：
+    财报三件套齐全，且至少有一段可用于策略预筛的完整日线。
+    """
     conn = ss.thread_conn()
-    return ss.existing_codes(conn)
+    fresh_cutoff = (
+        datetime.strptime(latest_weekday_date(), "%Y-%m-%d")
+        - timedelta(days=DAILY_FRESH_MAX_GAP_DAYS)
+    ).strftime("%Y-%m-%d")
+    rows = conn.execute(
+        """
+        SELECT m.code,
+               SUM(CASE WHEN h.daily_open IS NOT NULL
+                          AND h.daily_high IS NOT NULL
+                          AND h.daily_low IS NOT NULL
+                          AND h.daily_close IS NOT NULL
+                          AND h.daily_volume IS NOT NULL
+                          AND h.daily_amount IS NOT NULL
+                        THEN 1 ELSE 0 END) AS complete_daily_rows,
+               MAX(CASE WHEN h.daily_open IS NOT NULL
+                         AND h.daily_high IS NOT NULL
+                         AND h.daily_low IS NOT NULL
+                         AND h.daily_close IS NOT NULL
+                         AND h.daily_volume IS NOT NULL
+                         AND h.daily_amount IS NOT NULL
+                       THEN h.date ELSE NULL END) AS latest_daily_date
+        FROM stock_meta m
+        LEFT JOIN stock_history h ON h.code = m.code
+        WHERE m.financials_json IS NOT NULL
+          AND m.indicators_json IS NOT NULL
+          AND m.dividends_json IS NOT NULL
+        GROUP BY m.code
+        """,
+    ).fetchall()
+    complete_codes = set()
+    for row in rows:
+        complete_daily_rows = int(row["complete_daily_rows"] or 0)
+        latest_daily_date = row["latest_daily_date"]
+        if complete_daily_rows < MIN_COMPLETE_DAILY_ROWS:
+            continue
+        if not latest_daily_date or latest_daily_date < fresh_cutoff:
+            continue
+        complete_codes.add(row["code"])
+    return complete_codes
 
 
 def save_stock(symbol, data):
     conn = ss.thread_conn()
     symbol = str(symbol).zfill(6)
+    existing_meta = ss.load_stock(conn, symbol, include_history=False)
     existing_records = ss.load_history_records(conn, symbol)
     if existing_records:
         incoming_records = (data.get("history") or {}).get("records", [])
@@ -356,23 +494,33 @@ def save_stock(symbol, data):
                 "stock_data.history+stock_crawl_fundamentals.daily",
             )
             data["daily"] = daily_payload_from_history_records(merged_records)
-    prev_refetched = ss.history_refetched_at(conn, symbol)
-    if prev_refetched and "history_refetched_at" not in data:
-        data["history_refetched_at"] = prev_refetched
+    if existing_meta:
+        for field in ("daily_refetched_at", "history_refetched_at"):
+            if existing_meta.get(field) and field not in data:
+                data[field] = existing_meta[field]
+        pledge = data.get("pledge") if isinstance(data.get("pledge"), dict) else {}
+        old_pledge = existing_meta.get("pledge") if isinstance(existing_meta.get("pledge"), dict) else {}
+        has_new_pledge = any(
+            pledge.get(key) is not None
+            for key in ("pledge_ratio", "pledge_count", "trade_date", "industry")
+        )
+        if old_pledge and not has_new_pledge:
+            data["pledge"] = old_pledge
     ss.save_stock(conn, data)
 
 
 def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
     """通用爬取逻辑: stocks = {code: {name, ...}}，多线程并发"""
     existing_codes = load_existing()
-    existing = len(existing_codes)
+    target_existing_codes = set(stocks) & existing_codes
+    existing = len(target_existing_codes)
     if existing > 0:
         print(f"已有 {existing} 只股票数据，将跳过\n")
 
     # 筛选待爬列表
     todo = []
     for symbol, info in stocks.items():
-        if symbol in existing_codes:
+        if symbol in target_existing_codes:
             continue
         todo.append((symbol, info))
     if limit > 0:
@@ -469,11 +617,48 @@ def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
 
 
 # ═══════════════════════════════════════════════════════════
-# 方案1: 全量爬取
+# 方案1: 细分行业龙头池全量爬取
 # ═══════════════════════════════════════════════════════════
 
+def get_segment_leader_universe(refresh_slice: int = SEGMENT_REFRESH_SLICE):
+    """获取细分行业龙头股票池，返回 crawl_stocks 需要的 {code: info}。"""
+    from stock_crawl_segment_leaders import (
+        DEFAULT_TOP_PER_SEGMENT,
+        build_segment_leader_pool,
+        load_segment_leader_pool,
+    )
+
+    payload = None
+    if refresh_slice <= 0:
+        payload = load_segment_leader_pool()
+        if payload is not None:
+            print("读取已生成的细分行业龙头股票池(segment leaders)...")
+    if payload is None:
+        print("获取细分行业龙头股票池(segment leaders)...")
+        payload = build_segment_leader_pool(
+            top_per_segment=DEFAULT_TOP_PER_SEGMENT,
+            refresh_slice=refresh_slice,
+        )
+    stocks = {}
+    for segment in payload.get("segments", []):
+        segment_name = segment.get("segment_name") or segment.get("segment_code") or ""
+        for leader in segment.get("leaders", []):
+            code = str(leader.get("code", "")).zfill(6)
+            if not code or is_bse_stock(code):
+                continue
+            info = stocks.setdefault(code, {
+                "name": leader.get("name") or code,
+                "source": "segment_leader",
+                "candidate_for": [],
+            })
+            if segment_name and segment_name not in info["candidate_for"]:
+                info["candidate_for"].append(segment_name)
+    print(f"  细分行业龙头: {len(stocks)} 只\n")
+    return stocks
+
+
 def get_full_universe():
-    """获取三指数需要的完整样本空间, 合并去重, 排除北交所"""
+    """旧全市场样本空间，保留给 staged/历史调试使用，不再作为 --mode full 默认入口。"""
     stocks = {}
 
     # 1. 中证全指 (红利低波100 + 科技100 的样本空间)
@@ -485,47 +670,41 @@ def get_full_universe():
         stocks[code] = {"name": name, "source": "中证全指"}
     print(f"  中证全指: {len(csi_all_map)} 只")
 
-    # 2. 全A股 (中金300 的样本空间 = 沪深A股, 上市>500日, 非ST)
+    # 2. 全A股 (中金300 的样本空间 = 沪深A股, 非ST)
     #    中证全指已包含大部分, 补充未覆盖的
     print("获取上证A股列表...")
     df_sh_main = _retry_fetch(ak.stock_info_sh_name_code, symbol="主板A股")
     df_sh_kcb = _retry_fetch(ak.stock_info_sh_name_code, symbol="科创板")
     df_sh = pd.concat([df_sh_main, df_sh_kcb], ignore_index=True)
-    sh_listing = {}
+    sh_stocks = {}
     for _, row in df_sh.iterrows():
         code = str(row["证券代码"]).zfill(6)
-        sh_listing[code] = {
+        sh_stocks[code] = {
             "name": str(row["证券简称"]),
-            "listing_date": str(row["上市日期"])[:10],
         }
     print(f"  上证A股: {len(df_sh)} 只")
 
     print("获取深证A股列表...")
     df_sz = _retry_fetch(ak.stock_info_sz_name_code, symbol="A股列表")
-    sz_listing = {}
+    sz_stocks = {}
     for _, row in df_sz.iterrows():
         code = str(row["A股代码"]).zfill(6)
-        sz_listing[code] = {
+        sz_stocks[code] = {
             "name": str(row["A股简称"]),
-            "listing_date": str(row["A股上市日期"])[:10],
         }
     print(f"  深证A股: {len(df_sz)} 只")
 
-    # 合并上市日期信息
-    all_listing = {**sh_listing, **sz_listing}
+    all_a_stocks = {**sh_stocks, **sz_stocks}
 
-    # 中金300 额外候选: 上市>500交易日(约2年) 且 非ST, 排除北交所
-    cutoff_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")
+    # 中金300 额外候选: 非ST, 排除北交所
     added = 0
-    for code, info in all_listing.items():
+    for code, info in all_a_stocks.items():
         if code in stocks:
             continue
         if is_bse_stock(code):
             continue
         name = info["name"]
         if "ST" in name:
-            continue
-        if info["listing_date"] > cutoff_date:
             continue
         stocks[code] = {"name": name, "source": "全A股(中金300)"}
         added += 1
@@ -564,24 +743,12 @@ def get_market_snapshot():
         }
     print(f"  实时行情: {len(spot_map)} 只")
 
-    # 2. 上证上市日期
-    print("获取上证上市日期...")
-    df_sh_main = _retry_fetch(ak.stock_info_sh_name_code, symbol="主板A股")
-    df_sh_kcb = _retry_fetch(ak.stock_info_sh_name_code, symbol="科创板")
-    df_sh = pd.concat([df_sh_main, df_sh_kcb], ignore_index=True)
-    for _, row in df_sh.iterrows():
-        code = str(row["证券代码"]).zfill(6)
-        if code in spot_map:
-            spot_map[code]["listing_date"] = str(row["上市日期"])[:10]
-    print(f"  上证: {len(df_sh)} 只")
-
-    # 3. 深证上市日期 + 行业 + 股本
+    # 2. 深证行业 + 股本
     print("获取深证信息...")
     df_sz = _retry_fetch(ak.stock_info_sz_name_code, symbol="A股列表")
     for _, row in df_sz.iterrows():
         code = str(row["A股代码"]).zfill(6)
         if code in spot_map:
-            spot_map[code]["listing_date"] = str(row["A股上市日期"])[:10]  # 上市日期, 用于判断上市时长
             spot_map[code]["sz_industry"] = str(row["所属行业"])  # 深交所行业分类
             # 总股本(股), 用于估算总市值
             total_shares_str = str(row.get("A股总股本", "")).replace(",", "")
@@ -591,7 +758,7 @@ def get_market_snapshot():
                 pass
     print(f"  深证: {len(df_sz)} 只")
 
-    # 4. 中证全指 + 沪深300 成分股列表(官网全量接口)
+    # 3. 中证全指 + 沪深300 成分股列表(官网全量接口)
     print("获取中证全指成分股列表(000985)...")
     csi_all_map = fetch_index_constituents("000985")
     csi_all_set = set(csi_all_map)
@@ -604,7 +771,7 @@ def get_market_snapshot():
     print(f"  沪深300: {len(csi300_map)} 只")
     save_stock_universe(csi300_map, csi_all_map)
 
-    # 5. 质押数据 (含行业分类, 用于科技100的风险筛选和行业判断)
+    # 4. 质押数据 (含行业分类, 用于科技100的风险筛选和行业判断)
     print("获取质押数据...")
     pledge_map = fetch_pledge_data_bulk()
     for code, pdata in pledge_map.items():
@@ -662,9 +829,8 @@ def pre_screen_candidates(snapshot):
     print(f"  中证全指: {len(csi_stocks)} → 剔除成交额后20% → {len(hl_candidates)}")
 
     # ─── 中金300 ───
-    # 样本空间: 沪深A股(排除北交所), 上市>500交易日(约2年), 非ST
+    # 样本空间: 沪深A股(排除北交所), 非ST
     print("\n中金300 粗筛:")
-    cutoff_date = (datetime.now() - timedelta(days=730)).strftime("%Y-%m-%d")  # 上市日期截止线(约500交易日)
     zj_all = []
     for code, info in snapshot.items():
         if is_bse_stock(code):
@@ -672,15 +838,12 @@ def pre_screen_candidates(snapshot):
         name = info.get("name", "")
         if "ST" in name:
             continue
-        listing = info.get("listing_date")
-        if listing and listing > cutoff_date:
-            continue
         zj_all.append((code, info))
 
     # 行业内综合排名需要详细财务数据, 这里只做基本过滤
     for code, _ in zj_all:
         add_candidate(code, "中金300")
-    print(f"  全A股非ST且上市>2年: {len(zj_all)}")
+    print(f"  全A股非ST: {len(zj_all)}")
 
     # ─── 科技100 ───
     # 样本空间: 中证全指中属于科技行业的股票
@@ -851,13 +1014,15 @@ def refetch_daily(codes=None, years=1, workers=8, limit=0):
 # ═══════════════════════════════════════════════════════════
 
 def main():
-    parser = argparse.ArgumentParser(description="爬取三指数候选池股票数据")
+    parser = argparse.ArgumentParser(description="爬取股票基本面与近端日线数据")
     parser.add_argument("--mode", choices=["full", "staged"], default="staged",
-                        help="full=全量爬取, staged=分步粗筛(默认)")
+                        help="full=细分行业龙头池全量爬取, staged=分步粗筛(默认)")
     parser.add_argument("--limit", type=int, default=0,
-                        help="限制爬取数量, 0=不限 (full模式默认20)")
+                        help="限制爬取数量, 0=不限")
     parser.add_argument("--workers", type=int, default=40,
                         help="并发线程数(默认40)")
+    parser.add_argument("--segment-refresh-slice", type=int, default=SEGMENT_REFRESH_SLICE,
+                        help="full模式滚动刷新最旧多少个申万三级membership，默认15；0=只用缓存")
     parser.add_argument("--refetch-financials", action="store_true",
                         help="只把已有 stock_data 的财报加深重拉到10年(跳过日线), 用于PIT回测")
     parser.add_argument("--refetch-daily", action="store_true",
@@ -881,9 +1046,14 @@ def main():
         return
 
     if args.mode == "full":
-        limit = args.limit if args.limit > 0 else 20
-        print(f"模式: 全量爬取 (limit={limit}, workers={args.workers})\n")
-        stocks = get_full_universe()
+        limit = args.limit
+        limit_label = limit if limit > 0 else "不限"
+        print(
+            f"模式: 细分行业龙头全量爬取 "
+            f"(limit={limit_label}, workers={args.workers}, "
+            f"segment_refresh_slice={args.segment_refresh_slice})\n"
+        )
+        stocks = get_segment_leader_universe(refresh_slice=max(args.segment_refresh_slice, 0))
         pledge_map = fetch_pledge_data_bulk()
         crawl_stocks(stocks, pledge_map, limit=limit, workers=args.workers)
 

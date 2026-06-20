@@ -1,3 +1,4 @@
+import json
 import sys
 import time
 import unittest
@@ -11,6 +12,7 @@ from app.config import FUND_REPORT_DATA_FILE, ROOT_DIR
 from app.services.job_service import get_job_state, start_command_job
 from app.services.fund_report_service import load_fund_report_view
 from app.services import stock_strategy_service
+from funds import get_funds, get_funds_bond
 
 
 class FlaskAppTest(unittest.TestCase):
@@ -256,6 +258,63 @@ class FlaskAppTest(unittest.TestCase):
         self.assertNotIn('id="theme-toggle"', html)
         self.assertNotIn("深色", html)
         self.assertNotIn("浅色", html)
+
+    def test_metric_rows_include_signal_state_for_quick_filters(self):
+        payload = {
+            "generated_at": "2026-06-19 12:00",
+            "period_labels": ["近一周"],
+            "summary": {},
+            "sections": {
+                "equity": {
+                    "id": "equity",
+                    "title": "股票型基金（中高风险）",
+                    "benchmark_names": ["沪深300"],
+                    "rows": [
+                        {
+                            "code": "008115",
+                            "name": "天弘中证红利低波动100联接C",
+                            "total_asset": "143.09",
+                            "is_held": True,
+                            "asset_class": "",
+                            "benchmarks": [[("1.23", "red")]],
+                        }
+                    ],
+                }
+            },
+            "signal_rows": [
+                {
+                    "code": "008115",
+                    "name": "天弘中证红利低波动100联接C",
+                    "is_held": True,
+                    "signal_state": "买入",
+                    "signal": {"overall": "买入", "recent_navs": []},
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", dir=ROOT_DIR, delete=False) as tmp:
+            tmp.write(json.dumps(payload, ensure_ascii=False))
+            report_path = Path(tmp.name)
+
+        try:
+            app = create_app()
+            app.config["FUND_REPORT_DATA_FILE"] = report_path
+            html = app.test_client().get("/fund").get_data(as_text=True)
+        finally:
+            report_path.unlink(missing_ok=True)
+
+        self.assertRegex(
+            html,
+            r'<tr data-code="008115"[^>]*data-section="equity"[^>]*data-signal="买入"',
+        )
+
+    def test_bond_fund_config_carries_shared_holdings(self):
+        equity_config = get_funds()
+        bond_config = get_funds_bond()
+
+        held_bond_codes = set(equity_config["hold_index"]) & set(bond_config["fund"])
+
+        self.assertTrue(held_bond_codes)
+        self.assertLessEqual(held_bond_codes, set(bond_config.get("hold_index", [])))
 
     def test_fund_report_css_is_scoped(self):
         view = load_fund_report_view(FUND_REPORT_DATA_FILE)

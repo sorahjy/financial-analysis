@@ -1,5 +1,4 @@
 
-
 """
 Parameter search and proxy backtesting for stock_advanced_strategies.py.
 
@@ -84,9 +83,9 @@ LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
 DEFAULT_OPTIMIZATION_ITERATIONS = 300
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
-# 每隔约1.5个月取一折，固定持有 125 个交易日（约半年）。
-LONG_HOLD_CHOICES = [125]  # 长线持有期固定为125交易日(约半年)
-LONG_FOLD_STEP_TD = 30     # 折锚点间隔(交易日)；约每1.5个月一折，增加验证密度
+# 每 30 个交易日取一折，固定持有 30 个交易日；相邻完整折首尾衔接。
+LONG_HOLD_CHOICES = [30]   # 长线持有期固定为30交易日
+LONG_FOLD_STEP_TD = 30     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
 LONG_MAX_LOOKBACK_TD = 2400
 LONG_COST = 0.004          # 单折买卖往返成本（佣金+冲击的粗略值）
 LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
@@ -112,10 +111,8 @@ LONG_WEIGHT_FLOORS = {
     "debt_safety": 0.20,
     "asset_growth": 0.20,
 }
-# 高点回撤(抄底)过滤的"高点至今跌幅下限"候选值；搜索时强制开启该过滤(见 random_long_config)。
-# 仅在深档 [45,50,55,60,65,70] 里搜：本策略定位深反转，但让模型在三档里挑、不写死。
-# 尾部由防御因子保底 + 下行目标(CVaR/回撤/最差折惩罚)控制，而不是靠关闭抄底。
-LONG_HIGH_DD_PCT_CHOICES = [45, 50, 55, 60, 65, 70]
+# 高点回撤(抄底)过滤开关参与搜索；开启时搜索"高点至今跌幅下限"40~70%。
+LONG_HIGH_DD_PCT_CHOICES = list(range(40, 71))
 OPTUNA_MIN_STARTUP_TRIALS = 40
 OPTUNA_STARTUP_TRIAL_FRACTION = 0.35
 OPTUNA_EI_CANDIDATES = 64
@@ -164,6 +161,37 @@ def full_series_map() -> Dict[str, List[Dict[str, Any]]]:
         code: (cn_index.get(code) or {}).get("records") or price_history_rows(code, stock)
         for code, stock in stocks.items()
     }
+
+
+def long_price_history_health(series: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    min_rows = max(LONG_HOLD_CHOICES) + 1
+    price_rows = 0
+    usable_codes = 0
+    for rows in series.values():
+        closes = [safe_float(row.get("close")) for row in rows or []]
+        valid_closes = [close for close in closes if close is not None and close > 0]
+        price_rows += len(valid_closes)
+        if len(valid_closes) >= min_rows:
+            usable_codes += 1
+    return {
+        "series_codes": len(series),
+        "price_rows": price_rows,
+        "usable_price_codes": usable_codes,
+        "min_required_rows_per_code": min_rows,
+    }
+
+
+def ensure_long_price_history(series: Dict[str, List[Dict[str, Any]]]) -> Dict[str, int]:
+    health = long_price_history_health(series)
+    if health["usable_price_codes"] < LONG_MIN_VALID_PICKS:
+        raise RuntimeError(
+            "长线优化缺少可用于前推收益的 OHLCV 收盘价："
+            f"可用价格股票 {health['usable_price_codes']}/{health['series_codes']}，"
+            f"非空 close 行 {health['price_rows']}，"
+            f"每只至少需要 {health['min_required_rows_per_code']} 行。"
+            "请先刷新 stock_history 的 daily_close/OHLCV，再运行 stock_strategy_optimizer.py。"
+        )
+    return health
 
 
 def long_anchor_offsets(hold_td: int) -> List[int]:
@@ -247,9 +275,8 @@ def load_benchmark_series() -> Tuple[List[Dict[str, Any]], List[str]]:
 def decorrelate_pairs(pairs: List[Dict[str, Any]], min_gap_td: int) -> List[Dict[str, Any]]:
     """按交易日间隔贪心抽稀重叠折，降低自相关，用于尾部/IR等风险统计。
 
-    稠密折每 LONG_FOLD_STEP_TD 个交易日取一折，持有期远大于步长时相邻折高度重叠
-    （hold=125/step=30 时相邻折重叠约76%），会让胜率/IR虚高、把几十折当成几十个独立样本。
-    抽稀到相邻保留折至少间隔 min_gap_td 个交易日后，再算风险统计才可信。
+    当前默认 hold=30/step=30，完整折基本首尾衔接、不再有旧版 125/30 的窗口重叠。
+    这个函数保留给未来若持有期重新大于步长时使用，尾部统计会优先看去相关子样本。
     """
     if not pairs:
         return []
@@ -269,8 +296,7 @@ def random_fold_split(
     """按折随机打乱后切分训练/验证（约 train_frac / 1-train_frac），不做时间隔离。
 
     用户指定口径：取消 embargo 与时间分块，训练/验证折在时间上混合、各覆盖全部 regime。
-    ⚠ 注意泄漏：稠密折相邻重叠很高（hold=125/step=30 约 76%），随机切分会让训练折与
-    验证折在时间上重叠 → 含样本内泄漏，验证不再是严格样本外（gap 被人为收窄、val 被抬高）。
+    当前默认 hold=30/step=30，完整折首尾衔接，不再有旧版长持有窗口造成的重叠泄漏。
     每折按其 as_of 的确定性随机键排序后切分，保证可复现、且各配置用同一划分。
     """
     if len(pairs) < 2:
@@ -618,7 +644,7 @@ def long_validation_adjusted_objective(
     """长线最终选优目标：训练/验证共同决定，并惩罚不稳健的漂亮结果。
 
     验证为随机打乱后的折切分(见 random_fold_split)，按用户口径不做时间隔离；
-    ⚠ 因稠密折重叠，此验证含样本内泄漏、非严格样本外(val 会贴近 train、gap 收窄)。
+    当前默认 30 日持有 / 30 日起点间隔，完整折不再像旧版 125 日持有那样高度重叠。
     """
     train_obj = long_fold_objective(train_pairs, hold_td, decorr_gap_td)
     val_obj = long_fold_objective(val_pairs, hold_td, decorr_gap_td)
@@ -702,6 +728,24 @@ def convergence_summary(trace: List[Dict[str, Any]], iterations: int) -> Dict[st
         "top10_floor_objective": round(top10_floor_objective, 5),
         "top10_gap": round(top_objective - top10_floor_objective, 5),
     }
+
+
+def select_best_long_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid = [
+        row for row in trace
+        if int((row.get("summary") or {}).get("folds") or 0) >= LONG_MIN_FOLDS
+        and safe_float(row.get("objective")) is not None
+        and safe_float(row.get("objective")) > -999.0
+    ]
+    if not valid:
+        max_selected = max((int(row.get("selected_count") or 0) for row in trace), default=0)
+        max_folds = max((int((row.get("summary") or {}).get("folds") or 0) for row in trace), default=0)
+        raise RuntimeError(
+            "长线优化没有产生有效 trial："
+            f"共 {len(trace)} 次，最大入选 {max_selected} 只，最大有效折数 {max_folds}。"
+            "请检查 OHLCV 价格数据、min_score/min_market_cap_yi/min_high_drawdown_pct 等过滤条件。"
+        )
+    return max(valid, key=lambda r: r["objective"])
 
 
 def prepare_candidate_factor_scores(
@@ -964,21 +1008,29 @@ def constrain_long_search_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def set_long_high_drawdown_filter(cfg: Dict[str, Any], threshold_pct: Any) -> None:
+    """设置历史高点回撤过滤阈值；开关由 require_high_drawdown 独立搜索。"""
+    threshold = safe_float(threshold_pct)
+    if threshold is None:
+        threshold = 40.0
+    threshold = int(round(clamp(threshold, 40.0, 70.0)))
+    cfg["min_high_drawdown_pct"] = threshold
+
+
 def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["long"])
     cfg["weights"] = mutate_weights(
         rng, cfg["weights"], [f.key for f in LONG_FACTORS], iteration, floors=LONG_WEIGHT_FLOORS
     )
-    # 高点回撤过滤：按用户设定全程强制开启；跌幅下限在 [45,50,55,60,65,70] 搜，i==0 基线取50。
-    cfg["require_high_drawdown"] = True
-    cfg["min_high_drawdown_pct"] = LONG_HIGH_DD_PCT_CHOICES[1]
+    # 高点回撤过滤开关参与搜索；阈值仅在开启时作为历史高点至今跌幅下限。
+    set_long_high_drawdown_filter(cfg, cfg.get("min_high_drawdown_pct"))
     if iteration > 0:
-        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 8
+        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
         cfg["min_score"] = rng.choice([45, 50, 55, 58, 60, 63, 66, 70])
         # 市值下限放开到100亿，让中盘股（中证500档）有入池机会
         cfg["min_market_cap_yi"] = rng.choice([100, 200, 300, 500, 800])
-        cfg["min_listing_years"] = rng.choice([2, 3, 5, 8, 10])
-        cfg["min_high_drawdown_pct"] = rng.choice(LONG_HIGH_DD_PCT_CHOICES)
+        cfg["require_high_drawdown"] = rng.choice([False, True])
+        set_long_high_drawdown_filter(cfg, rng.choice(LONG_HIGH_DD_PCT_CHOICES))
     return constrain_long_search_config(cfg)
 
 
@@ -986,7 +1038,7 @@ def random_short_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["short"])
     cfg["weights"] = mutate_weights(rng, cfg["weights"], [f.key for f in SHORT_FACTORS], iteration)
     if iteration > 0:
-        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 8
+        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
         cfg["min_score"] = rng.choice([35, 40, 45, 50, 55, 60, 65, 70])
         cfg["min_lhb_count"] = rng.choice([1, 2, 3, 4])
         cfg["min_hot_money_concurrent"] = rng.choice([0, 1, 2, 3])
@@ -1001,9 +1053,10 @@ def broad_long_candidate_config() -> Dict[str, Any]:
     broad_cfg.update({
         "exclude_st": False,
         "min_market_cap_yi": 0,
-        "min_listing_years": 0,
         "require_csi300": False,
+        # broad 候选池不提前按高点回撤筛选；raw factor 由候选构建阶段保留，供 trial 硬过滤使用。
         "require_high_drawdown": False,
+        "min_high_drawdown_pct": 0,
         "min_score": 0,
         "top_n": 80,
     })
@@ -1017,7 +1070,6 @@ def broad_long_candidate_config() -> Dict[str, Any]:
 
 LONG_MIN_SCORE_CHOICES = [45, 50, 55, 58, 60, 63, 66, 70]
 LONG_MARKET_CAP_CHOICES = [100, 200, 300, 500, 800]
-LONG_LISTING_YEAR_CHOICES = [2, 3, 5, 8, 10]
 SHORT_MIN_SCORE_CHOICES = [35, 40, 45, 50, 55, 60, 65, 70]
 SHORT_HOLD_DAYS_CHOICES = [1, 2, 3, 4, 5]
 
@@ -1042,11 +1094,13 @@ def _suggest_long_config(trial) -> Tuple[Dict[str, Any], int]:
         f.key: round(trial.suggest_float(f"w_{f.key}", *_long_weight_bounds(f.key)), 3)
         for f in LONG_FACTORS
     }
-    cfg["require_high_drawdown"] = True
     cfg["min_score"] = trial.suggest_categorical("min_score", LONG_MIN_SCORE_CHOICES)
     cfg["min_market_cap_yi"] = trial.suggest_categorical("min_market_cap_yi", LONG_MARKET_CAP_CHOICES)
-    cfg["min_listing_years"] = trial.suggest_categorical("min_listing_years", LONG_LISTING_YEAR_CHOICES)
-    cfg["min_high_drawdown_pct"] = trial.suggest_categorical("min_high_drawdown_pct", LONG_HIGH_DD_PCT_CHOICES)
+    cfg["require_high_drawdown"] = trial.suggest_categorical("require_high_drawdown", [False, True])
+    set_long_high_drawdown_filter(
+        cfg,
+        trial.suggest_int("min_high_drawdown_pct", 40, 70),
+    )
     hold_td = trial.suggest_categorical("hold_td", LONG_HOLD_CHOICES)
     return constrain_long_search_config(cfg), hold_td
 
@@ -1060,7 +1114,7 @@ def _default_long_params() -> Dict[str, Any]:
         params[f"w_{f.key}"] = round(min(max(safe_float(base_weights.get(f.key)) or 0.0, low), high), 3)
     params["min_score"] = _nearest_choice(base.get("min_score"), LONG_MIN_SCORE_CHOICES)
     params["min_market_cap_yi"] = _nearest_choice(base.get("min_market_cap_yi"), LONG_MARKET_CAP_CHOICES)
-    params["min_listing_years"] = _nearest_choice(base.get("min_listing_years"), LONG_LISTING_YEAR_CHOICES)
+    params["require_high_drawdown"] = bool(base.get("require_high_drawdown", False))
     params["min_high_drawdown_pct"] = _nearest_choice(base.get("min_high_drawdown_pct"), LONG_HIGH_DD_PCT_CHOICES)
     params["hold_td"] = LONG_HOLD_CHOICES[0]
     return params
@@ -1166,6 +1220,7 @@ def _run_config_search(
 def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
     broad_cfg = broad_long_candidate_config()
     series = full_series_map()
+    price_health = ensure_long_price_history(series)
     cal = fold_calendar(series)
     cal_pos = {date: idx for idx, date in enumerate(cal)}  # as_of -> 交易日序号，供去相关/隔离带用
     benchmark_series, benchmark_notes = load_benchmark_series()
@@ -1258,19 +1313,20 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         record=_record,
         progress_label="长线参数搜索",
     )
-    best = max(trace, key=lambda r: r["objective"])
+    best = select_best_long_trace(trace)
     return {
         "strategy": "long",
         "iterations": iterations,
         "candidate_count": len(deep_codes),
+        "price_history_health": price_health,
         "notes": [search_note] + benchmark_notes + notes + [
-            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有125交易日(约半年)，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
-            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime。⚠注意：稠密折相邻重叠~76%，随机切分下训练折与验证折在时间上重叠，含样本内泄漏，验证不再是严格样本外(gap人为收窄、验证超额被抬高)，系有意为之的口径。",
+            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有30交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
+            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=30个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
             "折样本采用时间衰减权重：最旧折 0.5x，最新折 2.0x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
-            "稠密折(每30交易日一折)与持有期高度重叠，会把胜率/IR当成独立样本而虚高；故 worst/CVaR/Sortino 等风险统计在'相邻保留折至少隔半个持有期'的去相关子样本(indep_folds)上计算。",
+            "完整折每30交易日取一个起点、持有30交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
             "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
-            "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。高点回撤(抄底)过滤按设定强制开启，高点至今跌幅下限在45~70%搜优；接飞刀尾部改由防御因子保底 + 下行目标(CVaR/回撤/最差折惩罚)约束，而非靠关闭抄底。",
-            "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为稠密折最差单折超额，tail_cvar_excess_pct 为去重叠后最差20%折的平均超额。",
+            "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。高点回撤(抄底)过滤开关参与搜索；开启时 min_high_drawdown_pct 在40~70%搜优。",
+            "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为全部折最差单折超额，tail_cvar_excess_pct 为尾部最差20%折的平均超额。",
             "残留前视：沪深300成分与质押用当前快照(无历史数据)；优化器已将 csi300_current/csi300_persistence 权重分别限制到 0.15/0.8，且不再搜索 require_csi300 或成分稳定硬过滤，候选仍限于本地有多年日线的票(约中证800)。",
         ],
         "best": best,
@@ -1350,6 +1406,73 @@ def average_paths(paths: List[Dict[str, Any]], key: str) -> List[float]:
     return averaged
 
 
+def stitched_fold_path(paths: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """把按时间排序的折内日度净值拼成一条完整历史曲线。"""
+    dates: List[str] = []
+    portfolio_path: List[float] = []
+    benchmark_path: List[float] = []
+    portfolio_nav = 1.0
+    benchmark_nav = 1.0
+    source_folds = 0
+    last_date: Optional[str] = None
+
+    for path in sorted(paths, key=lambda row: row["as_of"]):
+        raw_dates = [str(date) for date in path.get("dates", [])]
+        raw_portfolio = path.get("portfolio_path", [])
+        raw_benchmark = path.get("benchmark_path", [])
+        length = min(len(raw_dates), len(raw_portfolio), len(raw_benchmark))
+        if length < 2:
+            continue
+
+        if not dates:
+            first_date = raw_dates[0]
+            if len(first_date) != 10:
+                continue
+            dates.append(first_date)
+            portfolio_path.append(portfolio_nav)
+            benchmark_path.append(benchmark_nav)
+            last_date = first_date
+
+        added = False
+        for idx in range(1, length):
+            date = raw_dates[idx]
+            if len(date) != 10 or (last_date is not None and date <= last_date):
+                continue
+            prev_portfolio = safe_float(raw_portfolio[idx - 1])
+            curr_portfolio = safe_float(raw_portfolio[idx])
+            prev_benchmark = safe_float(raw_benchmark[idx - 1])
+            curr_benchmark = safe_float(raw_benchmark[idx])
+            if (
+                prev_portfolio is None or curr_portfolio is None
+                or prev_benchmark is None or curr_benchmark is None
+                or prev_portfolio <= 0 or prev_benchmark <= 0
+            ):
+                continue
+            portfolio_nav *= curr_portfolio / prev_portfolio
+            benchmark_nav *= curr_benchmark / prev_benchmark
+            dates.append(date)
+            portfolio_path.append(portfolio_nav)
+            benchmark_path.append(benchmark_nav)
+            last_date = date
+            added = True
+        if added:
+            source_folds += 1
+
+    if len(dates) < 2:
+        return None
+    return {
+        "dates": dates,
+        "portfolio_path": portfolio_path,
+        "benchmark_path": benchmark_path,
+        "source_folds": source_folds,
+        "portfolio_return": portfolio_path[-1] - 1.0,
+        "benchmark_return": benchmark_path[-1] - 1.0,
+        "excess_return": portfolio_path[-1] - benchmark_path[-1],
+        "portfolio_max_drawdown": path_max_drawdown(portfolio_path) or 0.0,
+        "benchmark_max_drawdown": path_max_drawdown(benchmark_path) or 0.0,
+    }
+
+
 def svg_points(values: List[float], x_scale, y_scale) -> str:
     return " ".join(
         f"{x_scale(idx):.2f},{y_scale(value):.2f}"
@@ -1372,19 +1495,23 @@ def write_long_fold_paths_svg(
     avg_source = complete_paths or paths
     avg_portfolio = average_paths(avg_source, "portfolio_path")
     avg_benchmark = average_paths(avg_source, "benchmark_path")
+    full_path = stitched_fold_path(paths)
 
     cols = 4
     rows = math.ceil(len(paths) / cols)
     width = 1600
     header_h = 122
     footer_h = 42
+    full_chart_gap = 28 if full_path else 0
+    full_chart_h = 330 if full_path else 0
     left = 54
     right = 42
     gap_x = 24
     gap_y = 22
     cell_w = (width - left - right - gap_x * (cols - 1)) / cols
     cell_h = 230
-    height = int(header_h + rows * cell_h + (rows - 1) * gap_y + footer_h)
+    grid_h = rows * cell_h + (rows - 1) * gap_y
+    height = int(header_h + grid_h + full_chart_gap + full_chart_h + footer_h)
 
     def text(
         x: float,
@@ -1438,6 +1565,40 @@ def write_long_fold_paths_svg(
         second = " · ".join(names[5:10])
         return [line for line in (first, second) if line]
 
+    def holding_top10_keys(path: Dict[str, Any]) -> List[str]:
+        keys = []
+        seen = set()
+        for item in (path.get("holdings", []) or [])[:10]:
+            if isinstance(item, dict):
+                key = str(item.get("code") or item.get("name") or "").strip()
+            else:
+                key = str(item or "").strip()
+            if key and key not in seen:
+                keys.append(key)
+                seen.add(key)
+        return keys
+
+    top10_replacement_counts = []
+    prev_top10_keys: Optional[List[str]] = None
+    for path in paths:
+        top10_keys = holding_top10_keys(path)
+        replaced_count = None
+        if prev_top10_keys is not None and top10_keys:
+            replaced_count = len(set(top10_keys) - set(prev_top10_keys))
+        path["top10_replaced_count"] = replaced_count
+        top10_replacement_counts.append({
+            "as_of": path.get("as_of"),
+            "replaced_count": replaced_count,
+        })
+        if top10_keys:
+            prev_top10_keys = top10_keys
+
+    def top10_replacement_label(path: Dict[str, Any]) -> str:
+        replaced_count = path.get("top10_replaced_count")
+        if replaced_count is None:
+            return "Top10替换 --"
+        return f"Top10替换 {int(replaced_count)}只"
+
     elements: List[str] = []
     elements.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#f8fafc"/>')
     elements.append(text(36, 42, "长线最优参数各折走势小图矩阵", 25, "700"))
@@ -1482,11 +1643,18 @@ def write_long_fold_paths_svg(
         window_label = f"未满 {actual_hold_td}/{hold_td}日" if is_partial else f"完整 {hold_td}日"
         stock_lines = holding_name_lines(path)
         stock_title = " · 股票：" + "、".join(stock_lines).replace(" · ", "、") if stock_lines else ""
+        replacement_label = top10_replacement_label(path)
+        replacement_title = (
+            " · 首期Top10无上期可比"
+            if path.get("top10_replaced_count") is None
+            else f" · 较上期Top10替换 {int(path['top10_replaced_count'])} 只"
+        )
         fold_title = (
             f"起点 {path['as_of']} · {window_label} · 有效持仓 {path['stock_count']} 只 · "
             f"组合收益 {path['portfolio_return'] * 100:.2f}% · "
             f"基准收益 {path['benchmark_return'] * 100:.2f}% · "
             f"超额 {path['excess_return'] * 100:.2f}%"
+            f"{replacement_title}"
             f"{stock_title}"
         )
         elements.append(
@@ -1508,6 +1676,7 @@ def write_long_fold_paths_svg(
                 color="#475569",
             )
         )
+        elements.append(text(cell_x + cell_w - 12, cell_y + 38, replacement_label, 10, "600", "end", "#475569"))
         elements.append(
             f'<rect x="{plot_x:.2f}" y="{plot_y:.2f}" width="{plot_w:.2f}" height="{plot_h:.2f}" '
             'fill="#fbfdff" stroke="#edf2f7"/>'
@@ -1552,7 +1721,109 @@ def write_long_fold_paths_svg(
         elements.append(text(end_x + label_dx, y_scale(path["portfolio_path"][-1]) - 4, f"{path['portfolio_path'][-1]:.2f}", 9, "700", end_anchor, "#b91c1c"))
         elements.append(text(end_x + label_dx, y_scale(path["benchmark_path"][-1]) + 10, f"{path['benchmark_path'][-1]:.2f}", 9, "700", end_anchor, "#1d4ed8"))
 
-    elements.append(text(width / 2, height - 18, "每个小图横轴为买入后交易日，纵轴为当折净值倍数；未满持有期窗口只展示当前已走收益，不参与优化选优。", 12, "400", "middle", "#475569"))
+    if full_path:
+        full_x = left
+        full_y = header_h + grid_h + full_chart_gap
+        full_w = width - left - right
+        full_h = full_chart_h
+        plot_x = full_x + 58
+        plot_y = full_y + 58
+        plot_w = full_w - 92
+        plot_h = full_h - 112
+        values = [1.0] + full_path["portfolio_path"] + full_path["benchmark_path"]
+        y_min = min(values)
+        y_max = max(values)
+        if y_max - y_min < 0.08:
+            y_min -= 0.04
+            y_max += 0.04
+        else:
+            pad = (y_max - y_min) * 0.10
+            y_min = max(0.0, y_min - pad)
+            y_max += pad
+        max_idx = max(1, len(full_path["dates"]) - 1)
+
+        def full_x_scale(idx: int) -> float:
+            return plot_x + plot_w * idx / max_idx
+
+        def full_y_scale(value: float) -> float:
+            return plot_y + plot_h * (y_max - value) / (y_max - y_min)
+
+        full_excess_pct = full_path["excess_return"] * 100
+        elements.append(
+            f'<rect x="{full_x:.2f}" y="{full_y:.2f}" width="{full_w:.2f}" height="{full_h:.2f}" '
+            'rx="4" fill="#ffffff" stroke="#dbe3ee"/>'
+        )
+        elements.append(text(full_x + 18, full_y + 26, "完整历史拼接收益图", 17, "700"))
+        elements.append(
+            text(
+                full_x + 18,
+                full_y + 49,
+                (
+                    f"{full_path['dates'][0]} ~ {full_path['dates'][-1]} · "
+                    f"{full_path['source_folds']} 个窗口 · "
+                    f"组合 {full_path['portfolio_path'][-1]:.2f}x / "
+                    f"基准 {full_path['benchmark_path'][-1]:.2f}x / "
+                    f"超额 {full_excess_pct:+.1f}%"
+                ),
+                12,
+                "500",
+                color="#475569",
+            )
+        )
+        elements.append(
+            f'<rect x="{plot_x:.2f}" y="{plot_y:.2f}" width="{plot_w:.2f}" height="{plot_h:.2f}" '
+            'fill="#fbfdff" stroke="#edf2f7"/>'
+        )
+        tick_values = sorted({round(y_min, 4), 1.0, round((y_min + y_max) / 2.0, 4), round(y_max, 4)})
+        for tick_value in tick_values:
+            if tick_value < y_min or tick_value > y_max:
+                continue
+            y = full_y_scale(tick_value)
+            dash = ' stroke-dasharray="4 4"' if abs(tick_value - 1.0) < 1e-9 else ""
+            elements.append(
+                f'<line x1="{plot_x:.2f}" y1="{y:.2f}" x2="{plot_x + plot_w:.2f}" '
+                f'y2="{y:.2f}" stroke="#e6ebf2"{dash}/>'
+            )
+            elements.append(text(plot_x - 8, y + 4, f"{tick_value:.2f}x", 9, "400", "end", "#64748b"))
+        for idx in (0, max_idx // 2, max_idx):
+            x = full_x_scale(idx)
+            elements.append(
+                f'<line x1="{x:.2f}" y1="{plot_y:.2f}" x2="{x:.2f}" '
+                f'y2="{plot_y + plot_h:.2f}" stroke="#edf2f7"/>'
+            )
+            elements.append(text(x, plot_y + plot_h + 18, full_path["dates"][idx], 10, "500", "middle", "#64748b"))
+        elements.append(
+            '<polyline fill="none" stroke="#1d4ed8" stroke-width="2.2" stroke-opacity="0.9" '
+            f'points="{svg_points(full_path["benchmark_path"], full_x_scale, full_y_scale)}">'
+            f'<title>{html_escape(BENCHMARK_NAME)} 完整拼接曲线</title></polyline>'
+        )
+        elements.append(
+            '<polyline fill="none" stroke="#b91c1c" stroke-width="2.4" stroke-opacity="0.95" '
+            f'points="{svg_points(full_path["portfolio_path"], full_x_scale, full_y_scale)}">'
+            '<title>组合完整拼接曲线</title></polyline>'
+        )
+        end_x = full_x_scale(max_idx)
+        elements.append(text(end_x - 4, full_y_scale(full_path["portfolio_path"][-1]) - 6, f"{full_path['portfolio_path'][-1]:.2f}x", 10, "700", "end", "#b91c1c"))
+        elements.append(text(end_x - 4, full_y_scale(full_path["benchmark_path"][-1]) + 13, f"{full_path['benchmark_path'][-1]:.2f}x", 10, "700", "end", "#1d4ed8"))
+        elements.append(f'<line x1="{full_x + full_w - 318:.2f}" y1="{full_y + 28:.2f}" x2="{full_x + full_w - 280:.2f}" y2="{full_y + 28:.2f}" stroke="#b91c1c" stroke-width="4"/>')
+        elements.append(text(full_x + full_w - 270, full_y + 33, "组合", 12, "600", color="#334155"))
+        elements.append(f'<line x1="{full_x + full_w - 218:.2f}" y1="{full_y + 28:.2f}" x2="{full_x + full_w - 180:.2f}" y2="{full_y + 28:.2f}" stroke="#1d4ed8" stroke-width="4"/>')
+        elements.append(text(full_x + full_w - 170, full_y + 33, BENCHMARK_NAME, 12, "600", color="#334155"))
+        elements.append(
+            text(
+                full_x + 18,
+                full_y + full_h - 22,
+                (
+                    f"完整曲线最大回撤：组合 {full_path['portfolio_max_drawdown'] * 100:.1f}% · "
+                    f"基准 {full_path['benchmark_max_drawdown'] * 100:.1f}%"
+                ),
+                12,
+                "500",
+                color="#475569",
+            )
+        )
+
+    elements.append(text(width / 2, height - 18, "每个小图横轴为买入后交易日，纵轴为当折净值倍数；底部完整图按各折日度收益从旧到新拼接。", 12, "400", "middle", "#475569"))
 
     svg = (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
@@ -1571,13 +1842,22 @@ def write_long_fold_paths_svg(
         "displayed_folds": len(paths),
         "hold_td": hold_td,
         "fold_interval_td": LONG_FOLD_STEP_TD,
-        "chart_type": "small_multiples",
+        "latest_top10_replaced_count": top10_replacement_counts[-1]["replaced_count"] if top10_replacement_counts else None,
+        "top10_replacement_counts": top10_replacement_counts,
+        "chart_type": "small_multiples_with_full_path" if full_path else "small_multiples",
         "columns": cols,
         "rows": rows,
         "oldest_as_of": paths[0]["as_of"],
         "latest_as_of": paths[-1]["as_of"],
         "avg_portfolio_final_nav": round(avg_portfolio[-1], 4),
         "avg_benchmark_final_nav": round(avg_benchmark[-1], 4),
+        "full_path_points": len(full_path["dates"]) if full_path else 0,
+        "full_path_start_date": full_path["dates"][0] if full_path else None,
+        "full_path_end_date": full_path["dates"][-1] if full_path else None,
+        "full_portfolio_final_nav": round(full_path["portfolio_path"][-1], 4) if full_path else None,
+        "full_benchmark_final_nav": round(full_path["benchmark_path"][-1], 4) if full_path else None,
+        "full_portfolio_max_drawdown_pct": round(full_path["portfolio_max_drawdown"] * 100, 3) if full_path else None,
+        "full_benchmark_max_drawdown_pct": round(full_path["benchmark_max_drawdown"] * 100, 3) if full_path else None,
     }
 
 
@@ -1769,6 +2049,13 @@ def print_summary(result: Dict[str, Any]) -> None:
                     f"{fold_text} · 平均组合期末 {chart.get('avg_portfolio_final_nav')}x · "
                     f"平均基准期末 {chart.get('avg_benchmark_final_nav')}x"
                 )
+                if chart.get("full_path_points"):
+                    print(
+                        f"完整拼接收益图: {chart.get('full_path_start_date')} ~ {chart.get('full_path_end_date')} · "
+                        f"组合 {chart.get('full_portfolio_final_nav')}x · "
+                        f"基准 {chart.get('full_benchmark_final_nav')}x · "
+                        f"组合最大回撤 {chart.get('full_portfolio_max_drawdown_pct')}%"
+                    )
         else:
             print_metric_block("真实前推回测", best["actual_backtest"], SHORT_SUMMARY_FIELDS)
             print_metric_block("代理评分回测", best["proxy_backtest"], SHORT_SUMMARY_FIELDS)
@@ -1780,7 +2067,11 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260611, help="随机种子")
     parser.add_argument("--no-persist", action="store_true", help="只打印结果，不写入结果文件")
     args = parser.parse_args()
-    result = run_optimization(args.iterations, args.seed, persist=not args.no_persist)
+    try:
+        result = run_optimization(args.iterations, args.seed, persist=not args.no_persist)
+    except RuntimeError as exc:
+        print(f"[ERROR] {exc}")
+        raise SystemExit(1) from None
     print_summary(result)
     if not args.no_persist:
         print(f"\n已保存优化结果: {OUTPUT_FILE}")

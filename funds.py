@@ -7,7 +7,7 @@ compare_index = ["510310", "510580"]  # 沪深300，中证500，
 # 对比的中低风险基金
 compare_index_bond = ["161119", "519769"]  # 债券综指,交银固收+
 
-hold_index = ["008115", "501060", "515580", "159928", "040046", "050025","510310","510580"]
+hold_index = ["008115", "501060", "515580", "159928", "040046", "050025", "510310", "510580", "161119"]
 # 中高风险基金代码
 fund_index = [
     # -----------   策略指数     -----------
@@ -89,7 +89,7 @@ def get_funds():
 
 
 def get_funds_bond():
-    return {'compare_index': compare_index_bond, 'fund': fund_bond}
+    return {'compare_index': compare_index_bond, 'fund': fund_bond, 'hold_index': hold_index}
 
 
 if __name__ == '__main__':

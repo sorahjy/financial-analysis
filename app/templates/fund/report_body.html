@@ -86,7 +86,7 @@
           </thead>
           <tbody>
             {% for row in section.rows %}
-              <tr data-code="{{ row.code }}" data-name="{{ row.name }}" data-section="{{ section.id }}" data-held="{{ 1 if row.is_held else 0 }}">
+              <tr data-code="{{ row.code }}" data-name="{{ row.name }}" data-section="{{ section.id }}" data-held="{{ 1 if row.is_held else 0 }}" data-signal="{{ row.signal_state }}">
                 <td class="sticky-col sticky-code code-cell{% if row.is_held %} held{% endif %}">{{ row.code }}</td>
                 <td class="sticky-col sticky-name name-cell">{{ row.name }}</td>
                 <td{% if row.asset_class %} class="{{ row.asset_class }}"{% endif %}>{{ row.total_asset }}</td>

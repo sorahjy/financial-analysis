@@ -313,7 +313,6 @@
           ["top_n", "输出数量", "number", 1, 100, 1],
           ["min_score", "最低分", "number", 0, 100, 1],
           ["min_market_cap_yi", "市值下限(亿)", "number", 0, 5000, 50],
-          ["min_listing_years", "上市年限", "number", 0, 20, 1],
           ["require_csi300", "必须当前沪深300", "checkbox"],
           ["require_high_drawdown", "高点回撤过滤", "checkbox"],
           ["min_high_drawdown_pct", "高点至今跌幅下限(%)", "number", 0, 95, 1, "require_high_drawdown"],
@@ -636,7 +635,6 @@
         ["沪深300", cfg.require_csi300 ? "必须是当前沪深300成分股" : "不强制当前成分股，成分稳定性只参与打分"],
         ["历史回撤", cfg.require_high_drawdown ? `已启用：历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `未启用：勾选「高点回撤过滤」后，才会按跌幅下限 ${fmt(cfg.min_high_drawdown_pct, 0)}% 硬过滤`],
         ["市值门槛", `总市值不低于 ${fmt(cfg.min_market_cap_yi, 0)} 亿元`],
-        ["上市年限", `上市时间不低于 ${fmt(cfg.min_listing_years, 0)} 年`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
       ];
     }

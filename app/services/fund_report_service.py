@@ -47,8 +47,10 @@ def load_fund_report_view(report_data_file: Path) -> FundReportView:
 def build_fund_report_view(payload: Dict[str, Any]) -> FundReportView:
     period_labels = list(payload.get("period_labels") or [])
     raw_sections = payload.get("sections") or {}
+    raw_signal_rows = list(payload.get("signal_rows") or [])
+    signal_states = _signal_state_map(raw_signal_rows)
     sections = [
-        _prepare_metric_section(raw_sections[key], period_labels)
+        _prepare_metric_section(raw_sections[key], period_labels, signal_states)
         for key in ("equity", "bond")
         if key in raw_sections
     ]
@@ -60,13 +62,30 @@ def build_fund_report_view(payload: Dict[str, Any]) -> FundReportView:
         manager_changes=list(payload.get("manager_changes") or []),
         sections=sections,
         signal_counts=payload.get("signal_counts") or {},
-        signal_rows=[_prepare_signal_row(row) for row in payload.get("signal_rows") or []],
+        signal_rows=[_prepare_signal_row(row) for row in raw_signal_rows],
         signal_note=_signal_note(),
     )
 
 
-def _prepare_metric_section(section: Dict[str, Any], period_labels: List[str]) -> Dict[str, Any]:
-    rows = list(section.get("rows") or [])
+def _signal_state_map(signal_rows: List[Dict[str, Any]]) -> Dict[str, str]:
+    states = {}
+    for row in signal_rows:
+        code = str(row.get("code") or "")
+        if code:
+            states[code] = str(row.get("signal_state") or "")
+    return states
+
+
+def _prepare_metric_section(
+    section: Dict[str, Any],
+    period_labels: List[str],
+    signal_states: Dict[str, str],
+) -> Dict[str, Any]:
+    rows = []
+    for row in section.get("rows") or []:
+        prepared = {**row}
+        prepared["signal_state"] = signal_states.get(str(prepared.get("code") or ""), "")
+        rows.append(prepared)
     benchmark_names = list(section.get("benchmark_names") or [])
     return {
         "id": section.get("id", ""),

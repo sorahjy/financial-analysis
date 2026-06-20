@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
@@ -30,7 +31,8 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 3
+SQLITE_BUSY_TIMEOUT_MS = 120000
 
 # 大表列：8 个日频行情字段 + 5 个估值字段，与 stock_crawl_common 的 canonical schema 同源。
 HISTORY_COLUMNS: tuple = tuple(HISTORY_PRICE_FIELDS) + tuple(HISTORY_VALUATION_FIELDS)
@@ -45,21 +47,33 @@ META_TIMESTAMP_FIELDS = (
 # 基准 ETF 的友好名（文件本身不带 name）。
 KNOWN_INDEX_NAMES = {"510310": "沪深300ETF", "510580": "中证500ETF"}
 
+_CONNECT_LOCK = threading.Lock()
+_WRITE_LOCK = threading.Lock()
+
 
 def connect(db_file: Path | str = DEFAULT_DB_FILE) -> sqlite3.Connection:
-    """打开个股缓存库并确保 schema 存在。busy_timeout 取 30s 以容纳多 worker 并发写。"""
+    """打开个股缓存库并确保 schema 存在。
+
+    SQLite 只能单写。爬虫多线程会把整只股票的多年 history 作为一个事务写入，
+    所以这里把 busy_timeout 拉长，并串行化文件库初始化，避免大量线程同时设置 WAL。
+    """
     if str(db_file) != ":memory:":
         db_target = Path(db_file)
         db_target.parent.mkdir(parents=True, exist_ok=True)
-        conn = sqlite3.connect(str(db_target))
+        conn = sqlite3.connect(str(db_target), timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0)
     else:
-        conn = sqlite3.connect(":memory:")
+        conn = sqlite3.connect(":memory:", timeout=SQLITE_BUSY_TIMEOUT_MS / 1000.0)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
-    conn.execute("PRAGMA synchronous = NORMAL")
-    ensure_schema(conn)
+    conn.execute(f"PRAGMA busy_timeout = {SQLITE_BUSY_TIMEOUT_MS}")
+    if str(db_file) == ":memory:":
+        conn.execute("PRAGMA foreign_keys = ON")
+        ensure_schema(conn)
+    else:
+        with _CONNECT_LOCK:
+            conn.execute("PRAGMA foreign_keys = ON")
+            conn.execute("PRAGMA journal_mode = WAL")
+            conn.execute("PRAGMA synchronous = NORMAL")
+            ensure_schema(conn)
     return conn
 
 
@@ -135,10 +149,52 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             record_count INTEGER NOT NULL DEFAULT 0,
             updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
+
+        -- 申万三级"行业→成分股"归属缓存（对应旧 data/capital/sw3_membership.json）。
+        -- 1股=1三级行业，故 sw3_member.code 全表唯一可做主键，反查个股→行业为 PK 命中。
+        CREATE TABLE IF NOT EXISTS sw3_segment (
+            segment_code   TEXT PRIMARY KEY,
+            segment_name   TEXT,
+            parent_segment TEXT,
+            member_count   INTEGER,
+            refreshed_at   TEXT,
+            error          TEXT,
+            updated_at     TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS sw3_member (
+            code               TEXT PRIMARY KEY,
+            segment_code       TEXT NOT NULL,
+            name               TEXT,
+            price              REAL,
+            market_cap_yi      REAL,
+            official_market_cap_ratio REAL,
+            roe_pct            REAL,
+            profit_growth_pct  REAL,
+            revenue_growth_pct REAL,
+            FOREIGN KEY (segment_code) REFERENCES sw3_segment (segment_code) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_sw3_member_segment
+        ON sw3_member (segment_code);
         """
     )
+    _ensure_table_columns(conn, "sw3_member", {
+        "official_market_cap_ratio": "REAL",
+    })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
+
+
+def _ensure_table_columns(conn: sqlite3.Connection, table: str, columns: Mapping[str, str]) -> None:
+    """Add nullable columns for older SQLite files without rebuilding hot tables."""
+    existing = {
+        row["name"] if isinstance(row, sqlite3.Row) else row[1]
+        for row in conn.execute(f"PRAGMA table_info({table})")
+    }
+    for name, declaration in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
 # ─── 动态 SQL（列集中定义，避免手抖漏列）────────────────────────
@@ -217,16 +273,17 @@ def save_stock(
         _optional_text(history.get("price_adjust")) or "qfq",
     )
 
-    with conn:
-        conn.execute(_META_INSERT_SQL, meta_row)
-        if write_history:
-            if replace_history:
-                conn.execute("DELETE FROM stock_history WHERE code = ?", (code,))
-            if records:
-                conn.executemany(
-                    _HISTORY_INSERT_SQL,
-                    [_history_value_tuple(code, record) for record in records],
-                )
+    with _WRITE_LOCK:
+        with conn:
+            conn.execute(_META_INSERT_SQL, meta_row)
+            if write_history:
+                if replace_history:
+                    conn.execute("DELETE FROM stock_history WHERE code = ?", (code,))
+                if records:
+                    conn.executemany(
+                        _HISTORY_INSERT_SQL,
+                        [_history_value_tuple(code, record) for record in records],
+                    )
     return code
 
 
@@ -241,39 +298,40 @@ def save_index_nav(conn: sqlite3.Connection, payload: Mapping[str, Any], *, name
     end_date = _optional_text(payload.get("end_date")) or (records[-1]["date"] if records else None)
     target_years = payload.get("target_years")
 
-    with conn:
-        conn.execute("DELETE FROM index_nav WHERE code = ?", (code,))
-        if records:
-            conn.executemany(
+    with _WRITE_LOCK:
+        with conn:
+            conn.execute("DELETE FROM index_nav WHERE code = ?", (code,))
+            if records:
+                conn.executemany(
+                    """
+                    INSERT INTO index_nav (code, date, nav, nav_acc, daily_growth_rate, updated_at)
+                    VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    """,
+                    [
+                        (
+                            code,
+                            str(record["date"]),
+                            _optional_text(record.get("nav")),
+                            _optional_text(record.get("nav_acc")),
+                            _optional_text(record.get("daily_growth_rate")),
+                        )
+                        for record in records
+                    ],
+                )
+            conn.execute(
                 """
-                INSERT INTO index_nav (code, date, nav, nav_acc, daily_growth_rate, updated_at)
-                VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                INSERT INTO index_nav_meta (code, name, target_years, start_date, end_date, record_count, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                ON CONFLICT(code) DO UPDATE SET
+                    name = excluded.name,
+                    target_years = excluded.target_years,
+                    start_date = excluded.start_date,
+                    end_date = excluded.end_date,
+                    record_count = excluded.record_count,
+                    updated_at = CURRENT_TIMESTAMP
                 """,
-                [
-                    (
-                        code,
-                        str(record["date"]),
-                        _optional_text(record.get("nav")),
-                        _optional_text(record.get("nav_acc")),
-                        _optional_text(record.get("daily_growth_rate")),
-                    )
-                    for record in records
-                ],
+                (code, name, target_years, start_date, end_date, len(records)),
             )
-        conn.execute(
-            """
-            INSERT INTO index_nav_meta (code, name, target_years, start_date, end_date, record_count, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
-            ON CONFLICT(code) DO UPDATE SET
-                name = excluded.name,
-                target_years = excluded.target_years,
-                start_date = excluded.start_date,
-                end_date = excluded.end_date,
-                record_count = excluded.record_count,
-                updated_at = CURRENT_TIMESTAMP
-            """,
-            (code, name, target_years, start_date, end_date, len(records)),
-        )
     return len(records)
 
 
@@ -307,6 +365,193 @@ def import_stock_data_dir(
         if progress and idx % 200 == 0:
             progress(idx, len(files))
     return {"files": len(files), "imported": imported, "skipped": skipped}
+
+
+# ─── 申万三级归属缓存 (sw3 membership) ─────────────────────────
+
+_SW3_MEMBER_METRIC_COLS = (
+    "price",
+    "market_cap_yi",
+    "official_market_cap_ratio",
+    "roe_pct",
+    "profit_growth_pct",
+    "revenue_growth_pct",
+)
+
+
+def _sw3_member_metric(mem: Mapping[str, Any], col: str) -> Optional[float]:
+    value = mem.get(col)
+    if col == "official_market_cap_ratio" and value is None:
+        value = mem.get("index_weight")
+    return safe_float(value)
+
+
+def save_sw3_membership(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, int]:
+    """把 sw3_membership payload 全量落库（sw3_segment + sw3_member 两表替换）。
+
+    一个赛道可同时出现在 segments(带 members) 与 errors(上次刷新失败)——后者只在对应
+    segment 行的 error 列打标、不丢 members；纯失败赛道补一行无 member 的 segment。
+    全量 DELETE + 重插，匹配旧 json"整文件重写"语义(自然丢弃消失赛道)。返回写入计数。
+    """
+    segments = payload.get("segments") or []
+    errors = payload.get("errors") or []
+    error_by_code = {e.get("segment_code"): e.get("error")
+                     for e in errors if e.get("segment_code")}
+
+    seg_rows: List[tuple] = []
+    member_rows: List[tuple] = []
+    seen: set = set()
+    seen_members: set = set()
+    for seg in segments:
+        sc = _optional_text(seg.get("segment_code"))
+        if not sc:
+            continue
+        seen.add(sc)
+        seg_rows.append((
+            sc,
+            _optional_text(seg.get("segment_name")),
+            _optional_text(seg.get("parent_segment")),
+            seg.get("member_count"),
+            _optional_text(seg.get("refreshed_at")),
+            error_by_code.get(sc),
+        ))
+        for mem in seg.get("members") or []:
+            code = _normalize_code(mem.get("code"))
+            # 1股=1三级行业(code 唯一)；防御 legulegu 偶发重复，保第一次出现、不让整批崩
+            if not code or code in seen_members:
+                continue
+            seen_members.add(code)
+            member_rows.append(
+                (code, sc, _optional_text(mem.get("name")))
+                + tuple(_sw3_member_metric(mem, col) for col in _SW3_MEMBER_METRIC_COLS)
+            )
+    # 纯失败赛道(不在 segments 里)：补一行无 member 的 segment 以保留失败标记
+    for err in errors:
+        sc = _optional_text(err.get("segment_code"))
+        if sc and sc not in seen:
+            seen.add(sc)
+            seg_rows.append((sc, _optional_text(err.get("segment_name")), None, None, None, err.get("error")))
+
+    member_cols = ("code", "segment_code", "name") + _SW3_MEMBER_METRIC_COLS
+    with conn:
+        conn.execute("DELETE FROM sw3_member")
+        conn.execute("DELETE FROM sw3_segment")
+        conn.executemany(
+            "INSERT INTO sw3_segment "
+            "(segment_code, segment_name, parent_segment, member_count, refreshed_at, error, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            seg_rows,
+        )
+        if member_rows:
+            conn.executemany(
+                f"INSERT INTO sw3_member ({', '.join(member_cols)}) "
+                f"VALUES ({', '.join('?' for _ in member_cols)})",
+                member_rows,
+            )
+    return {"segments": len(seg_rows), "members": len(member_rows)}
+
+
+def load_sw3_membership(conn: sqlite3.Connection, max_age_days: Optional[int] = 30) -> Optional[Dict[str, Any]]:
+    """从 DB 拼回 sw3_membership dict（结构与旧 json 等价，下游零改动）。
+
+    generated_at 取所有赛道 refreshed_at 的最大值；max_age_days>0 时按它做 TTL，
+    过期返回 None（触发上层全量重爬）。库里无任何赛道返回 None。
+    """
+    seg_rows = conn.execute(
+        "SELECT segment_code, segment_name, parent_segment, member_count, refreshed_at, error "
+        "FROM sw3_segment ORDER BY segment_code"
+    ).fetchall()
+    if not seg_rows:
+        return None
+
+    members_by_seg: Dict[str, List[Dict[str, Any]]] = {}
+    for row in conn.execute(
+        "SELECT code, segment_code, name, price, market_cap_yi, official_market_cap_ratio, "
+        "roe_pct, profit_growth_pct, revenue_growth_pct FROM sw3_member ORDER BY segment_code, code"
+    ):
+        official_ratio = row["official_market_cap_ratio"]
+        members_by_seg.setdefault(row["segment_code"], []).append({
+            "code": row["code"],
+            "name": row["name"],
+            "price": row["price"],
+            "market_cap_yi": row["market_cap_yi"],
+            "official_market_cap_ratio": official_ratio,
+            "index_weight": official_ratio,
+            "roe_pct": row["roe_pct"],
+            "profit_growth_pct": row["profit_growth_pct"],
+            "revenue_growth_pct": row["revenue_growth_pct"],
+        })
+
+    segments: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+    refreshed_times: List[str] = []
+    for row in seg_rows:
+        sc = row["segment_code"]
+        members = members_by_seg.get(sc, [])
+        if members:
+            segments.append({
+                "segment_code": sc,
+                "segment_name": row["segment_name"],
+                "parent_segment": row["parent_segment"],
+                "member_count": row["member_count"],
+                "members": members,
+                "refreshed_at": row["refreshed_at"],
+            })
+            if row["refreshed_at"]:
+                refreshed_times.append(row["refreshed_at"])
+        if row["error"]:
+            errors.append({"segment_code": sc, "segment_name": row["segment_name"], "error": row["error"]})
+
+    if not segments:
+        return None
+    generated_at = max(refreshed_times) if refreshed_times else None
+    if max_age_days and max_age_days > 0 and generated_at:
+        try:
+            gen = datetime.strptime(generated_at, "%Y-%m-%d %H:%M:%S")
+            if (datetime.now() - gen).days > max_age_days:
+                return None
+        except ValueError:
+            pass
+    return {
+        "schema": "sw3_membership.v1",
+        "generated_at": generated_at,
+        "source": "申万三级行业成分(Legulegu, SQLite缓存)",
+        "segment_count": len(segments),
+        "segments": segments,
+        "errors": errors,
+    }
+
+
+def stock_segment(conn: sqlite3.Connection, code: str) -> Optional[Dict[str, Any]]:
+    """个股 → 申万三级行业(+一级父行业)反查。命中一行(1股=1赛道)，无则 None。"""
+    row = conn.execute(
+        "SELECT m.segment_code, s.segment_name, s.parent_segment "
+        "FROM sw3_member m JOIN sw3_segment s ON s.segment_code = m.segment_code "
+        "WHERE m.code = ?",
+        (_normalize_code(code),),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "segment_code": row["segment_code"],
+        "segment_name": row["segment_name"],
+        "parent_segment": row["parent_segment"],
+    }
+
+
+def segment_map(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
+    """全量 {code: {segment_code, segment_name, parent_segment}}，供批量打标/反查。"""
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in conn.execute(
+        "SELECT m.code, m.segment_code, s.segment_name, s.parent_segment "
+        "FROM sw3_member m JOIN sw3_segment s ON s.segment_code = m.segment_code"
+    ):
+        out[row["code"]] = {
+            "segment_code": row["segment_code"],
+            "segment_name": row["segment_name"],
+            "parent_segment": row["parent_segment"],
+        }
+    return out
 
 
 # ─── 读取 ──────────────────────────────────────────────────────
@@ -439,6 +684,20 @@ def codes_with_history(conn: sqlite3.Connection) -> List[str]:
     return [row["code"] for row in conn.execute("SELECT DISTINCT code FROM stock_history ORDER BY code")]
 
 
+def codes_needing_history_cleanup(conn: sqlite3.Connection) -> List[str]:
+    """有 snapshot-only/空行(daily_open 为空)需要 prune 清洗的 code。
+
+    正常日线 bar 的 daily_open 必非空；snapshot-only 与空行都满足 daily_open IS NULL，
+    故这是 prunable 行的安全超集——用它替代'全库逐只 load+prune'的扫描(多数情况返回空)。
+    """
+    return [
+        row["code"]
+        for row in conn.execute(
+            "SELECT DISTINCT code FROM stock_history WHERE daily_open IS NULL ORDER BY code"
+        )
+    ]
+
+
 def stock_exists(conn: sqlite3.Connection, code: str) -> bool:
     return conn.execute(
         "SELECT 1 FROM stock_meta WHERE code = ? LIMIT 1", (_normalize_code(code),)
@@ -455,6 +714,34 @@ def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:
         "SELECT history_refetched_at FROM stock_meta WHERE code = ?", (_normalize_code(code),)
     ).fetchone()
     return row["history_refetched_at"] if row else None
+
+
+def financials_refetched_map(
+    conn: sqlite3.Connection, codes: Optional[Sequence[str]] = None
+) -> Dict[str, Optional[str]]:
+    """{code: financials_refetched_at}（含值为 None 的，便于判断"从没爬过财报"）。
+
+    codes 给定时只查这些(分批 IN 查询，避免 SQL 变量上限)，库里没有的 code 也回填 None；
+    不给则全表。供龙头池财报增量刷新在进线程池前一次性读取新鲜度。
+    """
+    if codes is None:
+        return {
+            row["code"]: row["financials_refetched_at"]
+            for row in conn.execute("SELECT code, financials_refetched_at FROM stock_meta")
+        }
+    norm = [_normalize_code(c) for c in codes if c]
+    out: Dict[str, Optional[str]] = {}
+    for i in range(0, len(norm), 500):
+        chunk = norm[i:i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT code, financials_refetched_at FROM stock_meta WHERE code IN ({placeholders})",
+            chunk,
+        ):
+            out[row["code"]] = row["financials_refetched_at"]
+    for code in norm:
+        out.setdefault(code, None)
+    return out
 
 
 def iter_history(conn: sqlite3.Connection):

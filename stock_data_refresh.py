@@ -77,23 +77,6 @@ def command_text(cmd: Iterable[str]) -> str:
     return " ".join(str(part) for part in cmd)
 
 
-def env_text(names, default: str) -> str:
-    for name in names:
-        value = os.getenv(name)
-        if value:
-            return value
-    return default
-
-
-def env_int(names, default: int) -> int:
-    if isinstance(names, str):
-        names = (names,)
-    try:
-        return int(env_text(names, str(default)) or str(default))
-    except ValueError:
-        return default
-
-
 def run_step(
     name: str,
     cmd: List[str],
@@ -137,14 +120,14 @@ def _history_payload(code: str, name: str, records: List[Dict[str, Any]], source
 
 
 def fill_stock_history_from_local_data() -> Dict[str, Any]:
-    """Normalize stock_history and remove snapshot-only daily points (now in SQLite).
+    """Normalize stock_history: drop snapshot-only / stub rows (now in SQLite).
 
-    Snapshot-only rows (close/valuation without daily market fields) poison OHLCV
-    completeness checks, so prune them; clean rows are a no-op.
+    只挑库里实际含 snapshot/空行(daily_open 为空)的 code 来 prune，避免每次全库逐只 load 扫描
+    (4900+ 只)；干净库直接返回 candidates=0。
     """
     conn = ss.connect()
     try:
-        codes = ss.codes_with_history(conn)
+        codes = ss.codes_needing_history_cleanup(conn)
         updated = 0
         skipped = 0
         removed_records = 0
@@ -163,11 +146,11 @@ def fill_stock_history_from_local_data() -> Dict[str, Any]:
             removed_records += removed
 
         return {
+            "candidates": len(codes),
             "updated": updated,
             "skipped": skipped,
             "removed_snapshot_only_records": removed_records,
             "source_files": ss.table_count(conn, "stock_meta"),
-            "stock_history_files": len(codes),
         }
     finally:
         conn.close()
@@ -189,13 +172,45 @@ def local_step_result(name: str, command: str, func) -> StepResult:
         return StepResult(name, command, False, 1, elapsed, error=str(exc))
 
 
+def _date_from_text(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            continue
+    return None
+
+
+def _hot_money_source_generated_at(candidates: Any) -> Optional[str]:
+    if isinstance(candidates, dict):
+        generated_at = str(candidates.get("generated_at") or "").strip()
+        if generated_at:
+            return generated_at
+        as_of_date = str(candidates.get("as_of_date") or "").strip()
+        if as_of_date:
+            return as_of_date
+    if HOT_MONEY_CANDIDATES_FILE.exists():
+        mtime = datetime.fromtimestamp(HOT_MONEY_CANDIDATES_FILE.stat().st_mtime)
+        return mtime.strftime("%Y-%m-%d %H:%M:%S")
+    return None
+
+
 def mirror_capital_outputs() -> Dict[str, Any]:
     candidates = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
     stocks = candidates.get("stocks", []) if isinstance(candidates, dict) else []
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    today = datetime.now().strftime("%Y-%m-%d")
+    mirrored_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    source_generated_at = _hot_money_source_generated_at(candidates)
+    source_as_of_date = candidates.get("as_of_date") if isinstance(candidates, dict) else None
+    snapshot_date = (
+        _date_from_text(source_as_of_date)
+        or _date_from_text(source_generated_at)
+        or datetime.now().strftime("%Y-%m-%d")
+    )
 
-    snapshot_path = CAPITAL_DIR / "snapshots" / f"hot_money_candidates_{today}.json"
+    snapshot_path = CAPITAL_DIR / "snapshots" / f"hot_money_candidates_{snapshot_date}.json"
     if HOT_MONEY_CANDIDATES_FILE.exists():
         snapshot_path.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(HOT_MONEY_CANDIDATES_FILE, snapshot_path)
@@ -219,8 +234,11 @@ def mirror_capital_outputs() -> Dict[str, Any]:
     write_json_file(
         DATA_DIR / "main_capital_picks.json",
         {
-            "generated_at": now,
+            "generated_at": source_generated_at,
+            "mirrored_at": mirrored_at,
             "source": "data/capital/hot_money_candidates.json",
+            "source_generated_at": source_generated_at,
+            "source_as_of_date": source_as_of_date,
             "count": len(picks),
             "picks": picks,
         },
@@ -228,32 +246,55 @@ def mirror_capital_outputs() -> Dict[str, Any]:
     return {
         "capital_candidate_count": len(stocks),
         "capital_snapshot": str(snapshot_path.relative_to(ROOT)),
+        "capital_source_generated_at": source_generated_at,
+        "capital_mirrored_at": mirrored_at,
         "main_capital_picks_count": len(picks),
     }
 
 
-def refresh_csi300_benchmark() -> Dict[str, Any]:
-    from stock_crawl_price_valuation import (
-        CSI300_ETF_CODE,
-        CSI300_ETF_YEARS,
-        CSI300_FILE,
-        fetch_csi300_etf,
-    )
-
-    records = fetch_csi300_etf(years=CSI300_ETF_YEARS)
-    path = Path(CSI300_FILE)
+def _relative_display_path(path: Path) -> str:
     try:
-        display_path = str(path.resolve().relative_to(ROOT))
+        return str(path.resolve().relative_to(ROOT))
     except ValueError:
-        display_path = str(path)
+        return str(path)
+
+
+def refresh_benchmark_etfs() -> Dict[str, Any]:
+    from stock_crawl_price_valuation import BENCHMARK_ETFS, fetch_benchmark_etfs
+
+    results = fetch_benchmark_etfs()
+    benchmarks = []
+    for item in BENCHMARK_ETFS:
+        records = results.get(item["code"], [])
+        benchmarks.append({
+            "code": item["code"],
+            "label": item["label"],
+            "target_years": item["years"],
+            "records": len(records),
+            "start_date": records[0]["date"] if records else None,
+            "end_date": records[-1]["date"] if records else None,
+            "file": _relative_display_path(Path(item["file"])),
+        })
     return {
-        "code": CSI300_ETF_CODE,
-        "target_years": CSI300_ETF_YEARS,
-        "records": len(records),
-        "start_date": records[0]["date"] if records else None,
-        "end_date": records[-1]["date"] if records else None,
-        "file": display_path,
+        "codes": [item["code"] for item in BENCHMARK_ETFS],
+        "benchmarks": benchmarks,
     }
+
+
+def refresh_stock_universe() -> Dict[str, Any]:
+    """刷新沪深300(000300)与中证全指(000985)成分到 data/stock_universe.json。
+
+    供 stock_advanced_strategies / stock_strategy_optimizer 的 csi300_current /
+    csi300_persistence 因子与 require_csi300 过滤使用。成分变动慢，但需随刷新定期更新——
+    旧版只有手动跑 stock_crawl_fundamentals 才会写它，导致 csi300 一直停在旧快照。
+    """
+    from stock_crawl_common import fetch_index_constituents
+    from stock_crawl_fundamentals import save_stock_universe
+
+    csi300 = fetch_index_constituents("000300")
+    csi_all = fetch_index_constituents("000985")
+    save_stock_universe(csi300, csi_all)
+    return {"csi300": len(csi300), "all": len(csi_all)}
 
 
 def collect_data_health() -> Dict[str, Any]:
@@ -261,12 +302,19 @@ def collect_data_health() -> Dict[str, Any]:
     try:
         stock_data_count = ss.table_count(conn, "stock_meta")
         stock_history_count = len(ss.codes_with_history(conn))
-        csi300 = ss.load_index_nav(conn, "510310")
+        benchmark_nav = {}
+        for code in ("510310", "510580"):
+            entry = ss.load_index_nav(conn, code)
+            records = entry.get("records", []) if isinstance(entry, dict) else []
+            benchmark_nav[code] = {
+                "records": len(records),
+                "start_date": entry.get("start_date") if isinstance(entry, dict) else None,
+                "end_date": entry.get("end_date") if isinstance(entry, dict) else None,
+            }
     finally:
         conn.close()
     capital = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
     strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
-    csi300_records = csi300.get("records", []) if isinstance(csi300, dict) else []
     candidate_cache = load_json_file(DATA_DIR / "stock_strategy_candidate_cache.json", {})
     long_cache = candidate_cache.get("long") if isinstance(candidate_cache, dict) else {}
     short_cache = candidate_cache.get("short") if isinstance(candidate_cache, dict) else {}
@@ -281,37 +329,30 @@ def collect_data_health() -> Dict[str, Any]:
         "strategy_long_cache_candidates": long_cache.get("candidate_count") if isinstance(long_cache, dict) else None,
         "strategy_short_cache_generated_at": short_cache.get("generated_at") if isinstance(short_cache, dict) else None,
         "strategy_short_cache_candidates": short_cache.get("candidate_count") if isinstance(short_cache, dict) else None,
-        "csi300_benchmark_records": len(csi300_records),
-        "csi300_benchmark_start": csi300.get("start_date") if isinstance(csi300, dict) else None,
-        "csi300_benchmark_end": csi300.get("end_date") if isinstance(csi300, dict) else None,
+        "benchmark_nav": benchmark_nav,
+        "csi300_benchmark_records": benchmark_nav["510310"]["records"],
+        "csi300_benchmark_start": benchmark_nav["510310"]["start_date"],
+        "csi300_benchmark_end": benchmark_nav["510310"]["end_date"],
+        "csi500_benchmark_records": benchmark_nav["510580"]["records"],
+        "csi500_benchmark_start": benchmark_nav["510580"]["start_date"],
+        "csi500_benchmark_end": benchmark_nav["510580"]["end_date"],
     }
 
 
 def refresh_before_server(
     *,
     mode: str = "full",
-    strict: bool = False,
     timeout: Optional[int] = None,
-    python: Optional[str] = None,
-    index_workers: int = 40,
-    index_limit: int = 0,
-    capital_days: int = 14,
-    capital_top_yyb: int = 30,
-    capital_min_followers: int = 1,
-    capital_score_top: int = 100,
     no_proxy: bool = False,
-    daily_process_workers: int = 32,
-    daily_process_sources: str = "腾讯,新浪",
 ) -> Dict[str, Any]:
-    python_bin = resolve_python(python)
+    python_bin = resolve_python()
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TQDM_DISABLE", "1")
-    env.setdefault("STOCK_THREAD_COUNT", "16")
-    env["STOCK_DAILY_PROCESS_WORKERS"] = str(max(daily_process_workers, 0))
-    env["STOCK_DAILY_PROCESS_SOURCES"] = daily_process_sources
-    env["STOCK_DAILY_FALLBACK_PROCESS_WORKERS"] = env["STOCK_DAILY_PROCESS_WORKERS"]
-    env["STOCK_DAILY_FALLBACK_PROCESS_SOURCES"] = env["STOCK_DAILY_PROCESS_SOURCES"]
+    env.setdefault("STOCK_THREAD_COUNT", "48")
+    # 日线源进程池：默认 32 / 腾讯,新浪；用 STOCK_DAILY_PROCESS_WORKERS / _SOURCES 环境变量可覆盖
+    env.setdefault("STOCK_DAILY_PROCESS_WORKERS", "32")
+    env.setdefault("STOCK_DAILY_PROCESS_SOURCES", "腾讯,新浪")
     if no_proxy:
         # 数据源均为境内接口，绕过本地代理直连；NO_PROXY=* 同时屏蔽系统代理
         for var in ("http_proxy", "https_proxy", "all_proxy",
@@ -328,42 +369,36 @@ def refresh_before_server(
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     steps: List[StepResult] = []
 
-    index_cmd = [
-        python_bin,
-        "-B",
-        "stock_crawl_fundamentals.py",
-        "--mode",
-        "staged",
-        "--workers",
-        str(index_workers),
-        "--limit",
-        str(index_limit if full else max(index_limit, 80)),
-    ]
-    steps.append(
-        run_step(
-            "index_candidate_data",
-            index_cmd,
-            timeout=timeout,
-            env=env,
-            skip=mode == "capital-only",
-        )
+    history_step = run_step(
+        "segment_leader_history",
+        [python_bin, "-B", "stock_crawl_price_valuation.py"],
+        timeout=timeout,
+        env=env,
+        skip=not full,
     )
-
+    steps.append(history_step)
     steps.append(
         run_step(
-            "csi800_history",
-            [python_bin, "-B", "stock_crawl_price_valuation.py"],
+            "segment_leader_fundamentals",
+            [python_bin, "-B", "stock_crawl_fundamentals.py", "--mode", "full", "--segment-refresh-slice", "0"],
             timeout=timeout,
             env=env,
-            skip=not full,
+            skip=(not full) or (not history_step.ok),
         )
     )
     if mode != "capital-only":
         steps.append(
             local_step_result(
-                "csi300_benchmark",
-                "fetch 510310 CSI300 ETF accumulated NAV for 12 years",
-                refresh_csi300_benchmark,
+                "benchmark_etfs",
+                "fetch 510310 CSI300 and 510580 CSI500 ETF accumulated NAV for 12 years",
+                refresh_benchmark_etfs,
+            )
+        )
+        steps.append(
+            local_step_result(
+                "stock_universe_csi300",
+                "refresh 沪深300(000300) + 中证全指(000985) 成分 -> data/stock_universe.json",
+                refresh_stock_universe,
             )
         )
     if full:
@@ -378,19 +413,9 @@ def refresh_before_server(
     steps.append(
         run_step(
             "dragon_tiger_capital",
-            [
-                python_bin,
-                "-B",
-                "stock_crawl_hot_money.py",
-                "--days",
-                str(capital_days),
-                "--top-yyb",
-                str(capital_top_yyb),
-                "--min-followers",
-                str(capital_min_followers),
-                "--score-top",
-                str(capital_score_top),
-            ],
+            # 龙虎榜阈值固定为刷新口径(覆盖 hot_money 自身默认 20/2/20)；要调改这里或单独跑 stock_crawl_hot_money.py
+            [python_bin, "-B", "stock_crawl_hot_money.py",
+             "--days", "14", "--top-yyb", "30", "--min-followers", "1", "--score-top", "100"],
             timeout=timeout,
             env=env,
         )
@@ -427,55 +452,21 @@ def refresh_before_server(
         "health": health,
     }
     write_json_file(REFRESH_REPORT_FILE, report)
-
-    if strict and not ok:
-        failed = [step.name for step in steps if not step.ok]
-        raise RuntimeError(f"data refresh failed before server startup: {', '.join(failed)}")
     return report
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Refresh local stock data before serving the dashboard")
     parser.add_argument("--mode", choices=["full", "quick", "capital-only"], default="full")
-    parser.add_argument("--strict", action="store_true")
-    parser.add_argument("--timeout", type=int, default=1800, help="per-step timeout seconds, 0=disabled")
-    parser.add_argument("--python", default=None, help="python executable used for crawler subprocesses")
-    parser.add_argument("--index-workers", type=int, default=40)
-    parser.add_argument("--index-limit", type=int, default=0)
-    parser.add_argument("--capital-days", type=int, default=14)
-    parser.add_argument("--capital-top-yyb", type=int, default=30)
-    parser.add_argument("--capital-min-followers", type=int, default=1)
-    parser.add_argument("--capital-score-top", type=int, default=100)
-    parser.add_argument("--daily-process-workers", type=int,
-                        default=env_int(("STOCK_DAILY_PROCESS_WORKERS",
-                                         "STOCK_DAILY_FALLBACK_PROCESS_WORKERS"), 32),
-                        help="日线源进程池大小；<=1 表示关闭，默认 32")
-    parser.add_argument("--daily-process-sources",
-                        default=env_text(("STOCK_DAILY_PROCESS_SOURCES",
-                                          "STOCK_DAILY_FALLBACK_PROCESS_SOURCES"), "腾讯,新浪"),
-                        help="需要进程池隔离的日线源，逗号分隔，默认 腾讯,新浪")
-    parser.add_argument("--fallback-process-workers", dest="daily_process_workers", type=int,
-                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
-    parser.add_argument("--fallback-process-sources", dest="daily_process_sources",
-                        default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    parser.add_argument("--timeout", type=int, default=0, help="per-step timeout seconds, 0=disabled")
     parser.add_argument("--no-proxy", action="store_true",
                         help="绕过系统代理直连境内数据源（东财/腾讯/新浪/百度）")
     args = parser.parse_args()
 
     report = refresh_before_server(
         mode=args.mode,
-        strict=args.strict,
         timeout=args.timeout or None,
-        python=args.python,
-        index_workers=args.index_workers,
-        index_limit=args.index_limit,
-        capital_days=args.capital_days,
-        capital_top_yyb=args.capital_top_yyb,
-        capital_min_followers=args.capital_min_followers,
-        capital_score_top=args.capital_score_top,
         no_proxy=args.no_proxy,
-        daily_process_workers=args.daily_process_workers,
-        daily_process_sources=args.daily_process_sources,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
 

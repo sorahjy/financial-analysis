@@ -78,7 +78,7 @@ class FactorSpec:
 
 LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("csi300_current", "当前沪深300", "long", "指数约束", "现仍在沪深300成分池。", 2.0, "boolean"),
-    FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、上市年限、中证大盘池近似长期稳定成分。", 1.6, "direct"),
+    FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、中证大盘池近似长期稳定成分。", 1.6, "direct"),
     FactorSpec("market_cap", "总市值", "long", "规模流动性", "偏好大盘股。", 1.2, "percentile"),
     FactorSpec("size_reversal", "小市值因子", "long", "规模流动性", "SMB代理：总市值越小得分越高，给中小盘优质股入场机会，与总市值因子由权重搜索博弈。", 0.5, "percentile", "low", missing_score=40),
     FactorSpec("liquidity", "日均成交额", "long", "规模流动性", "偏好交易容量更高的股票。", 0.6, "percentile"),
@@ -170,10 +170,9 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
-        "top_n": 8,
+        "top_n": 10,
         "min_score": 60,
         "min_market_cap_yi": 100,
-        "min_listing_years": 5,
         "require_csi300": False,
         "require_high_drawdown": False,
         "min_high_drawdown_pct": 40,
@@ -184,7 +183,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "short": {
         "enabled": True,
-        "top_n": 8,
+        "top_n": 10,
         "min_score": 55,
         "hold_days_min": 1,
         "hold_days_max": 5,
@@ -555,16 +554,6 @@ def consecutive_dividend_asof(stock: Dict[str, Any], as_of: str, years: int = 3)
             paid_years.add(int(ann[:4]))
     base = int(as_of[:4])
     return all((base - i) in paid_years for i in range(1, years + 1))
-
-
-def listing_age_years(
-        snapshot: Optional[Dict[str, Any]], as_of: Optional[str] = None
-) -> Optional[float]:
-    date = parse_date((snapshot or {}).get("listing_date"))
-    if not date:
-        return None
-    ref = parse_date(as_of) if as_of else datetime.now()
-    return max(0.0, (ref - date).days / 365.25)
 
 
 def high_to_latest_drawdown_pct(rows: List[Dict[str, Any]]) -> Optional[float]:
@@ -1145,7 +1134,6 @@ def build_long_candidates(
         )
 
     min_cap_yi = safe_float(config.get("min_market_cap_yi")) or 0.0
-    min_listing = safe_float(config.get("min_listing_years")) or 0.0
     require_csi300 = bool(config.get("require_csi300", True))
     require_high_drawdown = bool(config.get("require_high_drawdown", False))
     min_high_drawdown_pct = safe_float(config.get("min_high_drawdown_pct")) or 0.0
@@ -1161,9 +1149,6 @@ def build_long_candidates(
         snap = snapshot.get(code, {})
         in_csi300 = code in csi300
         in_csi_all = bool(snap.get("in_csi_all")) or code in csi_all
-        age = listing_age_years(snap, as_of)
-        if min_listing and (age is None or age < min_listing):
-            continue
         if require_csi300 and not in_csi300:
             continue
 
@@ -1187,14 +1172,13 @@ def build_long_candidates(
         if min_cap_yi and (market_cap_yi is None or market_cap_yi < min_cap_yi):
             continue
 
-        high_drawdown_pct = None
+        high_drawdown_pct = historical_high_drawdown_pct(code, stock, as_of=as_of, hist_rows=hist_rows)
         if require_high_drawdown:
-            high_drawdown_pct = historical_high_drawdown_pct(code, stock, as_of=as_of, hist_rows=hist_rows)
             if high_drawdown_pct is None or high_drawdown_pct < min_high_drawdown_pct:
                 continue
 
         raw = compute_long_raw_factors(
-            code, stock, snap, in_csi300, in_csi_all, age, market_cap_cny,
+            code, stock, snap, in_csi300, in_csi_all, market_cap_cny,
             high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
         )
 
@@ -1230,11 +1214,6 @@ def passes_long_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bo
     if min_cap_yi and (market_cap_yi is None or market_cap_yi < min_cap_yi):
         return False
 
-    min_listing = safe_float(config.get("min_listing_years")) or 0.0
-    listing_age = safe_float(raw.get("listing_age"))
-    if min_listing and (listing_age is None or listing_age < min_listing):
-        return False
-
     if bool(config.get("require_csi300", True)) and not raw.get("csi300_current"):
         return False
 
@@ -1253,7 +1232,6 @@ def compute_long_raw_factors(
         snapshot: Dict[str, Any],
         in_csi300: bool,
         in_csi_all: bool,
-        age: Optional[float],
         market_cap_cny: Optional[float],
         high_drawdown_pct: Optional[float] = None,
         as_of: Optional[str] = None,
@@ -1323,7 +1301,7 @@ def compute_long_raw_factors(
     if roe_mean is not None:
         roe_stability = roe_mean - (roe_std or 0.0)
 
-    persistence = csi300_persistence_proxy(in_csi300, in_csi_all, age)
+    persistence = csi300_persistence_proxy(in_csi300, in_csi_all)
     total_assets = safe_float(latest_ind.get("total_assets"))
     if total_assets is None:
         total_assets = latest_value(balance, "total_assets_liabilities")
@@ -1408,8 +1386,6 @@ def compute_long_raw_factors(
         ),
         "historical_high_drawdown": high_drawdown_pct,
         "industry_leadership": None,
-        # listing_age 不再是打分因子，但 min_listing_years 硬过滤仍读取它
-        "listing_age": age,
         "book_to_market": book_to_market,
         "earnings_yield": scale_ratio_to_pct(earnings_yield),
         "cashflow_yield": scale_ratio_to_pct(cashflow_yield),
@@ -1431,10 +1407,8 @@ def compute_long_raw_factors(
     }
 
 
-def csi300_persistence_proxy(in_csi300: bool, in_csi_all: bool, age: Optional[float]) -> float:
-    age_score = clamp(((age or 0.0) / 12.0) * 100.0)
-    csi_score = 100.0 if in_csi300 else (45.0 if in_csi_all else 0.0)
-    return round(csi_score * 0.72 + age_score * 0.28, 4)
+def csi300_persistence_proxy(in_csi300: bool, in_csi_all: bool) -> float:
+    return 100.0 if in_csi300 else (45.0 if in_csi_all else 0.0)
 
 
 def scale_ratio_to_pct(value: Optional[float]) -> Optional[float]:
@@ -2004,7 +1978,6 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     # merely because the normalization pool changed.
     scoring_config["exclude_st"] = False
     scoring_config["min_market_cap_yi"] = 0
-    scoring_config["min_listing_years"] = 0
     scoring_config["require_csi300"] = False
     scoring_config["require_high_drawdown"] = False
     candidates, notes = live_long_candidate_pool(scoring_config)
