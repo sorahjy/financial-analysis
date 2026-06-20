@@ -9,6 +9,7 @@ from stock_advanced_strategies import (
     get_factor_registry,
     get_default_config,
     high_to_latest_drawdown_pct,
+    industry_label_from_sw3,
     institution_conflict_score,
     passes_long_hard_filters,
     report_available_date,
@@ -16,6 +17,7 @@ from stock_advanced_strategies import (
     rsi_sweetspot_score,
     run_long_strategy,
     run_strategies,
+    strip_internal,
 )
 
 
@@ -114,6 +116,37 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(first_not_none(0, 5), 0.0)
         self.assertEqual(first_not_none(None, "abc", 3), 3.0)
         self.assertIsNone(first_not_none(None, float("nan")))
+
+    def test_sw3_industry_label_uses_parent_and_segment_without_unknown(self):
+        label, bucket, sw2, sw3, segment_code = industry_label_from_sw3({
+            "segment_code": "851024",
+            "parent_segment": "通信设备",
+            "segment_name": "通信网络设备及器件",
+        }, fallback="UNKNOWN")
+
+        self.assertEqual(label, "通信设备 / 通信网络设备及器件")
+        self.assertEqual(bucket, "通信网络设备及器件")
+        self.assertEqual(sw2, "通信设备")
+        self.assertEqual(sw3, "通信网络设备及器件")
+        self.assertEqual(segment_code, "851024")
+        self.assertEqual(industry_label_from_sw3(None, fallback="UNKNOWN")[0], "")
+
+    def test_strip_internal_keeps_sw3_industry_fields_for_frontend(self):
+        row = strip_internal([{
+            "rank": 1,
+            "code": "600000",
+            "name": "浦发银行",
+            "industry": "银行 / 股份制银行",
+            "sw2_industry": "银行",
+            "sw3_industry": "股份制银行",
+            "sw3_segment_code": "850111",
+            "score": 88.0,
+        }])[0]
+
+        self.assertEqual(row["industry"], "银行 / 股份制银行")
+        self.assertEqual(row["sw2_industry"], "银行")
+        self.assertEqual(row["sw3_industry"], "股份制银行")
+        self.assertEqual(row["sw3_segment_code"], "850111")
 
     def test_institution_conflict_distinguishes_lhb_direction(self):
         self.assertEqual(institution_conflict_score(-1e7, 5e7), 35.0)

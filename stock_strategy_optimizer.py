@@ -83,9 +83,9 @@ LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
 DEFAULT_OPTIMIZATION_ITERATIONS = 300
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
-# 每 30 个交易日取一折，固定持有 30 个交易日；相邻完整折首尾衔接。
-LONG_HOLD_CHOICES = [30]   # 长线持有期固定为30交易日
-LONG_FOLD_STEP_TD = 30     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
+# 每 60 个交易日取一折，固定持有 60 个交易日；相邻完整折首尾衔接。
+LONG_HOLD_CHOICES = [60]   # 长线持有期固定为60交易日
+LONG_FOLD_STEP_TD = 60     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
 LONG_MAX_LOOKBACK_TD = 2400
 LONG_COST = 0.004          # 单折买卖往返成本（佣金+冲击的粗略值）
 LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
@@ -275,7 +275,7 @@ def load_benchmark_series() -> Tuple[List[Dict[str, Any]], List[str]]:
 def decorrelate_pairs(pairs: List[Dict[str, Any]], min_gap_td: int) -> List[Dict[str, Any]]:
     """按交易日间隔贪心抽稀重叠折，降低自相关，用于尾部/IR等风险统计。
 
-    当前默认 hold=30/step=30，完整折基本首尾衔接、不再有旧版 125/30 的窗口重叠。
+    当前默认 hold=60/step=60，完整折基本首尾衔接、不再有旧版 125/30 的窗口重叠。
     这个函数保留给未来若持有期重新大于步长时使用，尾部统计会优先看去相关子样本。
     """
     if not pairs:
@@ -296,7 +296,7 @@ def random_fold_split(
     """按折随机打乱后切分训练/验证（约 train_frac / 1-train_frac），不做时间隔离。
 
     用户指定口径：取消 embargo 与时间分块，训练/验证折在时间上混合、各覆盖全部 regime。
-    当前默认 hold=30/step=30，完整折首尾衔接，不再有旧版长持有窗口造成的重叠泄漏。
+    当前默认 hold=60/step=60，完整折首尾衔接，不再有旧版长持有窗口造成的重叠泄漏。
     每折按其 as_of 的确定性随机键排序后切分，保证可复现、且各配置用同一划分。
     """
     if len(pairs) < 2:
@@ -644,7 +644,7 @@ def long_validation_adjusted_objective(
     """长线最终选优目标：训练/验证共同决定，并惩罚不稳健的漂亮结果。
 
     验证为随机打乱后的折切分(见 random_fold_split)，按用户口径不做时间隔离；
-    当前默认 30 日持有 / 30 日起点间隔，完整折不再像旧版 125 日持有那样高度重叠。
+    当前默认 60 日持有 / 60 日起点间隔，完整折不再像旧版 125 日持有那样高度重叠。
     """
     train_obj = long_fold_objective(train_pairs, hold_td, decorr_gap_td)
     val_obj = long_fold_objective(val_pairs, hold_td, decorr_gap_td)
@@ -1320,10 +1320,10 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "candidate_count": len(deep_codes),
         "price_history_health": price_health,
         "notes": [search_note] + benchmark_notes + notes + [
-            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有30交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
-            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=30个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
+            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有60交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
+            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=60个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
             "折样本采用时间衰减权重：最旧折 0.5x，最新折 2.0x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
-            "完整折每30交易日取一个起点、持有30交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
+            "完整折每60交易日取一个起点、持有60交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
             "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
             "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。高点回撤(抄底)过滤开关参与搜索；开启时 min_high_drawdown_pct 在40~70%搜优。",
             "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为全部折最差单折超额，tail_cvar_excess_pct 为尾部最差20%折的平均超额。",

@@ -31,7 +31,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 120000
 
 # 大表列：8 个日频行情字段 + 5 个估值字段，与 stock_crawl_common 的 canonical schema 同源。
@@ -172,6 +172,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             roe_pct            REAL,
             profit_growth_pct  REAL,
             revenue_growth_pct REAL,
+            is_leader          INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (segment_code) REFERENCES sw3_segment (segment_code) ON DELETE CASCADE
         );
 
@@ -181,6 +182,9 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     )
     _ensure_table_columns(conn, "sw3_member", {
         "official_market_cap_ratio": "REAL",
+        # 细分龙头标记：build_segment_leader_pool 选出龙头后回写(见 mark_sw3_leaders)，
+        # 供主力雷达等模块直接 WHERE is_leader=1 取候选池，无需再解析 segment_leader_pool.json。
+        "is_leader": "INTEGER NOT NULL DEFAULT 0",
     })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -523,7 +527,7 @@ def load_sw3_membership(conn: sqlite3.Connection, max_age_days: Optional[int] = 
 
 
 def stock_segment(conn: sqlite3.Connection, code: str) -> Optional[Dict[str, Any]]:
-    """个股 → 申万三级行业(+一级父行业)反查。命中一行(1股=1赛道)，无则 None。"""
+    """个股 → 申万三级行业(+二级父行业)反查。命中一行(1股=1赛道)，无则 None。"""
     row = conn.execute(
         "SELECT m.segment_code, s.segment_name, s.parent_segment "
         "FROM sw3_member m JOIN sw3_segment s ON s.segment_code = m.segment_code "
@@ -552,6 +556,48 @@ def segment_map(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
             "parent_segment": row["parent_segment"],
         }
     return out
+
+
+def mark_sw3_leaders(conn: sqlite3.Connection, codes: Sequence[str]) -> int:
+    """把给定 code 标记为细分龙头(is_leader=1)，其余全部清零。
+
+    供 build_segment_leader_pool 选出龙头后回写：save_sw3_membership 会 DELETE 重插
+    sw3_member（is_leader 落回默认 0），故每次重建龙头池后调用本函数重新打标，
+    让 is_leader 反映最新一轮选股结果。返回实际打标命中的行数。
+    """
+    norm = sorted({_normalize_code(c) for c in codes if _normalize_code(c)})
+    with _WRITE_LOCK:
+        with conn:
+            conn.execute("UPDATE sw3_member SET is_leader = 0 WHERE is_leader = 1")
+            updated = 0
+            for i in range(0, len(norm), 500):
+                chunk = norm[i:i + 500]
+                placeholders = ",".join("?" for _ in chunk)
+                cur = conn.execute(
+                    f"UPDATE sw3_member SET is_leader = 1 WHERE code IN ({placeholders})", chunk
+                )
+                updated += cur.rowcount
+    return updated
+
+
+def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """当前被标记为细分龙头(is_leader=1)的成分股，含所属三级行业与最新总市值(亿元)。供主力雷达取候选池。"""
+    rows = conn.execute(
+        "SELECT m.code, m.name, m.market_cap_yi, m.segment_code, s.segment_name, s.parent_segment "
+        "FROM sw3_member m LEFT JOIN sw3_segment s ON s.segment_code = m.segment_code "
+        "WHERE m.is_leader = 1 ORDER BY m.segment_code, m.code"
+    ).fetchall()
+    return [
+        {
+            "code": row["code"],
+            "name": row["name"],
+            "market_cap_yi": row["market_cap_yi"],
+            "segment_code": row["segment_code"],
+            "segment_name": row["segment_name"],
+            "parent_segment": row["parent_segment"],
+        }
+        for row in rows
+    ]
 
 
 # ─── 读取 ──────────────────────────────────────────────────────
@@ -646,6 +692,26 @@ def stock_history_end_date(conn: sqlite3.Connection, code: str) -> Optional[str]
 def table_count(conn: sqlite3.Connection, table_name: str) -> int:
     row = conn.execute(f"SELECT COUNT(*) AS count FROM {table_name}").fetchone()
     return int(row["count"]) if row else 0
+
+
+def _sw3_signature_from_conn(conn: sqlite3.Connection) -> Dict[str, Any]:
+    seg = conn.execute(
+        "SELECT COUNT(*) AS c, MAX(updated_at) AS m FROM sw3_segment"
+    ).fetchone()
+    return {
+        "sw3_segments": int(seg["c"]) if seg else 0,
+        "sw3_members": table_count(conn, "sw3_member"),
+        "sw3_max_updated_at": seg["m"] if seg else None,
+    }
+
+
+def sw3_signature(db_file: Path | str = DEFAULT_DB_FILE) -> Dict[str, Any]:
+    """申万行业归属缓存签名；供消费方高效判断 sw3 映射是否需要重读。"""
+    conn = connect(db_file)
+    try:
+        return _sw3_signature_from_conn(conn)
+    finally:
+        conn.close()
 
 
 # ─── 外部集成辅助（爬虫/消费方切库用）──────────────────────────
@@ -779,7 +845,7 @@ def iter_history(conn: sqlite3.Connection):
 
 
 def db_signature(db_file: Path | str = DEFAULT_DB_FILE) -> Dict[str, Any]:
-    """缓存版本签名：股票数/最新 updated_at/日线行数/库文件大小。"""
+    """缓存版本签名：股票数/最新 updated_at/日线行数/申万行业归属/库文件大小。"""
     path = Path(str(db_file))
     try:
         size = path.stat().st_size
@@ -791,12 +857,14 @@ def db_signature(db_file: Path | str = DEFAULT_DB_FILE) -> Dict[str, Any]:
             "SELECT COUNT(*) AS c, MAX(updated_at) AS m FROM stock_meta"
         ).fetchone()
         history_rows = table_count(conn, "stock_history")
+        sw3 = _sw3_signature_from_conn(conn)
     finally:
         conn.close()
     return {
         "count": int(meta["c"]) if meta else 0,
         "max_updated_at": meta["m"] if meta else None,
         "history_rows": history_rows,
+        **sw3,
         "db_size": size,
     }
 

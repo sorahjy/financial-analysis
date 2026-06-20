@@ -32,6 +32,18 @@
     const esc = (text) => String(text ?? "").replace(/[&<>"']/g, (ch) => ({
       "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
     }[ch]));
+    const cleanIndustry = (text) => {
+      const value = String(text ?? "").trim();
+      return value && !["UNKNOWN", "unknown", "None", "none", "NULL", "null", "nan", "NaN"].includes(value)
+        ? value
+        : "";
+    };
+    const industryLabel = (pick) => {
+      const sw2 = cleanIndustry(pick.sw2_industry);
+      const sw3 = cleanIndustry(pick.sw3_industry);
+      if (sw2 && sw3 && sw2 !== sw3) return `${sw2} / ${sw3}`;
+      return sw3 || sw2 || cleanIndustry(pick.industry);
+    };
 
     async function fetchConfig() {
       const resp = await fetch("/api/config");
@@ -689,6 +701,7 @@
     }
 
     function renderRow(pick) {
+      const industry = industryLabel(pick);
       const topFactors = Object.entries(pick.factor_scores || {})
         .map(([key, v]) => ({key, ...v, power: Number(v.score || 0) * Number(v.weight || 0)}))
         .filter((v) => v.weight > 0)
@@ -697,7 +710,7 @@
       return `
         <tr>
           <td class="rank">${pick.rank}</td>
-          <td><div class="code">${esc(pick.code)}</div><div class="name">${esc(pick.name)} ${esc(pick.industry || "")}</div></td>
+          <td><div class="code">${esc(pick.code)}</div><div class="name">${esc(pick.name)}${industry ? ` ${esc(industry)}` : ""}</div></td>
           <td><span class="score">${fmt(pick.score)}</span><div class="name">覆盖 ${fmt((pick.data_quality || 0) * 100, 1)}%</div></td>
           <td><div class="chips">${(pick.reasons || []).map((r) => `<span class="chip good">${esc(r)}</span>`).join("")}</div></td>
           <td><div class="chips">${(pick.warnings || []).map((r) => `<span class="chip warn">${esc(r)}</span>`).join("") || `<span class="chip">无显著提示</span>`}</div></td>

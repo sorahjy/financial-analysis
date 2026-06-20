@@ -564,6 +564,35 @@ class StockHistorySchemaTest(unittest.TestCase):
         ratios = {m["code"]: m["official_market_cap_ratio"] for m in members}
         self.assertEqual(ratios, {"000998": 29.16, "002041": 10.36})
 
+    def test_db_signature_tracks_sw3_membership_tables(self):
+        import stock_storage as ss
+
+        membership = {
+            "segments": [{
+                "segment_code": "851024",
+                "segment_name": "通信网络设备及器件",
+                "parent_segment": "通信设备",
+                "member_count": 1,
+                "members": [{"code": "300308", "name": "中际旭创"}],
+            }],
+            "errors": [],
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "stock.sqlite3"
+            conn = ss.connect(db_path)
+            try:
+                before = ss.db_signature(db_path)
+                ss.save_sw3_membership(conn, membership)
+                after = ss.db_signature(db_path)
+            finally:
+                conn.close()
+
+        self.assertEqual(before["sw3_segments"], 0)
+        self.assertEqual(before["sw3_members"], 0)
+        self.assertEqual(after["sw3_segments"], 1)
+        self.assertEqual(after["sw3_members"], 1)
+        self.assertIsNotNone(after["sw3_max_updated_at"])
+
 
 class StockStrategyOptimizerTest(unittest.TestCase):
     def test_optuna_startup_trials_keeps_small_runs_exploratory(self):
@@ -709,7 +738,7 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             portfolio_fold_path,
         )
 
-        self.assertEqual(long_partial_anchor_offsets(125), [96, 66, 36, 6])
+        self.assertEqual(long_partial_anchor_offsets(125), [66, 6])
 
         benchmark = [
             {"date": f"2026-01-{day:02d}", "close": 1.0 + day * 0.01}
@@ -1148,6 +1177,7 @@ class HotMoneyFastBuildTest(unittest.TestCase):
             with patch.object(r, "load_sw3_membership", return_value=membership), \
                  patch.object(r, "SEGMENT_LEADER_POOL_FILE", tmp / "pool.json"), \
                  patch.object(r, "DATA_DIR", tmp), \
+                 patch.object(r, "STOCK_DB_FILE", tmp / "stock.sqlite3"), \
                  patch.object(r, "_enrich_membership_member_metrics", return_value=(0, 0)), \
                  patch.object(r, "membership_db_needs_full_recrawl", return_value=(False, 0, 0)):
                 payload = r.build_segment_leader_pool(top_per_segment=1, min_market_cap_yi=10.0)
@@ -1296,6 +1326,7 @@ class HotMoneySliceRefreshTest(unittest.TestCase):
             pool_path = tmp / "pool.json"
             with patch.object(r, "SEGMENT_LEADER_POOL_FILE", pool_path), \
                  patch.object(r, "DATA_DIR", tmp), \
+                 patch.object(r, "STOCK_DB_FILE", tmp / "stock.sqlite3"), \
                  patch.object(r, "membership_db_needs_full_recrawl", return_value=(False, 0, 0)), \
                  patch.object(r, "load_sw3_membership", return_value=None), \
                  patch.object(r, "crawl_sw3_membership", return_value=rebuilt) as crawl_mock:

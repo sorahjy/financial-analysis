@@ -47,7 +47,7 @@
 | A 股短线策略 | 面向 1-5 个交易日，围绕龙虎榜、游资席位、机构共振、价量和风控因子选股 | 同上 |
 | 参数搜索 | 对长线/短线策略做 Optuna/TPE 搜索和代理回测，写入优化后的默认参数 | `data/stock_strategy_optimized_config.json` |
 | 统一 Flask 工作台 | 在本地网页中查看基金报告、调参运行 A 股策略、保存配置、查看入选股票和关键因子 | `python run.py --port 8765`（`/`、`/fund`、`/stock`） |
-| 游资雷达 | 实验性识别盘中拉升票和盘后潜伏吸筹票，并支持命中率验证 | `data/capital/hot_money_*.json` |
+| 游资雷达 | 主力资金雷达框架，预留潜伏分、实时监控和命中验证三个入口 | `data/capital/hot_money_*.json` |
 
 ## 3. 快速开始
 
@@ -133,11 +133,11 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 
 v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
 
-股票爬虫、刷新、策略、游资雷达和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 随后只补齐龙头股票的基本面，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_hot_money_radar.py` 回放 K 线优先读 `stock_history`，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
+股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 随后只补齐龙头股票的基本面，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
 
 ### 5.4 参数搜索与可视化
 
-`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.2.0 当前口径为每 30 个交易日取一个折起点、固定持有 30 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并对越接近现在的折给更高权重；选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。
+`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.2.0 当前口径为每 60 个交易日取一个折起点、固定持有 60 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并对越接近现在的折给更高权重；选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。
 
 > 注意：受本地约 10 年日线与基准 ETF 覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认搜索 300 次，运行时间取决于本地缓存规模。
 
@@ -182,37 +182,34 @@ python stock_strategy_optimizer.py --iterations 300
 
 ## 6. 游资雷达
 
-`stock_hot_money_radar.py` 是 v3.1 新增的实验性模块，按「潜伏吸筹 → 拉升 → 出货」三阶段理解短线资金行为。
+`stock_hot_money_radar.py` 是主力资金雷达入口，按「潜伏吸筹 → 拉升 → 出货」三阶段理解短线资金行为。当前先保留框架，不写具体打分、实时行情和验证逻辑。
 
-v3.1.4 起雷达改为双分制：默认扫描会同时输出吸筹分、拉升分、阶段判断和操作建议；`--ambush` 模式也会补充盘后拉升风险分，避免只看潜伏分而忽略已启动或过热状态。历史 K 线优先从 `stock_history` 读取，缺失时才实时回退，`data/capital/ambush_cache` 现主要保留股东户数缓存。
+### 6.1 运行模式
 
-### 6.1 拉升雷达
+只保留三个模式参数：
 
-默认模式用于盘中扫描正在进攻的股票。它综合盘口异动、同花顺大单/即时资金流、涨停池和本地席位记忆，输出短线进攻候选：
+- `ambush`：默认模式，读取候选池股票并预留主力资金潜伏分字段。
+- `watch`：实时监控候选股票交易情况，后续接入实时行情/盘口事件。
+- `verify`：命中验证占位入口，后续复盘潜伏分与后续走势。
 
 ```bash
 python stock_hot_money_radar.py
-python stock_hot_money_radar.py --watch 60
-python stock_hot_money_radar.py --verify
+python stock_hot_money_radar.py ambush
+python stock_hot_money_radar.py watch
+python stock_hot_money_radar.py verify
 ```
 
-### 6.2 潜伏雷达
+### 6.2 输出文件
 
-`--ambush` 模式用于盘后扫描可能处于吸筹阶段、尚未明显启动的股票。它关注资金持续净流入但价格未明显上涨、波动收敛、低位横盘、温和放量、股东户数下降、历史龙虎榜试盘痕迹、入选新鲜度（刚出现指纹加分、挂榜多日未启动反而降权）等行为指纹：
-
-```bash
-python stock_hot_money_radar.py --ambush
-python stock_hot_money_radar.py --ambush --skip-holders
-python stock_hot_money_radar.py --ambush-verify --date 2026-06-13 --horizon 5
-python stock_hot_money_radar.py --ambush-backtest --days 15 --horizon 5
-STOCK_CRAWL_NO_PROXY=1 python stock_hot_money_radar.py --ambush-backtest --days 60 --horizon 3 --top 5
-```
+- `data/capital/hot_money_ambush.json`：潜伏分框架输出。
+- `data/capital/hot_money_watch.json`：实时监控框架输出。
+- `data/capital/hot_money_verify.json`：命中验证框架输出。
 
 ### 6.3 使用边界
 
 - 盘中没有席位级实时数据，雷达输出是行为推断，不是席位实锤。
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
-- 建议先积累 `--verify`、`--ambush-verify` 和 `--ambush-backtest` 的命中率，再决定是否纳入交易流程。
+- 当前文件只搭建接口和产物结构，具体评分/监控/验证逻辑后续再补。
 
 
 ## 7. 行业周期
@@ -250,9 +247,9 @@ python industry_cycle_extractor.py
 | `data/stock_data/CN_*.json` | 旧版个股 JSON 缓存；v3.1.4 主流程不再依赖，可通过 `stock_storage.import_stock_data_dir()` 批量导入 SQLite |
 | `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时和失败信息 |
 | `data/capital/hot_money_candidates.json` | 龙虎榜/游资候选池原始信号，短线最终分数由 `stock_advanced_strategies.py` 计算 |
-| `data/capital/hot_money_radar*.json` | 拉升雷达结果与每日快照 |
-| `data/capital/hot_money_ambush*.json` | 潜伏雷达结果与每日快照 |
-| `data/capital/ambush_backtest.json` | 潜伏雷达历史回放结果 |
+| `data/capital/hot_money_ambush.json` | 主力资金潜伏分框架输出 |
+| `data/capital/hot_money_watch.json` | 实时交易监控框架输出 |
+| `data/capital/hot_money_verify.json` | 命中验证框架输出 |
 
 ## 9. 项目结构
 
@@ -270,7 +267,7 @@ python industry_cycle_extractor.py
 ├── stock_storage.py               # A 股 SQLite 持久化层、schema、导入和读写工具
 ├── stock_crawl_segment_leaders.py # 申万三级行业 membership 与细分行业龙头池
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
-├── stock_hot_money_radar.py       # 游资拉升/潜伏雷达
+├── stock_hot_money_radar.py       # 主力资金雷达框架
 ├── industry_cycle_extractor.py    # 行业指数周期位置提取能力骨架
 ├── app/static/vendor/live2d-widget # 本地化 Live2D 小组件运行时资源
 ├── tests/                         # 核心逻辑和股票策略单测
@@ -283,7 +280,7 @@ python industry_cycle_extractor.py
 - 外部数据接口可能很慢或超时，刷新股票全量数据建议给足 `--timeout 1800`。
 - 境内行情接口通过本地代理有时会失败，可使用 `--no-proxy` 或 `FUND_CRAWL_NO_PROXY=1`。
 - Dashboard 日常打开优先使用 `--skip-refresh`，需要最新数据时再手动刷新。
-- 短线策略和游资雷达强依赖龙虎榜/资金数据，刷新后建议重新跑参数搜索。
+- 短线策略强依赖龙虎榜/资金数据；主力资金雷达框架会复用候选池，刷新后建议重新跑参数搜索。
 - 所有策略结果都来自本地缓存和可得数据，缺失数据会影响排序和评分。
 
 ## 11. 更新历史
@@ -358,7 +355,7 @@ python industry_cycle_extractor.py
 A 股主数据迁移到 SQLite，股票代码成为稳定主键；长线搜索升级为 300 次 Optuna/TPE，游资雷达改为吸筹分/拉升分双分制。
 
 #### Update v3.2.0  2026.6.20
-长线候选改为细分行业龙头池优先，龙头分简化为规模/ROE/成长，缺市值时用官方市值占比兜底。刷新链路先补龙头行情再补龙头基本面；优化器改为 30 日持有/30 日折间隔、混合宽基基准，并搜索高点回撤过滤开关与 40%-70% 阈值范围。
+长线候选改为细分行业龙头池优先，龙头分简化为规模/ROE/成长，缺市值时用官方市值占比兜底。刷新链路先补龙头行情再补龙头基本面；优化器改为 60 日持有/60 日折间隔、混合宽基基准，并搜索高点回撤过滤开关与 40%-70% 阈值范围。
 
 ## 12. Acknowledgment
 

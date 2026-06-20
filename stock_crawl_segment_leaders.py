@@ -858,6 +858,29 @@ def _save_sw3_membership_to_db(payload: Dict[str, Any]) -> None:
         conn.close()
 
 
+def _mark_leaders_in_db(segments: List[Dict[str, Any]]) -> int:
+    """把龙头池里每个赛道选出的龙头 code 回写到主库 sw3_member.is_leader。
+
+    save_sw3_membership 重建 sw3_member 时 is_leader 会落回 0，故在龙头池生成的最后一步
+    重新打标，让 is_leader 始终反映最新一轮选股，供主力雷达等模块直接 WHERE is_leader=1 取池。
+    """
+    codes = {
+        lead.get("code")
+        for seg in segments
+        for lead in seg.get("leaders", [])
+        if lead.get("code")
+    }
+    if not codes:
+        return 0
+    conn = stock_storage.connect(STOCK_DB_FILE)
+    try:
+        marked = stock_storage.mark_sw3_leaders(conn, codes)
+    finally:
+        conn.close()
+    print(f"  [membership] 已回写 {marked} 只龙头标记 -> sw3_member.is_leader", flush=True)
+    return marked
+
+
 def crawl_sw3_membership(
         sleep_sec: float = 0.6,
         resume: bool = True,
@@ -1264,10 +1287,12 @@ def build_segment_leader_pool(
             previous_leaders = 0
         if previous and previous_leaders > 0:
             print(f"  [membership] 本次未生成龙头，保留已有 {previous_leaders} 只龙头池，避免空结果覆盖")
+            _mark_leaders_in_db(previous.get("segments", []))
             return previous
     with open(SEGMENT_LEADER_POOL_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"  -> 已生成 {len(segments)} 个细分行业 / {leader_count} 只龙头，落盘 {SEGMENT_LEADER_POOL_FILE}")
+    _mark_leaders_in_db(segments)
     return payload
 
 

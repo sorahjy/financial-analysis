@@ -369,6 +369,7 @@ def clear_live_candidate_cache() -> None:
     try:
         _build_live_long_candidates_cached.cache_clear()
         _build_live_short_candidates_cached.cache_clear()
+        _load_sw3_segment_map_cached.cache_clear()
     except NameError:
         pass
     with _candidate_cache_lock:
@@ -802,6 +803,56 @@ def load_market_snapshot() -> Dict[str, Any]:
     return load_json_optional(DATA_DIR / "market_snapshot.json", {})
 
 
+def _signature_key(signature: Dict[str, Any]) -> Tuple[Tuple[str, Any], ...]:
+    return tuple(sorted((str(k), v) for k, v in (signature or {}).items()))
+
+
+def load_sw3_segment_map() -> Dict[str, Dict[str, Any]]:
+    """一次性加载个股到申万二级/三级行业映射；按 sw3 表签名缓存，避免逐股查库。"""
+    signature = _signature_key(stock_storage.sw3_signature())
+    with _sw3_segment_load_lock:
+        cached = _load_sw3_segment_map_cached(signature)
+    return {code: dict(info) for code, info in cached.items()}
+
+
+@lru_cache(maxsize=4)
+def _load_sw3_segment_map_cached(
+        signature: Tuple[Tuple[str, Any], ...],
+) -> Dict[str, Dict[str, Any]]:
+    _ = signature
+    conn = stock_storage.connect()
+    try:
+        return stock_storage.segment_map(conn)
+    finally:
+        conn.close()
+
+
+_UNKNOWN_INDUSTRY_NAMES = {"", "UNKNOWN", "unknown", "None", "none", "NULL", "null", "nan", "NaN"}
+
+
+def clean_industry_name(value: Any) -> str:
+    text = str(value or "").strip()
+    return "" if text in _UNKNOWN_INDUSTRY_NAMES else text
+
+
+def industry_label_from_sw3(
+        segment_info: Optional[Dict[str, Any]],
+        fallback: Any = "",
+) -> Tuple[str, str, str, str, str]:
+    """返回 (展示行业, 分桶行业, 二级行业, 三级行业, 三级代码)。"""
+    segment_info = segment_info or {}
+    sw2 = clean_industry_name(segment_info.get("parent_segment"))
+    sw3 = clean_industry_name(segment_info.get("segment_name"))
+    segment_code = clean_industry_name(segment_info.get("segment_code"))
+    legacy = clean_industry_name(fallback)
+    if sw2 and sw3 and sw2 != sw3:
+        display = f"{sw2} / {sw3}"
+    else:
+        display = sw3 or sw2 or legacy
+    bucket = sw3 or sw2 or legacy or "UNKNOWN"
+    return display, bucket, sw2, sw3, segment_code
+
+
 # DB history 行(daily_* + 估值列) → 紧凑 analysis 记录的直接重命名。
 # DB 存的已是 safe_float 后的干净值，无需再过 safe_float，等价于
 # analysis_records_from_history_records 但省去对百万行的逐字段转换(实测 ~24s→~3s)。
@@ -823,6 +874,7 @@ def _db_history_to_analysis_records(records: List[Dict[str, Any]]) -> List[Dict[
 
 _cn_index_load_lock = threading.Lock()
 _fundamental_load_lock = threading.Lock()
+_sw3_segment_load_lock = threading.Lock()
 
 
 def load_cn_stock_index() -> Dict[str, Dict[str, Any]]:
@@ -866,6 +918,7 @@ def warm_caches() -> None:
     """预热数据 loader 缓存（供 server 启动时后台调用），把首个策略请求的 ~6s 冷载移出请求路径。"""
     load_fundamental_stocks()
     load_cn_stock_index()
+    load_sw3_segment_map()
 
 
 @lru_cache(maxsize=1)
@@ -1122,6 +1175,7 @@ def build_long_candidates(
     universe = load_stock_universe()
     snapshot = load_market_snapshot()
     cn_index = load_cn_stock_index()
+    sw3_segments = load_sw3_segment_map()
     csi300 = set(str(code).zfill(6) for code in universe.get("csi300", []))
     csi_all = set(str(code).zfill(6) for code in universe.get("all", []))
     notes = []
@@ -1130,7 +1184,7 @@ def build_long_candidates(
     if as_of is not None:
         notes.append(
             f"PIT 时点 {as_of}：财报/价格/估值/分红已按当时可见切片；"
-            "但沪深300成分与质押用的是当前快照(无历史数据)，这两维仍有轻微前视。"
+            "但沪深300成分、申万行业与质押用的是当前快照(无历史数据)，这几维仍有轻微前视。"
         )
 
     min_cap_yi = safe_float(config.get("min_market_cap_yi")) or 0.0
@@ -1182,20 +1236,30 @@ def build_long_candidates(
             high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
         )
 
-        industry = str(stock.get("pledge", {}).get("industry") or snap.get("pledge_industry") or "UNKNOWN")
+        legacy_industry = (
+            clean_industry_name(stock.get("pledge", {}).get("industry"))
+            or clean_industry_name(snap.get("pledge_industry"))
+        )
+        industry, industry_bucket, sw2_industry, sw3_industry, sw3_segment_code = industry_label_from_sw3(
+            sw3_segments.get(code), legacy_industry
+        )
         item = {
             "code": code,
             "name": name,
             "strategy": "long",
             "horizon": f"{config.get('hold_years_min', 2)}-{config.get('hold_years_max', 5)} years",
             "industry": industry,
+            "industry_bucket": industry_bucket,
+            "sw2_industry": sw2_industry,
+            "sw3_industry": sw3_industry,
+            "sw3_segment_code": sw3_segment_code,
             "raw_factors": raw,
             "reasons": [],
             "warnings": [],
         }
         candidates.append(item)
         if market_cap_cny:
-            industry_buckets[industry].append((code, market_cap_cny))
+            industry_buckets[industry_bucket].append((code, market_cap_cny))
 
     apply_industry_leadership(candidates, industry_buckets)
     for item in candidates:
@@ -1488,6 +1552,7 @@ def load_short_pool() -> Dict[str, Dict[str, Any]]:
 
 def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     pool = load_short_pool()
+    sw3_segments = load_sw3_segment_map()
     notes = []
     if not pool:
         notes.append("No Dragon Tiger List pool found. Run stock_crawl_hot_money.py or main-capital script first.")
@@ -1509,13 +1574,19 @@ def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
             continue
         if (safe_float(raw.get("limit_up_control")) or 0) > max_consec:
             continue
+        industry, _, sw2_industry, sw3_industry, sw3_segment_code = industry_label_from_sw3(
+            sw3_segments.get(code)
+        )
 
         item = {
             "code": code,
             "name": name,
             "strategy": "short",
             "horizon": f"{config.get('hold_days_min', 1)}-{config.get('hold_days_max', 5)} days",
-            "industry": "",
+            "industry": industry,
+            "sw2_industry": sw2_industry,
+            "sw3_industry": sw3_industry,
+            "sw3_segment_code": sw3_segment_code,
             "raw_factors": raw,
             "reasons": short_reasons(data, raw),
             "warnings": short_warnings(data, raw),
@@ -1877,9 +1948,10 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
     universe_signature = _file_signature(DATA_DIR / "stock_universe.json")
     snapshot_signature = _file_signature(DATA_DIR / "market_snapshot.json")
+    stock_data_signature = stock_storage.db_signature()
     meta = {
         "config_key": key,
-        "stock_data": stock_storage.db_signature(),
+        "stock_data": stock_data_signature,
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
     }
@@ -1890,6 +1962,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     candidates, notes = _build_live_long_candidates_cached(
         universe_signature,
         snapshot_signature,
+        _signature_key(stock_data_signature),
         key,
     )
     write_live_candidate_cache("long", meta, candidates, notes)
@@ -1900,11 +1973,12 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
 def _build_live_long_candidates_cached(
         universe_signature: Tuple[int, int],
         snapshot_signature: Tuple[int, int],
+        stock_data_signature: Tuple[Tuple[str, Any], ...],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
     # 磁盘候选缓存另用 db_signature()(内容指纹) 校验，无需易变的文件指纹做 key。
-    _ = (universe_signature, snapshot_signature)
+    _ = (universe_signature, snapshot_signature, stock_data_signature)
     return build_long_candidates(config_from_key(config_key))
 
 
@@ -1913,11 +1987,13 @@ def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, An
     hot_money_signature = _file_signature(HOT_MONEY_CANDIDATES_FILE)
     legacy_hot_money_signature = _file_signature(LEGACY_HOT_MONEY_SCORED_FILE)
     main_capital_signature = _file_signature(DATA_DIR / "main_capital_picks.json")
+    sw3_signature = stock_storage.sw3_signature()
     meta = {
         "config_key": key,
         "hot_money_candidates": list(hot_money_signature),
         "legacy_hot_money_scored": list(legacy_hot_money_signature),
         "main_capital_picks": list(main_capital_signature),
+        "sw3": sw3_signature,
     }
     cached = read_live_candidate_cache("short", meta)
     if cached is not None:
@@ -1927,6 +2003,7 @@ def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, An
         hot_money_signature,
         legacy_hot_money_signature,
         main_capital_signature,
+        _signature_key(sw3_signature),
         key,
     )
     write_live_candidate_cache("short", meta, candidates, notes)
@@ -1938,9 +2015,10 @@ def _build_live_short_candidates_cached(
         hot_money_signature: Tuple[int, int],
         legacy_hot_money_signature: Tuple[int, int],
         main_capital_signature: Tuple[int, int],
+        sw3_signature: Tuple[Tuple[str, Any], ...],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    _ = (hot_money_signature, legacy_hot_money_signature, main_capital_signature)
+    _ = (hot_money_signature, legacy_hot_money_signature, main_capital_signature, sw3_signature)
     return build_short_candidates(config_from_key(config_key))
 
 
@@ -2095,6 +2173,9 @@ def strip_internal(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "strategy": item.get("strategy"),
             "horizon": item.get("horizon"),
             "industry": item.get("industry"),
+            "sw2_industry": item.get("sw2_industry"),
+            "sw3_industry": item.get("sw3_industry"),
+            "sw3_segment_code": item.get("sw3_segment_code"),
             "score": item.get("score"),
             "data_quality": item.get("data_quality"),
             "reasons": item.get("reasons", []),
