@@ -18,10 +18,10 @@ ambush 吸筹分（换手率优先、缺失退回成交量）：
 _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstring）。
 
 ─────────────────────────────────────────────────────────────────────────────
-游资形态总表（PATTERNS，6 类 / 20 个，编号 P1-P20）
+游资形态总表（PATTERNS，6 类 / 23 个，编号 P1-P23）
   · 列：编号  名称  —— 命中条件（位置=收盘价近60日分位；量比=近5日均量/前20日均量；
         漂移=近20日涨跌幅；CMF=Chaikin资金流；筹码集中=主峰±7%价带内筹码占比）。
-  · 信号方向 buy/hold/sell；阶段配色按操作进程由早到晚渐变：吸筹🟢→试盘/洗盘🟡→突破/拉升🟠→出货🔴（空仓观望⚪）。
+  · 信号方向 buy/hold/sell；阶段配色按操作进程由早到晚渐变：吸筹🟢→试盘/洗盘🟡→突破/拉升🟠→出货🔴（观望⚪）。
   · 阶段优先级见 _pattern_phase：出货 > 突破 > 吸筹/洗盘 > 拉升 > 试盘。
 ─────────────────────────────────────────────────────────────────────────────
 【吸筹 🟢buy】主力在低位悄悄建仓
@@ -30,6 +30,7 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P3 缩量阴线打压吸筹  位置<0.45 + 近10日有"大阴跌≥4%却缩量(<0.85×30日均量)、随后收复"：隐性吸货
   P4 量增价稳吸收      位置<0.60 + 量比>1.2 + |漂移|<6% + CMF>0：放量但价稳、资金净流入
   P5 底部形态构筑      位置<0.45 + 近端两摆动低点等高/低点抬高(-4%~+8%) + 中间反弹≥6%(颈线) + 当前价回升未破颈线：双底/W底
+  P23 箱体波动压缩     位置<0.60 + 近20日振幅<0.80×近60日：波动收窄蓄势(借鉴hot_money_patterns，后验各周期≈0、无edge)
 【试盘 🟡hold】拉升前试探上方抛压
   P6 试盘长上影        近8日有长上影(>3%且>2×实体)创20日新高后收盘缩回：探顶又压回
   P7 底部异动放量      位置<0.40 + 量比>1.5 + 近5日最大振幅>7%：低位突然放量异动
@@ -37,6 +38,7 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P8 缩量回踩洗盘      站上MA20 + 回踩近10日高点-2%~-15% + 跌日量<涨日量 + 筹码集中≥0.40：挖坑不破位
   P9 边拉边洗          多头排列(MA5>10>20) + 近8日涨跌符号切换≥4次 + 低点抬高：边拉边洗
   P10 高换手洗盘       量比>1.5 + 收盘>MA20 + 筹码集中≥0.45：高换手震仓但筹码峰不发散
+  P21 假跌破收回       近5日假摔穿前40日箱体下沿×0.985、收盘又站回：Wyckoff spring(各周期不显著,40日+1.15%弱)
 【突破 🟠hold（阶段标签=头号买点，优先级仅次出货）】放量右进
   P11 放量突破启动     右进左出触发器命中：从低/中位放量(>1.3×)突破近20日收盘高点，刚启动的右侧买点
 【拉升 🟠hold】主升浪，追入=接盘
@@ -50,6 +52,7 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P18 顶部大阴包阳      位置≥0.80 + 昨阳今阴且今实体完全吞没昨实体：顶部看跌吞没
   P19 灌压巨量大阴      位置≥0.70 + 量比>1.8 + 实体跌>6%且收在当日价区下1/4：巨量灌压大阴
   P20 均线放量破位      收盘跌破MA20(5日前还在MA20上方) + 量比>1.2：放量破位
+  P22 放量假突破        今日盘中破前40日高但收盘没站上 + 当日放量>1.8×：高位拒绝(有效@5/10/40日 sell)
 ─────────────────────────────────────────────────────────────────────────────
 
 Modes:
@@ -64,6 +67,8 @@ Modes:
 ═══════════════════════════════════════════════════════════════════════════════
 口径说明：pooled 分位收益含大盘 beta（高分扎堆普涨日→假象）；**截面 Rank IC / 多空价差 /
 触发器超额** 是每个 as-of 日内部排序再跨日平均，天然剔除 beta，才是真实选股力。
+⚠️ 口径迭代：(1)-(9) 为旧口径（前向 20/40/60日 + 成交量单位混(股/手)的脏数据）历史记录；
+   (10) 起为「成交量单位已修复(统一手) + 前向改 2/5/10/20日(游资短线)」的最新口径，以(10)为准。
 
 迭代与结论：
   1) 放量+创新高（最初）  → 截面 IC 5/10/20日 -0.035/-0.039/-0.048 (t≈-3.6~-4.5)。
@@ -80,23 +85,78 @@ Modes:
        · **右进左出触发器失败**：触发样本绝对收益看着高(+1.31%>全体+0.85%)是 beta 假象，
          截面超额为负 -1.2%/-2.0%/-3.0% (t-1.3~-1.7)，胜率<50%。买突破=接盘，与(1)同源。
   7) v3 三角筹码分布 + 市值缺失用 stock_history 回补后，cap-filtered(582只) →
-       · 吸筹分截面 IC 20/40/60日 +0.008/+0.005/-0.001，t<1，仍是微正/中性；
+       · 吸筹分截面 IC 20/40/60日 +0.008/+0.005/-0.001，t<1，仍是微正/中性；（注：此为加出货惩罚前的基线，已被(9)改善）
        · 右进触发器继续负超额：40日 -2.0%(t-1.4)。结论仍是只看状态，不追突破。
 
 核心结论：龙头池（大盘质量股）截面被**短期反转**主导——追强/突破/放量创高都亏，只有「安静的
-吸筹状态」（低位+资金悄悄流入+不动）微弱正向但不显著。量价 hot-money 命题在此池拿不到稳健
+吸筹状态」（低位+资金悄悄流入+不动）正向；叠加出货渐变惩罚后 20/40日截面 IC 显著(t≈2，见9)，
+但多空价差仍≈0、Q5高分非最强，经济意义弱。量价 hot-money 命题在此池拿不到稳健
 alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通题材股，不是细分龙头；DB 目前只有
 龙头 K 线（956 龙头+41 非龙头），无独立小盘池。下一步若要真正检验命题，需联网爬真·小盘/题材
 股池在游资主场重跑 verify。当前代码=cap-filtered 三信号吸筹分 + v3 三角筹码分布，作为研究基线沉淀。
 
   8) 游资形态层（P1-P20, match_patterns + patterns 模式）→ patterns 后验(582龙头/4.3万样本)：
      · 出货类经验证有效：P19 灌压巨量大阴 40日超额 -4.97%、P20 均线放量破位 -1.39%(t-2.16)。
+       · P20 位置分桶：低位<0.6 命中930(占74%) 40日 -1.41%(t-2.03 显著)；高位≥0.6 仅321且不显著(t-0.85)。
+         即「低位放量破位」=失败反弹/下跌中继才是 P20 主体信号，**不可按位置门控**(加门槛会扔掉74%有效信号)；
+         故低位股「吸筹分高却命中出货预警(P20)」是正确预警而非 bug——结构因子漏掉、形态层补上的真实风险。
      · buy 类多为反转陷阱(P8 洗盘 -1.17%/t-3.0、P10 -1.61%/t-3.0)；唯 P3 缩量阴线打压吸筹
        +3.35%/60日+3.94%(t1.47 近显著)有正向苗头。拉升类 P11/P12 负超额，追入=接盘。
      · P5 底部形态构筑(双底/W底, 后补)→ 命中2080, 20/40/60日 -0.65%/-0.84%/-0.82%(t-1.46)，
        buy 形态却负超额=又一反转陷阱；同 universe 错配，识别本身没问题但龙头池无预测力。
-     · 结论：出货预警层(P19/P20)可直接当风控；buy 侧除 P3 外(含P5)在龙头池失效——与全文一致。
-     · 备注：形态只产出"阶段标签"、不进吸筹分加权(分数=4因子)，故 P5 失效无需"降权"，留作研究基线。
+     · P21 假跌破收回(Wyckoff spring, 借鉴hot_money_patterns)→ 命中1624, 20/40/60日 +0.35/+1.23/+0.62%
+       (t1.23)：buy 侧三档全正、t 比 P3 高且样本3×，是龙头池里统计最可靠的正向 buy 形态(虽未达 t1.5)。留用。
+     · P22 放量假突破(高位拒绝, 同源)→ 命中517, 20/40/60日 -0.47/-1.11/-1.84%(t-0.83)：sell 看负、方向稳、
+       胜率39%，未显著但作辅助风控标签留用。
+     · 结论：出货预警层(P19/P20/P22)可当风控；buy 侧正向只有 P3/P21(含P5在内其余失效)——与全文一致。
+     · 备注：形态只产出"阶段标签"、不进吸筹分加权(分数=4因子)，故失效形态无需"降权"，留作研究基线。
+  9) 借鉴 hot_money_patterns.py 的「出货分渐变惩罚」（吸筹分 ×(1−DIST_PENALTY_CAP×派发分/100)，
+     派发分=高位×(基础+阶段涨幅+高位放量)）后重跑 verify（cap-filtered 582只）：
+     · 吸筹分截面 IC 20/40/60日 +0.021/+0.017/+0.011，t 2.32/2.02/1.27——相比(7)的中性，
+       20/40日 t 跳到 >2 显著正：把"高位假吸筹"剔出高分区、排序更干净（borrow 生效）。
+     · 但多空价差仍≈0/负(+0.0%/-0.2%/-0.9%)、Q5高分非最强(40日 Q5+2.4% < Q4+3.5%)——RankIC
+       转正靠中低分重排，不是"买最高分"能赚；定性为"无效→弱有效"，仍非可直接交易 alpha。
+     · 大盘开关 A/B（--exclude-large-cap，默认剔除；--no-exclude-large-cap 纳入全市值）：全市值956只
+       IC 20/40/60 +0.009/+0.004/-0.012、t 0.84/0.37/-1.23、60日多空-3.13%——加回大盘 IC 腰斩翻负，
+       铁证大盘是反转陷阱、默认剔除(5)成立。触发器不受惩罚影响仍负超额(40日-2.0%/t-1.4)。
+     · 试过(已弃)：给派发分加「高位放量长上影拒绝」维度→verify IC 0.021/0.017→0.0215/0.0179 几乎不动
+       (只动高位股、而高位股吸筹分本就趋零)，增益≈0 故不保留。
+ 10) 【最新口径】成交量单位修复(全库统一手) + 前向 2/5/10/20/40日、逐周期判有效(剔大盘582只)：
+     · verify 吸筹分截面 IC 2/5/10/20/40日 +0.012/+0.013/+0.019/+0.021/+0.017，t 1.28/1.46/2.04/2.33/1.92，
+       胜率57/53/60/57/53%——IC 峰在 20日(t2.33)、10/20/40日均显著：**吸筹是 10-40日慢信号，2-5日弱**；多空价差≈0。
+     · 触发器全周期负超额(再确认)：追突破任何持有期都亏，越长越亏(40日最负)。
+     · patterns 逐形态×逐周期「有效@」(buy正/sell负/hold显著，均 |t|≥1.5)：
+       - 风控 sell 多周期稳健：P22 放量假突破@5/10/40日、P20 均线破位@10/40日、P19 灌压大阴@5/40日(40日-4.97%)。
+       - P11 放量突破(hold)@2/20/40日但**全为显著负**(追突破=亏，40日-3.42%)——量化"买突破=接盘"。
+       - 动量：P12 连板拉升@2/5日显著正(+3.9/+3.5%)、20日反转-2.3%——连板短线续涨、3-4周见顶。
+       - **buy/吸筹侧无一达标**(P3 40日+2.2%但t<1.5、P21 40日+1.15%弱、P5/P1/P8/P9/P10 多周期负)：龙头池买入侧仍无显著 alpha。
+     · 结论：可用的只有**风控(P20/P22/P19/追突破P11)** + **超短动量(连板2-5日)**；吸筹买入侧不显著且偏慢(10-40日)，与全文一致。
+     · 默认口径改为「含大盘全市值」(956只，用户选择)后重跑对比：
+       - 吸筹分 IC 全线塌到噪声(2/5/10/20/40 +0.002/-0.000/+0.009/+0.006/+0.002，t<0.8，多空价差全负)——
+         再证大盘拖累综合分；**选 alpha 仍应 --exclude-large-cap**(剔大盘 IC 0.012~0.021/t≈2.3)。
+       - 但个股 sell/风控形态在全市值更丰富：P11 追突破**全周期显著负**(40日-2.07%)、P14/P15/P16/P19/P20/P22 多周期✅、
+         P3 缩量打压吸筹 40日 +4.21%*显著(全市值唯一达标 buy)、连板 P12 动量增至 2-10日。
+       - 取舍：综合吸筹分排名用剔大盘；个股风控/形态(P11/P19/P20/P22/P12)全市值也成立。雷达默认含大盘仅为"看得全"。
+     · P23 箱体波动压缩(借鉴hot_money_patterns 的 compression, 后补)：命中众多但**各周期超额≈0、无edge**
+       (剔大盘仅2日+0.18%*巨样本噪声)——又一买入侧失效形态，留作"酝酿"evidence标签/研究基线，不入有效集。
+     · evidence 升级为结构化 {label,kind}(利好/中性/风险)，前端按 kind 上色(替原关键字正则)。
+ 11) 因子拆解 + 背离/CMF 反向计入（剔大盘，子分截面 IC）：
+     · 单因子 RankIC(t)：**位置 +0.05/t3~4.5(唯一强正)**；背离 -0.04/t-3.6、CMF -0.02/t-1.8~-2.1(均显著负，
+       "放量价稳/收盘买压"在龙头池是反转特征)；筹码 ≈0/噪声。合成分原本靠位置一个扛、被背离+CMF 抵消。
+     · 改动：**背离、CMF 改"反向计入·只罚高不奖缺失"**：贡献=min(50,100−原始分)、权重不变；筹码/位置不动。
+       (纯 100−x 会把"无放量/无买压"翻成满分→死水股被抬，故封顶 50 中性；两者 IC 等效。)原始子分仍存 sub_scores。
+     · verify(剔大盘,真ambush含惩罚) 2/5/10/20/40日 IC ~+0.04(t≈3)、胜率60~68%、**多空价差转正**——相比翻转前
+       (0.012~0.021/t≈2、多空负)，IC 翻2~3倍、多空首次转正。
+     · 保留：本质仍是「位置=低位反转」主导、背离/CMF 反算只是去拖累；**样本内、未做 OOS**，是反转 alpha 非真吸筹。
+ 12) P3/P20 消融(吸筹分加 P3 加分 / P20 破位惩罚, ±15分, 前后半 OOS)：
+     · **P20 破位惩罚有增量**：全周期 +0.004~0.005 IC、前后半都成立(纠错型——把"低位破位但分仍偏高 0.60 分位"的票挪下，
+       补 dist 高位门控的盲区)；60日外失效(破位是近中期信号)。→ 已加 `MA_BREAKDOWN_PENALTY=0.20`(命中打掉20%)。
+       实测加后 IC 2/5/10/20/40 ≈ 0.049/0.036/0.039/0.041/0.047、t2.7~3.7、多空价差全正。
+     · **P3 加分无增量、弃**：全周期≈0、60日转负。原因(方法论)：① P3 稀疏(1.5%)，加分只动 1.5% 名次→截面 IC 不变；
+       ② **冗余**——P3 要 pos<0.45，命中票本就被位置/筹码因子排到高位(分位均值0.65)，再加分不改排序；③ 均值 vs 排序(超额是均值、可能偏度驱动)。
+       **教训：事件研究(patterns)超额高 ≠ 进合成模型能加分；判该不该进模型看「边际 RankIC 贡献(消融)」，而非「条件超额」。**
+     · ⚠️ **edge 时间不稳**：吸筹分 IC 几乎全在后半——前半 5/10/20/40日 t 仅 0.1~0.3(近零)、后半 t 3~5。
+       所有"IC≈0.04/t3"由近段单边撑起，可能 regime 依赖，**勿过度外推**。
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -159,11 +219,23 @@ CHIP_WINNER_MAX = 0.82
 SEALED_AMP = 0.005       # 日内振幅 ≤ 0.5% 视为一字封死板
 SEALED_PENALTY_PER = 0.2  # 每个一字封板的打折系数
 SEALED_PENALTY_CAP = 0.6  # 一字封板最多打掉 60%
+MA_BREAKDOWN_PENALTY = 0.20  # P20 均线放量破位命中 → 吸筹分打掉 20%（补 dist 高位门控漏掉的"低位破位"风险，见纪要(11)消融）
 TURNOVER_COVERAGE = 0.7  # 近端窗口换手率覆盖率达标才用换手率，否则退回成交量
 WEIGHTS = {"position": 0.20, "divergence": 0.25, "cmf": 0.25, "chip": 0.30}
-SUSPECT_ACCUM_SCORE = 65  # 无形态命中但吸筹分≥此值 → 疑似吸筹(待确认)；低于则空仓观望
+SUSPECT_ACCUM_SCORE = 65  # 无形态命中但吸筹分≥此值 → 疑似吸筹(待确认)；低于则观望
+COMPRESS_AMP_RATIO = 0.80  # 近20日振幅 < 此倍×近60日振幅 → 波动压缩(酝酿)；借鉴 hot_money_patterns.py
 
-# 阶段标签按游资操作顺序排列（疑似吸筹→吸筹→试盘→洗盘→突破→拉升→出货，空仓观望=场外）。
+# 出货风险分（连续 0~100）：高位 + 阶段涨幅大 + 高位放量 = 派发特征。借鉴 stock_hot_money_patterns.py
+# 的「出货分渐变惩罚」——不再只靠形态硬覆盖标签，而是连续地给吸筹分打折，让"既像吸筹又带派发味"的票排名下沉。
+DIST_POS_START = 0.70    # 收盘价分位 ≥ 此值才进入派发风险区（高位门控）
+DIST_POS_FULL = 0.92     # 分位 ≥ 此值 → 高位满格
+DIST_RUNUP_LO = 0.20     # 近20日涨幅 ≥ 此值开始计派发风险
+DIST_RUNUP_HI = 0.60     # 涨幅 ≥ 此值 → 满格（已大涨）
+DIST_VOL_LO = 1.5        # 量比 ≥ 此值开始计高位放量
+DIST_VOL_HI = 3.0        # 量比 ≥ 此值 → 满格（天量见天价）
+DIST_PENALTY_CAP = 0.5   # 出货风险最多把吸筹分打掉 50%
+
+# 阶段标签按游资操作顺序排列（疑似吸筹→吸筹→试盘→洗盘→突破→拉升→出货，观望=场外）。
 # 表头计数据此从左到右展示；标签字符串须与 _pattern_phase() 的返回值完全一致。
 PHASE_ORDER: Tuple[str, ...] = (
     "疑似吸筹(待确认)🟢",
@@ -174,10 +246,11 @@ PHASE_ORDER: Tuple[str, ...] = (
     "▲突破🟠",
     "拉升中🟠",
     "出货预警🔴",
-    "空仓观望⚪",
+    "观望⚪",
 )
 
-# 市值上限：大盘是反转陷阱(verify 分层显示 >368亿 IC≈-0.05 显著负)，雷达只看小/中盘龙头。
+# 市值上限(亿)：传给 --exclude-large-cap 时生效。注意默认已改为「不剔除大盘/全市值」(用户选择)，
+# 该值仅在显式 --exclude-large-cap 时启用。研究上大盘是反转陷阱(verify >368亿 IC≈-0.05 显著负)、选 alpha 仍建议剔除。
 MAX_MARKET_CAP_YI = 300.0
 
 # 右进左出触发器：吸筹分给"状态"，触发器给"买点"——从低/中位整理放量突破近端高点。
@@ -186,7 +259,7 @@ TRIGGER_VOL_MULT = 1.3    # 突破当日量 > 1.3× 前 20 日均量
 TRIGGER_BASE_MAX_POS = 0.70  # 被突破的前高在近 60 日分位 < 0.70 → 从低/中位突破(非高位追涨)
 
 # ── 后验回测参数 ──────────────────────────────────────────────
-VERIFY_HORIZONS = (20, 40, 60)     # 吸筹是中期信号，前向持有期拉长（交易日）
+VERIFY_HORIZONS = (2, 5, 10, 20, 40)   # 游资持有期（交易日）：2/5/10/20/40 日前向收益，逐周期判有效
 VERIFY_STEP = 10                   # 每隔多少个交易日取一个 as-of 截面
 VERIFY_WINDOW_DAYS = 750           # 回测窗口（交易日，约 3 年）
 VERIFY_MIN_NAMES = 30              # 单个截面至少多少只票才计入截面 IC / 多空
@@ -315,9 +388,17 @@ _BAR_SQL = (
 )
 
 
-def _recent_bars(conn: sqlite3.Connection, code: str, limit: int = LOOKBACK) -> List[Dict[str, Any]]:
-    """该 code 近 limit 个有效日线 bar（升序），跳过估值快照空行。"""
-    rows = conn.execute(_BAR_SQL + "ORDER BY date DESC LIMIT ?", (code, limit)).fetchall()
+def _recent_bars(conn: sqlite3.Connection, code: str, limit: int = LOOKBACK,
+                 as_of: Optional[str] = None) -> List[Dict[str, Any]]:
+    """该 code 近 limit 个有效日线 bar（升序），跳过估值快照空行。
+
+    as_of 给定时只取该日期及以前的 bar（PIT 防泄漏，供历史 as-of 复盘）。
+    """
+    if as_of:
+        rows = conn.execute(_BAR_SQL + "AND date <= ? ORDER BY date DESC LIMIT ?",
+                            (code, as_of, limit)).fetchall()
+    else:
+        rows = conn.execute(_BAR_SQL + "ORDER BY date DESC LIMIT ?", (code, limit)).fetchall()
     return [_bar(r) for r in reversed(rows)]
 
 
@@ -361,6 +442,28 @@ def _score_position(bars: List[Dict[str, Any]]) -> Tuple[Optional[float], Option
     pct = sum(1 for c in closes if c <= last) / len(closes)
     score = _clip01((POS_HIGH - pct) / (POS_HIGH - POS_LOW)) * 100.0
     return score, pct
+
+
+def _amp_ratio(bars: List[Dict[str, Any]]) -> Optional[float]:
+    """近20日振幅均值 / 近60日振幅均值（<1 = 波动压缩/酝酿）。振幅=(高−低)/昨收。样本<60 返回 None。"""
+    amps: List[float] = []
+    for i in range(1, len(bars)):
+        pc, h, l = bars[i - 1]["close"], bars[i]["high"], bars[i]["low"]
+        if pc and h is not None and l is not None:
+            amps.append((h - l) / pc)
+    if len(amps) < 60:
+        return None
+    a_recent, a_base = _mean(amps[-20:]), _mean(amps[-60:])
+    return (a_recent / a_base) if a_base else None
+
+
+def _turnover_pctile(bars: List[Dict[str, Any]]) -> Optional[float]:
+    """最新换手率在近端窗口内的分位（0~1）：越高=换手越拥挤。样本<20 返回 None。"""
+    turns = [b["turnover"] for b in bars if b["turnover"] is not None]
+    if len(turns) < 20:
+        return None
+    last = turns[-1]
+    return sum(1 for t in turns if t <= last) / len(turns)
 
 
 def _absorption_score(drift: float) -> float:
@@ -737,6 +840,15 @@ def _pat_bottom_formation(bars, ctx):            # P5 底部形态构筑(双底/
     return chip is None or chip["concentration"] >= 0.35
 
 
+def _pat_compression(bars, ctx):                 # P23 箱体波动压缩(酝酿)
+    """中低位 + 近20日振幅 < 0.80×近60日振幅：波动收窄、蓄势待发。借鉴 hot_money_patterns.py 的 compression。"""
+    pos = ctx["pos"]
+    if pos is None or pos >= 0.60:
+        return False
+    r = _amp_ratio(bars)
+    return r is not None and r < COMPRESS_AMP_RATIO
+
+
 # --- 试盘 🟡hold ---
 def _pat_test_upper_shadow(bars, ctx):           # P6 试盘长上影破平台又缩回
     if len(bars) < 30:
@@ -886,15 +998,54 @@ def _pat_dump_bigbear(bars, ctx):                # P19 灌压出货(巨量大阴
     return body is not None and body > 0.06 and c < o and (c - l) / (h - l) < 0.25
 
 
-def _pat_ma_breakdown(bars, ctx):                # P20 均线放量破位
-    closes, ma20, vr = ctx["closes"], ctx["ma20"], ctx["vol_ratio"]
-    if ma20 is None or len(closes) < 25 or vr is None:
+def _ma_breakdown(closes: List[Optional[float]], vol_ratio: Optional[float]) -> bool:
+    """均线放量破位判定：收盘跌破MA20 + 5日前还在MA20上方 + 量比>1.2。
+    P20 形态与吸筹分的「破位惩罚」共用此单一判据，避免两处逻辑漂移。"""
+    ma20 = _ma_last(closes, 20)
+    if ma20 is None or len(closes) < 25 or vol_ratio is None:
         return False
     c = closes[-1]
     if not c or c >= ma20:
         return False
     prior, ma20_prior = closes[-5], _ma_last(closes[:-4], 20)
-    return bool(prior and ma20_prior and prior > ma20_prior and vr > 1.2)
+    return bool(prior and ma20_prior and prior > ma20_prior and vol_ratio > 1.2)
+
+
+def _pat_ma_breakdown(bars, ctx):                # P20 均线放量破位
+    return _ma_breakdown(ctx["closes"], ctx["vol_ratio"])
+
+
+def _pat_spring_reclaim(bars, ctx):              # P21 假跌破收回(Wyckoff spring·挖坑收回)
+    """近5日最低跌穿前40日箱体下沿×0.985(假摔)，但当前收盘又站回箱体下沿之上。借鉴 hot_money_patterns.py。"""
+    if len(bars) < 45:
+        return False
+    lows = [b["low"] for b in bars if b["low"] is not None]
+    if len(lows) < 45:
+        return False
+    box_low_prior = min(lows[-45:-5])            # 前40日(不含近5日)箱体下沿
+    recent_low = min(lows[-5:])
+    c = ctx["closes"][-1]
+    if not box_low_prior or not recent_low or not c:
+        return False
+    return recent_low < box_low_prior * 0.985 and c > box_low_prior
+
+
+def _pat_failed_breakout(bars, ctx):             # P22 放量假突破(高位拒绝)
+    """今日盘中高点刺破前40日高点、但收盘没站上 + 当日放量(>1.8×前20日均量)。借鉴 hot_money_patterns.py。"""
+    if len(bars) < 42:
+        return False
+    highs = [b["high"] for b in bars if b["high"] is not None]
+    if len(highs) < 42:
+        return False
+    high_40_prior = max(highs[-41:-1])           # 前40日(不含今日)最高
+    today_high, c = bars[-1]["high"], ctx["closes"][-1]
+    vol = ctx["vol"]
+    base = _mean([v for v in vol[-21:-1] if v])
+    today_v = vol[-1] if vol else None
+    if not high_40_prior or today_high is None or not c or not base or not today_v:
+        return False
+    day_ratio = today_v / base
+    return today_high > high_40_prior and c <= high_40_prior and day_ratio > 1.8
 
 
 # (code, 名称, 阶段, 信号方向, 匹配函数)
@@ -919,7 +1070,52 @@ PATTERNS: List[Tuple[str, str, str, str, Any]] = [
     ("P18", "顶部大阴包阳", "出货", "sell", _pat_bearish_engulf),
     ("P19", "灌压巨量大阴", "出货", "sell", _pat_dump_bigbear),
     ("P20", "均线放量破位", "出货", "sell", _pat_ma_breakdown),
+    ("P21", "假跌破收回", "洗盘", "buy", _pat_spring_reclaim),       # 借鉴hot_money_patterns；各周期均不显著(40日+1.15%弱)
+    ("P22", "放量假突破", "出货", "sell", _pat_failed_breakout),     # 借鉴hot_money_patterns；有效@5/10/40日(sell, 40日-1.99%)
+    ("P23", "箱体波动压缩", "吸筹", "buy", _pat_compression),        # 借鉴hot_money_patterns；后验各周期≈0无edge，留作酝酿标签
 ]
+
+# 每个形态的命中条件一句话（供前端「命中形态解释」模块；与文件头总表口径一致）。
+PATTERN_DESC: Dict[str, str] = {
+    "P1": "位置<0.40 + 近20日振幅<18% + |20日涨跌|<8%：低位窄幅横盘磨人",
+    "P2": "位置<0.40 + 近15日≥3根十字星/长下影：反复探底留下影",
+    "P3": "位置<0.45 + 近10日有“大阴跌≥4%却缩量、随后收复”：隐性吸货",
+    "P4": "位置<0.60 + 量比>1.2 + |20日涨跌|<6% + CMF>0：放量但价稳、资金净流入",
+    "P5": "位置<0.45 + 近端两摆动低点等高/低点抬高 + 中间反弹≥6%(颈线)：双底/W底",
+    "P6": "近8日长上影(>3%且>2×实体)创20日新高后收盘缩回：探顶又压回",
+    "P7": "位置<0.40 + 量比>1.5 + 近5日最大振幅>7%：低位突然放量异动",
+    "P8": "站上MA20 + 回踩近10日高点-2%~-15% + 跌日量<涨日量 + 筹码集中≥0.40：挖坑不破位",
+    "P9": "多头排列(MA5>10>20) + 近8日涨跌切换≥4次 + 低点抬高：边拉边洗",
+    "P10": "量比>1.5 + 收盘>MA20 + 筹码集中≥0.45：高换手震仓但筹码峰不发散",
+    "P11": "右进左出触发器：从低/中位放量(>1.3×)突破近20日收盘高点；⚠回测追突破全周期显著负(=接盘)、宜回避",
+    "P12": "连续涨停 streak≥2",
+    "P13": "今日首板(近20日无涨停) + 换手10%~45%",
+    "P14": "位置≥0.85 + 量比>1.5 + 近5日涨幅≤2% + 上影>2%：高位放量不涨",
+    "P15": "创60日新高却缩量(量比<1.0)、或放量(>1.8)却5日涨幅<1%：量价背离顶",
+    "P16": "位置≥0.80 + 近5日出现40日最大量且收阴：天量收阴",
+    "P17": "位置≥0.80 + 较前期冲高>15%后从峰值回落≤-8%：冲高倒V",
+    "P18": "位置≥0.80 + 昨阳今阴且今实体完全吞没昨实体：顶部看跌吞没",
+    "P19": "位置≥0.70 + 量比>1.8 + 实体跌>6%且收在当日价区下1/4：巨量灌压大阴",
+    "P20": "收盘跌破MA20(5日前还在MA20上方) + 量比>1.2：放量破位",
+    "P21": "近5日最低假摔穿前40日箱体下沿×0.985、收盘又站回：假跌破收回(Wyckoff spring)",
+    "P22": "今日盘中破前40日高但收盘没站上 + 当日放量>1.8×：放量假突破(高位拒绝)",
+    "P23": "中低位 + 近20日振幅<0.80×近60日：箱体波动压缩、蓄势酝酿",
+}
+
+# 经 patterns 后验「截面超额多周期显著」的有效形态（前端高亮）：
+#   P3 正向买入(吸筹)；P11 追突破=接盘(全周期显著负,回避)；P19/P20 出货风控(显著负)。
+PATTERN_EFFECTIVE = {"P3", "P11", "P19", "P20"}
+
+
+def pattern_catalog() -> List[Dict[str, str]]:
+    """形态总表结构化输出：{code, name, category, signal, desc, effective}。供前端解释模块。"""
+    return [
+        {
+            "code": c, "name": n, "category": cat, "signal": sig,
+            "desc": PATTERN_DESC.get(c, ""), "effective": c in PATTERN_EFFECTIVE,
+        }
+        for c, n, cat, sig, _ in PATTERNS
+    ]
 
 
 def match_patterns(code: str, bars: List[Dict[str, Any]],
@@ -943,7 +1139,7 @@ def _pattern_phase(fired: List[Dict[str, str]], score: Optional[float] = None) -
 
     突破=放量右进买点，最 actionable，仅次于出货风控示警、优先于被动的吸筹/洗盘；
     买入区按类别细分吸筹 / 洗盘（两类都中则合并标注）；剩余 hold 区拉升中 > 试盘；
-    无任何形态命中：吸筹分≥SUSPECT_ACCUM_SCORE → 疑似吸筹(待确认)，否则 → 空仓观望(场外不参与)。
+    无任何形态命中：吸筹分≥SUSPECT_ACCUM_SCORE → 疑似吸筹(待确认)，否则 → 观望(场外不参与)。
     """
     sigs = {p["signal"] for p in fired}
     cats = {p["phase"] for p in fired}
@@ -962,11 +1158,32 @@ def _pattern_phase(fired: List[Dict[str, str]], score: Optional[float] = None) -
         return "拉升中🟠" if "拉升" in cats else "试盘🟡"
     if score is not None and score >= SUSPECT_ACCUM_SCORE:
         return "疑似吸筹(待确认)🟢"
-    return "空仓观望⚪"
+    return "观望⚪"
+
+
+def _score_distribution(close_pctile: Optional[float], drift: Optional[float],
+                        vol_ratio: Optional[float]) -> float:
+    """高位派发风险（连续 0~100）：高位门控 ×（基础高位 + 阶段涨幅 + 高位放量）。
+
+    只有处在高位（close_pctile≥DIST_POS_START）才计派发风险——低位放量是吸筹、高位放量才是出货
+    （"天量见天价"）。用于给吸筹分做渐变折扣，而非靠形态硬覆盖标签。
+    """
+    if close_pctile is None:
+        return 0.0
+    high = _clip01((close_pctile - DIST_POS_START) / (DIST_POS_FULL - DIST_POS_START))
+    if high <= 0.0:
+        return 0.0
+    runup = _clip01(((drift or 0.0) - DIST_RUNUP_LO) / (DIST_RUNUP_HI - DIST_RUNUP_LO))
+    volspike = _clip01(((vol_ratio or 0.0) - DIST_VOL_LO) / (DIST_VOL_HI - DIST_VOL_LO))
+    return 100.0 * high * (0.5 + 0.3 * runup + 0.2 * volspike)
 
 
 def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """对一段日线窗口算吸筹分（位置 + 努力结果背离 + 收盘买压 + 低位筹码集中）。数据不足返回 None。"""
+    """对一段日线窗口算吸筹分（位置 + 努力结果背离 + 收盘买压 + 低位筹码集中）。数据不足返回 None。
+
+    吸筹分 = 4 因子加权 × (1 − 一字板惩罚) × (1 − 出货风险折扣)。出货风险折扣 = 连续派发分
+    渐变压制买入侧（借鉴 hot_money_patterns.py），让带派发味的票排名下沉。
+    """
     if len(bars) < MIN_BARS:
         return None
     vol, vol_measure = _volume_series(bars)
@@ -978,15 +1195,29 @@ def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     sealed, streak = _sealed_and_streak(bars, code)
     triggered, trigger = _breakout_trigger(bars, vol)     # 右进左出触发器
 
+    # ⚠️ 背离/CMF「反向计入·只罚高不奖缺失」：单因子截面 IC 实测显著为负(背离 t≈-3.6、CMF t≈-1.8~-2.1，见纪要(11))
+    #   ——「放量价稳/收盘买压」在龙头池是反转特征(放量=见顶)。贡献用 min(50, 100−原始分)、权重不变：
+    #   原始分越高(信号越强)越往 0 压(惩罚)；原始分低/缺失=中性 50(不重奖"无信号"，避免死水股被抬)。
+    #   实测：裸合成 IC 由 ≈0 抬到 +0.03~+0.043(t2.2~3.2)，与纯 100−x 等效但无"奖励缺失"副作用。
+    #   原始分仍存 sub_scores(语义不变)、本处仅翻转贡献。
+    div_eff = min(50.0, 100.0 - s_div) if s_div is not None else None
+    cmf_eff = min(50.0, 100.0 - s_cmf) if s_cmf is not None else None
     raw = (WEIGHTS["position"] * (s_pos or 0.0)
-           + WEIGHTS["divergence"] * (s_div or 0.0)
-           + WEIGHTS["cmf"] * (s_cmf or 0.0)
+           + WEIGHTS["divergence"] * (div_eff if div_eff is not None else 0.0)
+           + WEIGHTS["cmf"] * (cmf_eff if cmf_eff is not None else 0.0)
            + WEIGHTS["chip"] * (s_chip or 0.0))
     penalty = min(SEALED_PENALTY_CAP, SEALED_PENALTY_PER * sealed)
-    score = round(raw * (1.0 - penalty), 1)
+    dist = _score_distribution(close_pctile, drift, vol_ratio)
+    dist_discount = DIST_PENALTY_CAP * dist / 100.0       # 连续出货惩罚（最多 DIST_PENALTY_CAP）
+    # P20 均线放量破位惩罚：消融证明这是有增量的"纠错"——把"低位破位但分仍偏高"的票往下挪(dist 高位门控漏的盲区)。
+    ma_breakdown = _ma_breakdown([b["close"] for b in bars], vol_ratio)
+    breakdown_discount = MA_BREAKDOWN_PENALTY if ma_breakdown else 0.0
+    score = round(raw * (1.0 - penalty) * (1.0 - dist_discount) * (1.0 - breakdown_discount), 1)
+    turnover_pctile = _turnover_pctile(bars)              # 最新换手率分位（拥挤度，仅展示）
     return {
         "ambush_score": score,
         "raw": raw,
+        "distribution_score": round(dist, 1),
         "sealed": sealed,
         "streak": streak,
         "triggered": triggered,
@@ -1001,11 +1232,13 @@ def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any
             "chip_peak_price": round(chip["peak_price"], 2) if chip else None,
             "chip_peak_pctile": round(chip["peak_pctile"], 2) if chip else None,
             "chip_price_to_peak": round(chip["price_to_peak"], 3) if chip and chip["price_to_peak"] is not None else None,
+            "distribution_score": round(dist, 1),
             "triggered": triggered,
             "trigger": trigger,
             "sealed_recent": sealed,
             "limit_streak": streak,
             "latest_turnover": bars[-1]["turnover"],
+            "turnover_pctile": round(turnover_pctile, 2) if turnover_pctile is not None else None,
         },
         "sub_scores": {
             "position": round(s_pos, 1) if s_pos is not None else None,
@@ -1017,6 +1250,8 @@ def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any
             "chip_price_near_peak": round(chip["sub_price_near_peak"], 1) if chip else None,
             "chip_winner_mid_low": round(chip["sub_winner_mid_low"], 1) if chip else None,
             "sealed_penalty": round(penalty, 2),
+            "dist_penalty": round(dist_discount, 2),
+            "breakdown_penalty": round(breakdown_discount, 2),
         },
     }
 
@@ -1035,9 +1270,91 @@ def _state_label(raw: Optional[float], sealed: int, streak: int, triggered: bool
     return "平淡"
 
 
-def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any]) -> Dict[str, Any]:
-    """给单只龙头算当下潜伏分 + 游资形态匹配，返回带子分/原始信号/形态的明细行。"""
-    bars = _recent_bars(conn, cand["code"])
+def _phase_confidence(phase: str, fired: List[Dict[str, str]],
+                      ambush_score: float, distribution_score: float) -> float:
+    """阶段把握度（连续 0~100）——把脆弱的布尔形态标签补成带强度的分。
+
+    有形态命中=同向形态越多越笃定（1→60、2→80、3+→100）；
+    无形态命中(疑似吸筹/观望)=连续吸筹分本身（distribution_score 另存为独立连续出货分）。
+    """
+    if "疑似吸筹" in phase or "观望" in phase or "空仓" in phase:  # 无形态命中
+        return round(ambush_score, 1)
+    if "出货" in phase:
+        n = sum(1 for p in fired if p["signal"] == "sell")
+    elif "突破" in phase or "拉升" in phase or "试盘" in phase:
+        n = sum(1 for p in fired if p["signal"] == "hold")
+    else:                                                    # 吸筹 / 洗盘 / 吸筹+洗盘
+        n = sum(1 for p in fired if p["signal"] == "buy")
+    return round(min(100.0, 40.0 + 20.0 * n), 1) if n > 0 else round(ambush_score, 1)
+
+
+def _phase_invalidations(phase: str) -> List[str]:
+    """每个阶段的证伪/止损条件（借鉴 hot_money_patterns.py 的 invalidations，让标签可执行）。"""
+    if "出货" in phase:
+        return ["缩量回踩后重新放量突破前高才解除风险", "跌破高位平台下沿=派发确认"]
+    if "突破" in phase:
+        return ["次日低开低走或突破位站不稳3日", "突破后回到平台内=假突破"]
+    if "拉升" in phase:
+        return ["跌破5/10日线且放量", "高位放量滞涨或长上影=见顶"]
+    if "试盘" in phase:
+        return ["试盘后无量回落、不能再创异动高点", "跌破试盘当日低点"]
+    if "吸筹" in phase or "洗盘" in phase:                    # 含疑似吸筹/吸筹+洗盘
+        return ["跌破筑底箱体下沿且3-5日不收回", "放量下跌且筹码峰发散", "所属题材退潮"]
+    return ["无形态信号：仅观察，待左侧吸筹形态出现再评估"]   # 观望
+
+
+def _evidence(res: Dict[str, Any], fired: List[Dict[str, str]],
+              bars: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, str]]:
+    """把吸筹分的子分/信号翻译成结构化「依据」标签：[{label, kind}]，kind ∈ bullish/neutral/bearish。
+
+    只verbalize 因子层（位置/背离/CMF/筹码/压缩/换手/派发）——形态层由 P 编号 + 解释模块呈现，互补不重复。
+    前端按 kind 上色（利好绿/中性灰/风险红），替代原先靠关键字正则猜色。
+    """
+    sub = res.get("sub_scores", {})
+    sig = res.get("signals", {})
+    tags: List[Dict[str, str]] = []
+    def add(label: str, kind: str) -> None:
+        tags.append({"label": label, "kind": kind})
+
+    if (sub.get("position") or 0) >= 60:
+        add("价格中低位", "bullish")
+    # 注：背离(放量价稳)/CMF(买压) 已在吸筹分里「反向计入」(实测负 edge)，不再作为利好 evidence；
+    #     高背离/高CMF 反而是轻度反转风险，故标 bearish。
+    if (sub.get("divergence") or 0) >= 60:
+        add("放量滞涨(反转风险)", "bearish")
+    if (sub.get("cmf") or 0) >= 60:
+        add("高位买压(反转风险)", "bearish")
+    if (sub.get("chip") or 0) >= 60:
+        add("低位筹码集中", "bullish")
+    pos = sig.get("close_pctile")
+    if bars is not None and pos is not None and pos < 0.60:
+        r = _amp_ratio(bars)
+        if r is not None and r < COMPRESS_AMP_RATIO:
+            add("波动压缩(酝酿)", "bullish")
+    if sig.get("triggered"):
+        add("放量突破(追=接盘)", "bearish")        # P11 实测追突破显著负
+    streak = sig.get("limit_streak") or 0
+    if streak >= 2:
+        add(f"连板{streak}(已启动)", "neutral")
+    elif sig.get("sealed_recent"):
+        add("一字封板(买不进)", "neutral")
+    tp = sig.get("turnover_pctile")
+    if tp is not None and tp > 0.84:
+        add("换手拥挤", "bearish")
+    if (sig.get("distribution_score") or 0) >= 40:
+        add("高位派发风险", "bearish")
+    if any(p["signal"] == "sell" for p in fired) and (sig.get("distribution_score") or 0) < 40:
+        add("出货形态(破位/见顶)", "bearish")
+    return tags
+
+
+def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
+                    as_of: Optional[str] = None) -> Dict[str, Any]:
+    """给单只龙头算当下潜伏分 + 游资形态匹配，返回带子分/原始信号/形态的明细行。
+
+    as_of 给定时只用该日期及以前的 bar（PIT 防泄漏，供历史复盘）。
+    """
+    bars = _recent_bars(conn, cand["code"], as_of=as_of)
     out = dict(cand)
     res = _score_bars(cand["code"], bars)
     if res is None:
@@ -1045,15 +1362,20 @@ def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any]) -> Dict[str,
                     "state": "数据不足", "last_date": bars[-1]["date"] if bars else None})
         return out
     fired = match_patterns(cand["code"], bars)
+    phase = _pattern_phase(fired, res["ambush_score"])
     out.update({
         "ambush_score": res["ambush_score"],
+        "distribution_score": res["distribution_score"],
         "score_status": "OK",
         "triggered": res["triggered"],
         "state": _state_label(res["raw"], res["sealed"], res["streak"], res["triggered"]),
         "last_date": bars[-1]["date"],
         "patterns": [p["code"] for p in fired],
         "pattern_detail": fired,
-        "pattern_phase": _pattern_phase(fired, res["ambush_score"]),
+        "pattern_phase": phase,
+        "phase_confidence": _phase_confidence(phase, fired, res["ambush_score"], res["distribution_score"]),
+        "invalidations": _phase_invalidations(phase),
+        "evidence": _evidence(res, fired, bars),
         "signals": res["signals"],
         "sub_scores": res["sub_scores"],
     })
@@ -1132,15 +1454,23 @@ def _load_theme_map() -> Tuple[Dict[str, Dict[str, Any]], Dict[str, Any]]:
     return out, meta
 
 
-def run_ambush() -> Dict[str, Any]:
+def run_ambush(as_of: Optional[str] = None,
+               max_cap: Optional[float] = None) -> Dict[str, Any]:
     conn = stock_storage.connect(DB_FILE)
     try:
-        candidates = load_leader_candidates(conn)
-        scored = [score_candidate(conn, cand) for cand in candidates]
+        candidates = load_leader_candidates(conn, max_cap=max_cap)
+        scored = [score_candidate(conn, cand, as_of=as_of) for cand in candidates]
     finally:
         conn.close()
 
-    theme_map, theme_meta = _load_theme_map()
+    # PIT 防泄漏：theme_candidates.json 是「最新日」快照，历史 as-of 复盘时用它会泄露未来题材热度，
+    # 故只在 as_of=None（实时跑）时才挂题材映射；历史复盘留空、题材列回退静态细分行业。
+    if as_of is None:
+        theme_map, theme_meta = _load_theme_map()
+    else:
+        theme_map, theme_meta = {}, {"available": False, "generated_at": None,
+                                     "age_days": None, "stale": False,
+                                     "skipped_reason": f"as_of={as_of} 历史复盘禁用题材缓存(防泄漏)"}
     for r in scored:
         info = theme_map.get(r["code"])
         if info:
@@ -1160,11 +1490,12 @@ def run_ambush() -> Dict[str, Any]:
             "weights": WEIGHTS, "lookback": LOOKBACK,
             "cmf_full": CMF_FULL, "chip_band": CHIP_BAND, "pos_low": POS_LOW, "pos_high": POS_HIGH,
         },
+        "as_of": as_of,
         "scored_count": len(ranked),
         "skipped_count": skipped,
         "triggered_count": sum(1 for r in ranked if r.get("triggered")),
         "phase_counts": dict(Counter(r.get("pattern_phase") for r in ranked)),
-        "max_market_cap_yi": MAX_MARKET_CAP_YI,
+        "max_market_cap_yi": max_cap,
         "theme_source": theme_meta,
         "stocks": ranked,
     })
@@ -1210,6 +1541,8 @@ def _theme_cell(s: Dict[str, Any]) -> str:
 
 def _theme_freshness_note(meta: Dict[str, Any]) -> str:
     """题材热度数据来源 + 新鲜度提示行。"""
+    if meta.get("skipped_reason"):
+        return f"题材热度: ⏸ {meta['skipped_reason']}，「跟踪二级行业」列回退静态细分行业"
     if not meta.get("available"):
         return ("题材热度: ⚠️ 缺 theme_candidates.json，"
                 "「跟踪二级行业」列回退静态细分行业 → 先跑 python stock_theme_candidates.py")
@@ -1230,7 +1563,10 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
     print("  主力资金雷达 · 吸筹分 + 游资形态 (ambush)")
     counts = payload.get("phase_counts") or {}
     dist = " · ".join(f"{ph}{counts[ph]}" for ph in PHASE_ORDER if counts.get(ph))
-    print(f"  生成时间: {payload['generated_at']} · 候选(≤{payload.get('max_market_cap_yi', '∞')}亿小中盘龙头): "
+    as_of_note = f" · 数据截至 {payload['as_of']}(历史复盘·禁题材缓存)" if payload.get("as_of") else ""
+    cap = payload.get("max_market_cap_yi")
+    pool_note = f"≤{cap:g}亿小中盘龙头" if cap else "全市值龙头(含大盘)"
+    print(f"  生成时间: {payload['generated_at']}{as_of_note} · 候选({pool_note}): "
           f"{payload['candidate_count']} · 已打分: {payload.get('scored_count', 0)}")
     print(f"  阶段分布(游资操作顺序): {dist}")
     print(f"  落盘: {display_path(AMBUSH_RESULT_FILE)}")
@@ -1242,17 +1578,21 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
         print("=" * 112)
         return
     print(f"  {'#':>2} {_ljust('代码', 7)}{_ljust('名称', 9)}{_rjust('吸筹分', 6)}  "
-          f"{_rjust('量比', 5)} {_rjust('价分位', 6)} {'CMF':>6} {_rjust('筹码集中', 7)}"
+          f"{_rjust('量比', 5)} {_rjust('价分位', 6)} {_rjust('换手分位', 8)} {'CMF':>6} {_rjust('筹码集中', 7)}"
           f" {_rjust('连板', 4)}  {_ljust('命中形态', 16)} 阶段 / 跟踪二级行业(热度%)")
     for i, s in enumerate(stocks[:30], 1):
         sig = s.get("signals", {})
         name = (s.get("name") or "")[:8]
         pats = ",".join(s.get("patterns") or []) or "-"
         phase = s.get("pattern_phase") or s.get("state", "")
+        conf = s.get("phase_confidence")
+        phase_cell = f"{phase} 把握{conf:.0f}" if conf is not None else phase
+        tp = sig.get("turnover_pctile")
+        tp_cell = "-" if tp is None else (f"{tp:.2f}!" if tp > 0.84 else f"{tp:.2f}")  # !=拥挤(>84%)
         print(f"  {i:>2} {s['code']:<7}{_ljust(name, 9)}{s['ambush_score']:>6.1f}  "
-              f"{_fmt(sig.get('vol_ratio')):>5} {_fmt(sig.get('close_pctile')):>6} "
+              f"{_fmt(sig.get('vol_ratio')):>5} {_fmt(sig.get('close_pctile')):>6} {tp_cell:>8} "
               f"{_fmt(sig.get('cmf')):>6} {_fmt(sig.get('chip_concentration')):>7} "
-              f"{sig.get('limit_streak', 0):>4}  {pats:<16} {phase} / {_theme_cell(s)}")
+              f"{sig.get('limit_streak', 0):>4}  {pats:<16} {phase_cell} / {_theme_cell(s)}")
     if len(stocks) > 30:
         print(f"  ... 其余 {len(stocks) - 30} 只见 {display_path(AMBUSH_RESULT_FILE)}")
     print("=" * 112)
@@ -1429,10 +1769,10 @@ def _verdict(by_horizon: Dict[str, Any]) -> str:
     return "; ".join(parts)
 
 
-def run_verify() -> Dict[str, Any]:
+def run_verify(max_cap: Optional[float] = None) -> Dict[str, Any]:
     conn = stock_storage.connect(DB_FILE)
     try:
-        candidates = load_leader_candidates(conn)
+        candidates = load_leader_candidates(conn, max_cap=max_cap)
         collected = _collect_verify_samples(conn, candidates)
     finally:
         conn.close()
@@ -1558,6 +1898,18 @@ def _collect_pattern_samples(conn: sqlite3.Connection, candidates: List[Dict[str
     return {"samples": samples, "dates": sorted(used_dates), "codes": list(series.keys())}
 
 
+def _horizon_effective(signal: str, hz: Dict[str, Any]) -> bool:
+    """单个(形态,周期)是否有效：buy 超额>0且t≥1.5；sell 超额<0且t≤-1.5；hold 仅看显著(|t|≥1.5)。"""
+    em, t = hz.get("excess_mean"), hz.get("excess_t_stat")
+    if em is None or t is None:
+        return False
+    if signal == "buy":
+        return em > 0 and t >= 1.5
+    if signal == "sell":
+        return em < 0 and t <= -1.5
+    return abs(t) >= 1.5      # hold(试盘/突破/拉升)无先验方向，显著即"有信息"
+
+
 def _pattern_event_study(by_date: Dict[str, List[Dict[str, Any]]], pcode: str, h: int) -> Dict[str, Any]:
     """单形态事件研究：命中样本 vs 同日全体的前向收益超额（剔除大盘 beta），跨日平均 + t。"""
     excess: List[float] = []
@@ -1583,10 +1935,10 @@ def _pattern_event_study(by_date: Dict[str, List[Dict[str, Any]]], pcode: str, h
     }
 
 
-def run_patterns() -> Dict[str, Any]:
+def run_patterns(max_cap: Optional[float] = None) -> Dict[str, Any]:
     conn = stock_storage.connect(DB_FILE)
     try:
-        candidates = load_leader_candidates(conn)
+        candidates = load_leader_candidates(conn, max_cap=max_cap)
         collected = _collect_pattern_samples(conn, candidates)
     finally:
         conn.close()
@@ -1598,8 +1950,10 @@ def run_patterns() -> Dict[str, Any]:
 
     results = []
     for pcode, name, phase, signal, _fn in PATTERNS:
+        horizons = {str(h): _pattern_event_study(by_date, pcode, h) for h in VERIFY_HORIZONS}
         row = {"code": pcode, "name": name, "phase": phase, "signal": signal,
-               "horizons": {str(h): _pattern_event_study(by_date, pcode, h) for h in VERIFY_HORIZONS}}
+               "horizons": horizons,
+               "effective_at": [h for h in VERIFY_HORIZONS if _horizon_effective(signal, horizons[str(h)])]}
         results.append(row)
 
     payload = base_payload("patterns", len(candidates))
@@ -1620,50 +1974,50 @@ def run_patterns() -> Dict[str, Any]:
 
 
 def _print_patterns_summary(payload: Dict[str, Any]) -> None:
-    print("=" * 100)
+    print("=" * 108)
     print("  主力资金雷达 · 游资形态预测力后验 (patterns)")
     rng = payload.get("date_range")
     print(f"  生成时间: {payload['generated_at']} · 候选龙头: {payload['candidate_count']}"
           f" · 截面: {payload.get('section_count', 0)} · 样本: {payload.get('sample_count', 0)}"
           + (f" · 区间: {rng[0]}~{rng[1]}" if rng else ""))
     print(f"  落盘: {display_path(PATTERNS_RESULT_FILE)}")
-    print("-" * 100)
+    print("-" * 108)
     results = payload.get("patterns", [])
     if not results:
         for note in payload.get("notes", ["（无样本）"]):
             print(f"  {note}")
-        print("=" * 100)
+        print("=" * 108)
         return
     mid = str(VERIFY_HORIZONS[len(VERIFY_HORIZONS) // 2])
-    print(f"  逐形态：命中后相对同日全体的超额收益（buy 看正、sell 看负为有效；按{mid}日超额排序）")
+    print(f"  逐形态 × 逐周期超额收益(剔beta)；带 * = 该周期有效(buy超额>0且t≥1.5 / sell超额<0且t≤-1.5 / hold仅|t|≥1.5)")
     print(f"  {_ljust('形态', 6)}{_ljust('名称', 17)}{_ljust('阶段', 5)}{_ljust('信号', 5)}{_rjust('命中', 6)}  "
-          + "".join(_rjust(f"{h}日超额", 9) for h in VERIFY_HORIZONS) + _rjust(f"  {mid}日_t", 8) + _rjust('胜率', 7))
+          + "".join(_rjust(f"{h}日", 9) for h in VERIFY_HORIZONS) + _rjust('有效@', 12))
     rows = sorted(results, key=lambda r: (r["horizons"][mid].get("excess_mean") or 0), reverse=True)
     for r in rows:
         hz = r["horizons"]
-        m = hz[mid]
-        cells = "".join(f"{_pct(hz[str(h)].get('excess_mean')):>9}" for h in VERIFY_HORIZONS)
-        win = m.get("win_rate")
-        flag = ""
-        if r["signal"] == "buy" and (m.get("excess_t_stat") or 0) >= 1.5:
-            flag = " ✅有效"
-        elif r["signal"] == "sell" and (m.get("excess_t_stat") or 0) <= -1.5:
-            flag = " ✅有效"
-        print(f"  {r['code']:<6}{_ljust(r['name'], 17)}{_ljust(r['phase'], 5)}{r['signal']:<5}{m.get('n_hits', 0):>6}  "
-              f"{cells}{_fmt(m.get('excess_t_stat')):>8}"
-              f"{(f'{win*100:.0f}%' if win is not None else '-'):>7}{flag}")
-    print("-" * 100)
-    print("  说明：buy 形态超额>0 且 t≥1.5、或 sell 形态超额<0 且 t≤-1.5，视为有预测力（标 ✅）。")
-    print("=" * 100)
+        cells = ""
+        eff: List[str] = []
+        for h in VERIFY_HORIZONS:
+            d = hz[str(h)]
+            ok = _horizon_effective(r["signal"], d)
+            cells += f"{(_pct(d.get('excess_mean')) + ('*' if ok else '')):>9}"
+            if ok:
+                eff.append(str(h))
+        eff_str = (",".join(eff) + "日") if eff else "—"
+        print(f"  {r['code']:<6}{_ljust(r['name'], 17)}{_ljust(r['phase'], 5)}{r['signal']:<5}"
+              f"{hz[mid].get('n_hits', 0):>6}  {cells}{_rjust(eff_str, 12)}")
+    print("-" * 108)
+    print("  有效@ = 该形态达标的持有期(交易日)。buy 看正超额、sell 看负超额、hold 看显著；均要 |t|≥1.5。")
+    print("=" * 108)
 
 
 # ── watch（骨架）──────────────────────────────────────────────
 
-def run_watch() -> Dict[str, Any]:
+def run_watch(max_cap: Optional[float] = None) -> Dict[str, Any]:
     """实时交易监控入口（骨架）：取候选龙头占位，后续接盘口/实时行情事件。"""
     conn = stock_storage.connect(DB_FILE)
     try:
-        candidates = load_leader_candidates(conn)
+        candidates = load_leader_candidates(conn, max_cap=max_cap)
     finally:
         conn.close()
     payload = base_payload("watch", len(candidates))
@@ -1686,22 +2040,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="运行模式：ambush(默认,吸筹分+形态) / watch(实时监控) / "
              "verify(吸筹分回测) / patterns(形态预测力回测)",
     )
+    parser.add_argument(
+        "--as-of", default=None, metavar="YYYY-MM-DD",
+        help="ambush 模式只用该日期及以前的 bar（PIT 历史复盘，并禁用题材缓存防泄漏）；默认最新交易日。",
+    )
+    parser.add_argument(
+        "--exclude-large-cap", action=argparse.BooleanOptionalAction, default=False,
+        help=f"是否剔除大盘股（默认否=纳入全市值龙头）；用 --exclude-large-cap 只看 ≤{MAX_MARKET_CAP_YI:g}亿小/中盘"
+             "（verify 证明大盘是反转陷阱、选 alpha 时建议剔除）。",
+    )
     return parser
 
 
-def run_mode(mode: str) -> Dict[str, Any]:
+def run_mode(mode: str, as_of: Optional[str] = None,
+             max_cap: Optional[float] = None) -> Dict[str, Any]:
     if mode == "watch":
-        return run_watch()
+        return run_watch(max_cap=max_cap)
     if mode == "verify":
-        return run_verify()
+        return run_verify(max_cap=max_cap)
     if mode == "patterns":
-        return run_patterns()
-    return run_ambush()
+        return run_patterns(max_cap=max_cap)
+    return run_ambush(as_of=as_of, max_cap=max_cap)
 
 
 def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     args = build_parser().parse_args(argv)
-    return run_mode(args.mode)
+    max_cap = MAX_MARKET_CAP_YI if args.exclude_large_cap else None
+    return run_mode(args.mode, as_of=args.as_of, max_cap=max_cap)
 
 
 if __name__ == "__main__":

@@ -15,6 +15,8 @@
           <button id="reset" class="btn" type="button">重置</button>
           <button id="optimize" class="btn" type="button">搜索参数</button>
           <button id="refresh-data" class="btn" type="button">刷新数据</button>
+          <button id="long-chart-show" class="btn" type="button" hidden>策略走势</button>
+          <button id="export-picks" class="btn" type="button" disabled>导出</button>
           <label class="toggle"><input id="auto" type="checkbox" checked>实时</label>
         </div>
         <div class="data-refresh-meta">
@@ -68,5 +70,22 @@
       <div class="overlay-title">正在搜索参数…</div>
       <div id="optimize-elapsed" class="overlay-sub">已耗时 0 秒</div>
       <div class="overlay-sub">长线/短线各 300 次随机搜索回测（长线为 PIT 多年回测，较重），约需 3 分钟左右，请勿关闭页面</div>
+    </div>
+  </div>
+  <div id="long-chart-modal" class="chart-modal" hidden>
+    <div class="chart-modal-card">
+      <div class="chart-modal-head">
+        <div>
+          <strong id="long-chart-title">长线历史回测走势</strong>
+          <span id="long-chart-meta"></span>
+        </div>
+        <div class="chart-modal-actions">
+          <a id="long-chart-open" class="btn" href="#" target="_blank" rel="noopener">单独打开</a>
+          <button id="long-chart-close" class="btn" type="button">关闭</button>
+        </div>
+      </div>
+      <div class="chart-modal-body">
+        <img id="long-chart-image" alt="长线历史回测走势图">
+      </div>
     </div>
   </div>

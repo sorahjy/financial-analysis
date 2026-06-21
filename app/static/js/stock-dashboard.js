@@ -19,6 +19,10 @@
     let refreshShouldRunAfterDone = false;
     let runInFlight = false;
     let runAgainAfterDone = false;
+    let exactStockSearch = "";
+    let chartInFlight = false;
+    let klineRenderSeq = 0;
+    const klineCache = new Map();
 
     const $ = (id) => document.getElementById(id);
     const status = (text) => {
@@ -119,6 +123,13 @@
       $("collapse-factors").onclick = () => setFactorGroupsOpen(false);
       $("optimize").onclick = startOptimize;
       $("refresh-data").onclick = startDataRefresh;
+      $("long-chart-show").onclick = showLongBacktestChart;
+      $("export-picks").onclick = exportCurrentPicks;
+      $("long-chart-close").onclick = hideLongBacktestChart;
+      $("long-chart-modal").onclick = (event) => {
+        if (event.target === $("long-chart-modal")) hideLongBacktestChart();
+      };
+      window.addEventListener("resize", redrawVisibleMiniKlines);
     }
 
     function setRefreshButtonBusy(busy) {
@@ -294,6 +305,7 @@
       active = name;
       factorGroup = "all";
       factorSearch = "";
+      exactStockSearch = "";
       $("factor-search").value = "";
       $("tab-long").classList.toggle("active", name === "long");
       $("tab-short").classList.toggle("active", name === "short");
@@ -317,6 +329,23 @@
       renderParams();
       renderFactors();
       $("title").textContent = active === "long" ? "长线大盘股策略" : "短线龙虎榜策略";
+      updateLongChartButton();
+      updateExportButton();
+    }
+
+    function updateLongChartButton() {
+      const button = $("long-chart-show");
+      if (!button) return;
+      const visible = active === "long";
+      button.hidden = !visible;
+      button.disabled = !visible || chartInFlight;
+    }
+
+    function updateExportButton() {
+      const button = $("export-picks");
+      if (!button) return;
+      const section = result && result[active];
+      button.disabled = !section || !(section.picks || []).length;
     }
 
     function paramSchema() {
@@ -599,19 +628,19 @@
       if (!result) return;
       const section = result[active];
       if (!section) return;
+      updateExportButton();
       $("subtitle").textContent = section.title;
       $("generated").textContent = section.generated_at;
       renderMetrics(section);
       renderPoolRules(section);
       renderNotes(section.notes || []);
-      renderBars(section.picks || []);
-      renderTable(section.picks || []);
+      renderSearchDependentResults(section);
     }
 
     function renderMetrics(section) {
       const diag = section.diagnostics || {};
       const range = diag.score_range || ["--", "--"];
-      $("metrics").innerHTML = [
+      const cards = [
         ["候选", section.candidate_count],
         ["入选", section.selected_count],
         [active === "long" ? "长线因子" : "短线因子", section.factor_count],
@@ -619,6 +648,142 @@
         ["分数区间", `${range[0]} / ${range[1]}`],
         ["数据覆盖", diag.avg_data_quality === undefined ? "--" : `${fmt(diag.avg_data_quality * 100, 1)}%`]
       ].map(([label, value]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join("");
+      $("metrics").innerHTML = cards + `
+        <div class="metric stock-search-card">
+          <label for="stock-exact-search">搜索代码/名称</label>
+          <input id="stock-exact-search" type="text" value="${esc(exactStockSearch)}" placeholder="精确输入代码或名称" autocomplete="off">
+          <div id="stock-exact-search-status" class="stock-search-status"></div>
+        </div>
+      `;
+      const input = $("stock-exact-search");
+      input.oninput = () => {
+        exactStockSearch = input.value.trim();
+        renderSearchDependentResults(section);
+      };
+    }
+
+    async function showLongBacktestChart() {
+      if (active !== "long" || chartInFlight) return;
+      chartInFlight = true;
+      updateLongChartButton();
+      status("生成策略走势");
+      try {
+        const resp = await fetch("/api/stock/long-backtest-chart", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({config})
+        });
+        const payload = await resp.json();
+        if (disposed) return;
+        if (!resp.ok) throw new Error(payload.error || "生成失败");
+        renderLongBacktestChart(payload);
+        status(payload.is_default ? "默认参数走势" : "当前参数走势");
+      } catch (err) {
+        status(`走势失败: ${err.message}`);
+      } finally {
+        chartInFlight = false;
+        updateLongChartButton();
+      }
+    }
+
+    function renderLongBacktestChart(payload) {
+      const chart = payload.chart || {};
+      const url = `${payload.url}${payload.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
+      $("long-chart-title").textContent = payload.is_default ? "默认参数历史回测走势" : "当前参数历史回测走势";
+      $("long-chart-meta").textContent = [
+        chart.folds ? `${chart.folds} 个完整折` : "",
+        chart.partial_folds ? `${chart.partial_folds} 个未满折` : "",
+        chart.full_path_start_date && chart.full_path_end_date ? `${chart.full_path_start_date} ~ ${chart.full_path_end_date}` : "",
+      ].filter(Boolean).join(" · ");
+      $("long-chart-image").src = url;
+      $("long-chart-open").href = url;
+      $("long-chart-modal").hidden = false;
+    }
+
+    function hideLongBacktestChart() {
+      $("long-chart-modal").hidden = true;
+      $("long-chart-image").removeAttribute("src");
+    }
+
+    function exportCurrentPicks() {
+      const section = result && result[active];
+      if (!section) {
+        status("暂无可导出结果");
+        return;
+      }
+      const limit = Math.max(0, Math.floor(Number(config?.[active]?.top_n) || 0));
+      const picks = (section.picks || []).slice(0, limit || section.picks.length);
+      if (!picks.length) {
+        status("暂无可导出股票");
+        return;
+      }
+      const cleanField = (value) => String(value ?? "").replace(/[\r\n]+/g, " ").trim();
+      const text = picks.map((pick) =>
+        `${cleanField(pick.code)},${cleanField(pick.name)},`
+      ).join("\n") + "\n";
+      const blob = new Blob([text], {type: "text/plain;charset=utf-8"});
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
+      anchor.href = url;
+      anchor.download = `stock_strategy_${active}_${today}.txt`;
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      URL.revokeObjectURL(url);
+      status(`已导出${picks.length}只`);
+    }
+
+    function renderSearchDependentResults(section) {
+      const state = displayPicksWithExactSearch(section);
+      renderExactSearchStatus(state);
+      renderBars(state.picks);
+      renderTable(state.picks);
+    }
+
+    function displayPicksWithExactSearch(section) {
+      const picks = section.picks || [];
+      const query = exactStockSearch.trim();
+      if (!query) return { picks, query, match: null, alreadyShown: false };
+
+      const pool = section.search_pool || picks;
+      const qLower = query.toLowerCase();
+      const byCode = pool.find((p) => String(p.code || "").toLowerCase() === qLower);
+      const match = byCode || pool.find((p) => String(p.name || "") === query);
+      if (!match) return { picks, query, match: null, alreadyShown: false };
+
+      const alreadyShown = picks.some((p) => p.code === match.code);
+      if (alreadyShown) return { picks, query, match, alreadyShown: true };
+
+      const extended = picks.concat([{ ...match, _searchExtra: true }]);
+      extended.sort((a, b) =>
+        (Number(a.rank || 999999) - Number(b.rank || 999999)) ||
+        (Number(b.score || 0) - Number(a.score || 0)) ||
+        String(a.code || "").localeCompare(String(b.code || ""))
+      );
+      return { picks: extended, query, match, alreadyShown: false };
+    }
+
+    function renderExactSearchStatus(state) {
+      const el = $("stock-exact-search-status");
+      if (!el) return;
+      if (!state.query) {
+        el.textContent = "";
+        el.className = "stock-search-status";
+        return;
+      }
+      if (!state.match) {
+        el.textContent = "无精确匹配";
+        el.className = "stock-search-status warn";
+        return;
+      }
+      if (state.alreadyShown) {
+        el.textContent = `已在入选列表中 #${state.match.rank}`;
+        el.className = "stock-search-status";
+        return;
+      }
+      el.textContent = `已加入 #${state.match.rank} ${state.match.code} ${state.match.name}`;
+      el.className = "stock-search-status ok";
     }
 
     function renderPoolRules(section) {
@@ -698,6 +863,7 @@
           <tbody>${picks.map(renderRow).join("")}</tbody>
         </table>
       `;
+      requestAnimationFrame(() => loadWeeklyMiniKlines(picks));
     }
 
     function renderRow(pick) {
@@ -708,9 +874,16 @@
         .sort((a, b) => b.power - a.power)
         .slice(0, 5);
       return `
-        <tr>
+        <tr class="${pick._searchExtra ? "is-search-extra" : ""}">
           <td class="rank">${pick.rank}</td>
-          <td><div class="code">${esc(pick.code)}</div><div class="name">${esc(pick.name)}${industry ? ` ${esc(industry)}` : ""}</div></td>
+          <td class="stock-cell">
+            <div class="code">${esc(pick.code)}</div>
+            <div class="name">${esc(pick.name)}${industry ? ` ${esc(industry)}` : ""}</div>
+            <div class="stock-mini-kline" data-code="${esc(pick.code)}" aria-label="${esc(pick.code)} ${esc(pick.name)} 周K线">
+              <canvas></canvas>
+              <span class="mini-kline-status">周K</span>
+            </div>
+          </td>
           <td><span class="score">${fmt(pick.score)}</span><div class="name">覆盖 ${fmt((pick.data_quality || 0) * 100, 1)}%</div></td>
           <td><div class="chips">${(pick.reasons || []).map((r) => `<span class="chip good">${esc(r)}</span>`).join("")}</div></td>
           <td><div class="chips">${(pick.warnings || []).map((r) => `<span class="chip warn">${esc(r)}</span>`).join("") || `<span class="chip">无显著提示</span>`}</div></td>
@@ -718,6 +891,154 @@
           <td>${detailBlock(pick)}</td>
         </tr>
       `;
+    }
+
+    function miniKlineNodes(code) {
+      return Array.from(document.querySelectorAll(".stock-mini-kline[data-code]"))
+        .filter((node) => node.dataset.code === String(code || ""));
+    }
+
+    function normalizeKlineBars(bars) {
+      return (Array.isArray(bars) ? bars : [])
+        .map((bar) => ({
+          date: bar.date,
+          open: Number(bar.open),
+          high: Number(bar.high),
+          low: Number(bar.low),
+          close: Number(bar.close),
+          volume: Number(bar.volume || 0),
+        }))
+        .filter((bar) => [bar.open, bar.high, bar.low, bar.close].every((v) => Number.isFinite(v)));
+    }
+
+    async function fetchWeeklyMiniKline(code) {
+      const url = `/api/stock/kline?code=${encodeURIComponent(code)}&period=week&limit=640`;
+      const resp = await fetch(url);
+      const payload = await resp.json();
+      if (!resp.ok) throw new Error(payload.error || "kline failed");
+      return normalizeKlineBars(payload.bars);
+    }
+
+    function loadWeeklyMiniKlines(picks) {
+      const seq = ++klineRenderSeq;
+      const codes = Array.from(new Set((picks || []).map((p) => String(p.code || "")).filter(Boolean)));
+      codes.forEach((code) => {
+        if (klineCache.has(code)) {
+          miniKlineNodes(code).forEach((node) => drawMiniKline(node, klineCache.get(code)));
+          return;
+        }
+        miniKlineNodes(code).forEach((node) => setMiniKlineStatus(node, "加载"));
+        fetchWeeklyMiniKline(code)
+          .then((bars) => {
+            klineCache.set(code, bars);
+            if (disposed || seq !== klineRenderSeq) return;
+            miniKlineNodes(code).forEach((node) => drawMiniKline(node, bars));
+          })
+          .catch(() => {
+            klineCache.set(code, []);
+            if (disposed || seq !== klineRenderSeq) return;
+            miniKlineNodes(code).forEach((node) => drawMiniKline(node, []));
+          });
+      });
+    }
+
+    function redrawVisibleMiniKlines() {
+      document.querySelectorAll(".stock-mini-kline[data-code]").forEach((node) => {
+        if (klineCache.has(node.dataset.code)) drawMiniKline(node, klineCache.get(node.dataset.code));
+      });
+    }
+
+    function setMiniKlineStatus(node, text) {
+      const statusNode = node.querySelector(".mini-kline-status");
+      if (statusNode) statusNode.textContent = text;
+    }
+
+    function drawMiniKline(node, bars) {
+      const canvas = node.querySelector("canvas");
+      if (!canvas) return;
+      const width = Math.max(220, Math.floor(canvas.clientWidth || node.clientWidth || 280));
+      const height = Math.max(72, Math.floor(canvas.clientHeight || node.clientHeight || 86));
+      const dpr = window.devicePixelRatio || 1;
+      canvas.width = Math.floor(width * dpr);
+      canvas.height = Math.floor(height * dpr);
+      const ctx = canvas.getContext("2d");
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, width, height);
+      ctx.fillStyle = "#f8fafc";
+      ctx.fillRect(0, 0, width, height);
+
+      const view = normalizeKlineBars(bars).slice(-96);
+      if (view.length < 4) {
+        ctx.strokeStyle = "#cbd5e1";
+        ctx.setLineDash([4, 4]);
+        ctx.beginPath();
+        ctx.moveTo(8, height / 2);
+        ctx.lineTo(width - 8, height / 2);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        setMiniKlineStatus(node, "无周K");
+        return;
+      }
+
+      const padX = 8;
+      const priceTop = 8;
+      const priceBottom = height - 22;
+      const volumeTop = height - 17;
+      const volumeBottom = height - 6;
+      const highs = view.map((bar) => bar.high);
+      const lows = view.map((bar) => bar.low);
+      const maxPrice = Math.max(...highs);
+      const minPrice = Math.min(...lows);
+      const priceRange = maxPrice - minPrice || Math.max(1, maxPrice * 0.02);
+      const maxVolume = Math.max(...view.map((bar) => bar.volume), 1);
+      const step = (width - padX * 2) / view.length;
+      const candleWidth = Math.max(2, Math.min(6, step * 0.58));
+      const yPrice = (value) => priceTop + (maxPrice - value) / priceRange * (priceBottom - priceTop);
+
+      ctx.strokeStyle = "#e2e8f0";
+      ctx.lineWidth = 1;
+      [0.25, 0.5, 0.75].forEach((ratio) => {
+        const y = priceTop + (priceBottom - priceTop) * ratio;
+        ctx.beginPath();
+        ctx.moveTo(padX, y);
+        ctx.lineTo(width - padX, y);
+        ctx.stroke();
+      });
+
+      view.forEach((bar, index) => {
+        const x = padX + index * step + step / 2;
+        const up = bar.close >= bar.open;
+        const color = up ? "#dc2626" : "#059669";
+        const highY = yPrice(bar.high);
+        const lowY = yPrice(bar.low);
+        const openY = yPrice(bar.open);
+        const closeY = yPrice(bar.close);
+        const bodyTop = Math.min(openY, closeY);
+        const bodyHeight = Math.max(1, Math.abs(closeY - openY));
+        const volHeight = (bar.volume / maxVolume) * (volumeBottom - volumeTop);
+
+        ctx.strokeStyle = color;
+        ctx.fillStyle = color;
+        ctx.globalAlpha = 0.85;
+        ctx.beginPath();
+        ctx.moveTo(x, highY);
+        ctx.lineTo(x, lowY);
+        ctx.stroke();
+        ctx.fillRect(x - candleWidth / 2, bodyTop, candleWidth, bodyHeight);
+        ctx.globalAlpha = 0.18;
+        ctx.fillRect(x - candleWidth / 2, volumeBottom - volHeight, candleWidth, volHeight);
+        ctx.globalAlpha = 1;
+      });
+
+      const last = view[view.length - 1];
+      ctx.strokeStyle = "#64748b";
+      ctx.globalAlpha = 0.35;
+      ctx.beginPath();
+      ctx.moveTo(padX, yPrice(last.close));
+      ctx.lineTo(width - padX, yPrice(last.close));
+      ctx.stroke();
+      ctx.globalAlpha = 1;
+      setMiniKlineStatus(node, "周K");
     }
 
     function detailBlock(pick) {
@@ -749,6 +1070,7 @@
       clearTimeout(runTimer);
       clearInterval(optimizeTimer);
       clearInterval(refreshTimer);
+      window.removeEventListener("resize", redrawVisibleMiniKlines);
     };
     init();
   }

@@ -7,6 +7,7 @@
   <link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/fund-report.css') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/stock-dashboard.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/radar.css') }}">
   {% block head %}{% endblock %}
 </head>
 <body>
@@ -16,6 +17,7 @@
       <nav class="main-nav" aria-label="主导航">
         <a href="{{ url_for('fund.fund_page') }}">基金报告</a>
         <a href="{{ url_for('stock.stock_page') }}">A股策略</a>
+        <a href="{{ url_for('radar.radar_page') }}">游资雷达</a>
       </nav>
     </header>
     <main class="app-main">
@@ -25,6 +27,7 @@
   {% block scripts %}{% endblock %}
   <script src="{{ url_for('static', filename='js/fund-report.js') }}"></script>
   <script src="{{ url_for('static', filename='js/stock-dashboard.js') }}"></script>
+  <script src="{{ url_for('static', filename='js/radar.js') }}"></script>
   <script src="{{ url_for('static', filename='js/app-navigation.js') }}"></script>
   <script type="module" src="{{ url_for('static', filename='vendor/live2d-widget/autoload.js') }}"></script>
 </body>

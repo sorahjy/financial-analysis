@@ -32,6 +32,10 @@ import requests
 from bs4 import BeautifulSoup
 
 import stock_storage
+from stock_crawl_common import strip_proxy_env
+
+
+strip_proxy_env()
 
 
 DATA_DIR = Path("data/capital")

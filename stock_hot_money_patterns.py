@@ -30,7 +30,9 @@ from rich.console import Console
 from rich.table import Table
 from rich.text import Text
 
+from stock_hot_money_radar import PATTERNS as RADAR_PATTERNS
 from stock_hot_money_radar import _limit_pct
+from stock_hot_money_radar import match_patterns as radar_match_patterns
 
 
 ROOT = Path(__file__).resolve().parent
@@ -41,13 +43,19 @@ PLATE_DB = DATA_DIR / "plate_data.sqlite3"
 THEME_CANDIDATES_JSON = CAPITAL_DIR / "theme_candidates.json"
 OUT_JSON = CAPITAL_DIR / "hot_money_patterns.json"
 OUT_CSV = CAPITAL_DIR / "hot_money_patterns.csv"
+OUT_VERIFY_JSON = CAPITAL_DIR / "hot_money_pattern_verify.json"
 
 SCHEMA = "hot_money_patterns.v1"
 PLATE_TYPE = "sw2"
 DEFAULT_LOOKBACK_DAYS = 920
+DEFAULT_VERIFY_LOOKBACK_DAYS = 1600
 DEFAULT_MAX_CAP_YI = 300.0
 DEFAULT_MIN_BARS = 160
 DEFAULT_PRINT_TOP = 40
+VERIFY_PATTERN_LOOKBACK_BARS = 90
+VERIFY_HORIZONS = (5, 20, 40, 60)
+VERIFY_STEP = 10
+VERIFY_WINDOW_BARS = 750
 
 
 def safe_float(value: Any) -> Optional[float]:
@@ -1103,6 +1111,7 @@ def build_patterns(
             "lookback_days": lookback_days,
             "min_bars": min_bars,
             "max_cap_yi": max_cap_yi,
+            "exclude_large_cap": bool(max_cap_yi and max_cap_yi > 0),
             "use_theme_cache": cache_allowed,
         },
         "candidate_count": int(len(candidates)),
@@ -1265,12 +1274,293 @@ def print_summary(payload: Mapping[str, Any], top: int) -> None:
     print_table("[patterns] dump/distribution 风险 Top:", risk_rows, top)
 
 
+def mean_values(values: List[float]) -> Optional[float]:
+    return sum(values) / len(values) if values else None
+
+
+def history_group_to_bars(group: pd.DataFrame) -> List[Dict[str, Any]]:
+    bars: List[Dict[str, Any]] = []
+    for _, row in group.sort_values("trade_date").iterrows():
+        trade_date = row["trade_date"]
+        date_text = trade_date.strftime("%Y-%m-%d") if hasattr(trade_date, "strftime") else str(trade_date)
+        bars.append({
+            "date": date_text,
+            "open": safe_float(row["daily_open"]),
+            "high": safe_float(row["daily_high"]),
+            "low": safe_float(row["daily_low"]),
+            "close": safe_float(row["daily_close"]),
+            "volume": safe_float(row["daily_volume"]),
+            "amount": safe_float(row["daily_amount"]),
+            "chg": safe_float(row["daily_change_pct"]),
+            "turnover": safe_float(row["daily_turnover_rate"]),
+        })
+    return bars
+
+
+def pattern_event_study(by_date: Mapping[str, List[Dict[str, Any]]],
+                        pcode: str,
+                        horizon: int) -> Dict[str, Any]:
+    excess: List[float] = []
+    hit_rets: List[float] = []
+    relative_wins = 0
+    relative_count = 0
+    for group in by_date.values():
+        section = [sample["rets"][horizon] for sample in group if horizon in sample["rets"]]
+        section_mean = mean_values(section)
+        if section_mean is None:
+            continue
+        hits = [sample["rets"][horizon] for sample in group if pcode in sample["fired"] and horizon in sample["rets"]]
+        if not hits:
+            continue
+        hit_mean = mean_values(hits)
+        if hit_mean is None:
+            continue
+        excess.append(hit_mean - section_mean)
+        hit_rets.extend(hits)
+        relative_wins += sum(1 for value in hits if value > section_mean)
+        relative_count += len(hits)
+    if not hit_rets:
+        return {
+            "n_hits": 0,
+            "n_sections": 0,
+            "excess_mean": None,
+            "excess_t_stat": None,
+            "absolute_win_rate": None,
+            "relative_win_rate": None,
+        }
+    excess_mean = mean_values(excess)
+    if excess_mean is None:
+        return {
+            "n_hits": len(hit_rets),
+            "n_sections": 0,
+            "excess_mean": None,
+            "excess_t_stat": None,
+            "absolute_win_rate": round(sum(1 for value in hit_rets if value > 0) / len(hit_rets), 4),
+            "relative_win_rate": None,
+        }
+    excess_std = (
+        sum((value - excess_mean) ** 2 for value in excess) / len(excess)
+    ) ** 0.5 if len(excess) > 1 else None
+    t_stat = excess_mean / excess_std * math.sqrt(len(excess)) if excess_std else None
+    return {
+        "n_hits": len(hit_rets),
+        "n_sections": len(excess),
+        "excess_mean": round(excess_mean, 4),
+        "excess_t_stat": round(t_stat, 2) if t_stat is not None else None,
+        "absolute_win_rate": round(sum(1 for value in hit_rets if value > 0) / len(hit_rets), 4),
+        "relative_win_rate": round(relative_wins / relative_count, 4) if relative_count else None,
+    }
+
+
+def collect_verify_pattern_samples(
+    *,
+    max_cap_yi: Optional[float],
+    lookback_days: int,
+    step: int,
+    window_bars: int,
+) -> Dict[str, Any]:
+    as_of_date = latest_stock_date(None)
+    candidates = load_candidates(max_cap_yi)
+    if candidates.empty:
+        raise RuntimeError("sw3_member.is_leader 候选池为空")
+    history = load_stock_history(candidates["code"].tolist(), as_of_date, lookback_days)
+    if history.empty:
+        raise RuntimeError("stock_history 没有候选股可用日线")
+
+    max_horizon = max(VERIFY_HORIZONS)
+    series: Dict[str, Tuple[List[Dict[str, Any]], Dict[str, int]]] = {}
+    for code, group in history.groupby("code", sort=False):
+        code = normalize_code(code)
+        bars = history_group_to_bars(group)
+        if len(bars) < VERIFY_PATTERN_LOOKBACK_BARS + max_horizon + 1:
+            continue
+        series[code] = (bars, {bar["date"]: i for i, bar in enumerate(bars)})
+    if not series:
+        return {"samples": [], "dates": [], "codes": [], "candidate_count": int(len(candidates))}
+
+    all_dates = sorted({bar["date"] for bars, _ in series.values() for bar in bars})
+    as_of_dates = all_dates[:-max_horizon][-window_bars:][::max(step, 1)]
+    samples: List[Dict[str, Any]] = []
+    used_dates = set()
+    for date in as_of_dates:
+        for code, (bars, idx_map) in series.items():
+            i = idx_map.get(date)
+            if i is None or i < VERIFY_PATTERN_LOOKBACK_BARS - 1 or i + max_horizon >= len(bars):
+                continue
+            close = safe_float(bars[i].get("close"))
+            if not close:
+                continue
+            window = bars[i - VERIFY_PATTERN_LOOKBACK_BARS + 1:i + 1]
+            fired = radar_match_patterns(code, window)
+            rets: Dict[int, float] = {}
+            ok = True
+            for horizon in VERIFY_HORIZONS:
+                future_close = safe_float(bars[i + horizon].get("close"))
+                if not future_close:
+                    ok = False
+                    break
+                rets[horizon] = future_close / close - 1.0
+            if not ok:
+                continue
+            samples.append({
+                "date": date,
+                "code": code,
+                "fired": {p["code"] for p in fired},
+                "rets": rets,
+            })
+            used_dates.add(date)
+    return {
+        "samples": samples,
+        "dates": sorted(used_dates),
+        "codes": sorted(series.keys()),
+        "candidate_count": int(len(candidates)),
+    }
+
+
+def verify_patterns(
+    *,
+    max_cap_yi: Optional[float] = DEFAULT_MAX_CAP_YI,
+    lookback_days: int = DEFAULT_VERIFY_LOOKBACK_DAYS,
+    step: int = VERIFY_STEP,
+    window_bars: int = VERIFY_WINDOW_BARS,
+) -> Dict[str, Any]:
+    collected = collect_verify_pattern_samples(
+        max_cap_yi=max_cap_yi,
+        lookback_days=lookback_days,
+        step=step,
+        window_bars=window_bars,
+    )
+    samples = collected["samples"]
+    by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for sample in samples:
+        by_date.setdefault(sample["date"], []).append(sample)
+
+    results: List[Dict[str, Any]] = []
+    for pcode, name, phase, signal, _fn in RADAR_PATTERNS:
+        horizons = {
+            str(horizon): pattern_event_study(by_date, pcode, horizon)
+            for horizon in VERIFY_HORIZONS
+        }
+        mid = horizons.get("20") or horizons[str(VERIFY_HORIZONS[len(VERIFY_HORIZONS) // 2])]
+        excess = safe_float(mid.get("excess_mean"))
+        t_stat = safe_float(mid.get("excess_t_stat"))
+        valid = bool(
+            (signal == "buy" and excess is not None and excess > 0 and t_stat is not None and t_stat >= 1.5)
+            or (signal == "sell" and excess is not None and excess < 0 and t_stat is not None and t_stat <= -1.5)
+        )
+        results.append({
+            "code": pcode,
+            "name": name,
+            "phase": phase,
+            "signal": signal,
+            "validity_hint": valid,
+            "horizons": horizons,
+        })
+
+    dates = collected["dates"]
+    payload = {
+        "schema": SCHEMA,
+        "mode": "verify-patterns",
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "source": {
+            "stock_db": str(STOCK_DB.relative_to(ROOT)),
+            "pattern_matcher": "stock_hot_money_radar.PATTERNS",
+            "candidate_pool": "sw3_member.is_leader=1",
+        },
+        "params": {
+            "horizons": list(VERIFY_HORIZONS),
+            "pattern_lookback_bars": VERIFY_PATTERN_LOOKBACK_BARS,
+            "lookback_days": lookback_days,
+            "step": step,
+            "window_bars": window_bars,
+            "max_cap_yi": max_cap_yi,
+            "exclude_large_cap": bool(max_cap_yi and max_cap_yi > 0),
+        },
+        "candidate_count": collected["candidate_count"],
+        "series_count": len(collected["codes"]),
+        "section_count": len(dates),
+        "sample_count": len(samples),
+        "date_range": [dates[0], dates[-1]] if dates else None,
+        "patterns": results,
+    }
+    if not samples:
+        payload["notes"] = ["无可验证样本：请确认 stock_history 日线长度足够，且候选池有有效交易数据。"]
+    return payload
+
+
+def write_verify_output(payload: Mapping[str, Any]) -> None:
+    CAPITAL_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_json = OUT_VERIFY_JSON.with_suffix(".tmp")
+    tmp_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp_json.replace(OUT_VERIFY_JSON)
+
+
+def pct_fmt(value: Any) -> str:
+    value = safe_float(value)
+    return "-" if value is None else f"{value * 100:.2f}%"
+
+
+def print_verify_summary(payload: Mapping[str, Any]) -> None:
+    print(
+        f"[verify-patterns] candidates={payload['candidate_count']} series={payload['series_count']} "
+        f"sections={payload['section_count']} samples={payload['sample_count']} "
+        f"written={OUT_VERIFY_JSON.relative_to(ROOT)}",
+        flush=True,
+    )
+    for note in payload.get("notes", []):
+        print(f"[verify-patterns] {note}", flush=True)
+    table = _plain_table([
+        ("形态", "left", None),
+        ("名称", "left", 18),
+        ("阶段", "left", None),
+        ("信号", "left", None),
+        ("命中", "right", None),
+        ("5日超额", "right", None),
+        ("20日超额", "right", None),
+        ("40日超额", "right", None),
+        ("60日超额", "right", None),
+        ("20日t", "right", None),
+        ("相对胜率", "right", None),
+        ("有效", "left", None),
+    ])
+    results = list(payload.get("patterns", []))
+    results.sort(
+        key=lambda row: safe_float(row.get("horizons", {}).get("20", {}).get("excess_mean")) or 0.0,
+        reverse=True,
+    )
+    for row in results:
+        horizons = row.get("horizons", {})
+        mid = horizons.get("20", {})
+        table.add_row(
+            _cell(row.get("code")),
+            _cell(row.get("name")),
+            _cell(row.get("phase")),
+            _cell(row.get("signal")),
+            _cell(mid.get("n_hits", 0)),
+            _cell(pct_fmt(horizons.get("5", {}).get("excess_mean"))),
+            _cell(pct_fmt(horizons.get("20", {}).get("excess_mean"))),
+            _cell(pct_fmt(horizons.get("40", {}).get("excess_mean"))),
+            _cell(pct_fmt(horizons.get("60", {}).get("excess_mean"))),
+            _cell(fmt(mid.get("excess_t_stat"), digits=2)),
+            _cell(pct_fmt(mid.get("relative_win_rate"))),
+            _cell("Y" if row.get("validity_hint") else ""),
+        )
+    _console().print(table)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="游资题材股形态匹配器")
+    parser.add_argument("--mode", choices=("scan", "verify-patterns"), default="scan",
+                        help="scan 输出最新形态表；verify-patterns 做历史形态事件研究")
     parser.add_argument("--as-of", help="只使用该日期及以前的数据，YYYY-MM-DD；默认使用最新交易日")
     parser.add_argument("--max-cap-yi", type=float, default=DEFAULT_MAX_CAP_YI,
-                        help="候选池市值上限，单位亿元；设为 0 表示不过滤")
+                        help="剔除大盘时的市值上限，单位亿元")
+    parser.add_argument("--exclude-large-cap", action=argparse.BooleanOptionalAction, default=True,
+                        help="是否剔除大盘股；默认剔除，使用 --no-exclude-large-cap 可关闭")
     parser.add_argument("--lookback-days", type=int, default=DEFAULT_LOOKBACK_DAYS)
+    parser.add_argument("--verify-lookback-days", type=int, default=DEFAULT_VERIFY_LOOKBACK_DAYS)
+    parser.add_argument("--verify-step", type=int, default=VERIFY_STEP)
+    parser.add_argument("--verify-window-bars", type=int, default=VERIFY_WINDOW_BARS)
     parser.add_argument("--min-bars", type=int, default=DEFAULT_MIN_BARS)
     parser.add_argument("--print-top", type=int, default=DEFAULT_PRINT_TOP)
     parser.add_argument("--no-theme-cache", action="store_true",
@@ -1280,7 +1570,18 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> Dict[str, Any]:
     args = build_parser().parse_args()
-    max_cap = None if args.max_cap_yi == 0 else args.max_cap_yi
+    max_cap = args.max_cap_yi if args.exclude_large_cap and args.max_cap_yi > 0 else None
+    if args.mode == "verify-patterns":
+        payload = verify_patterns(
+            max_cap_yi=max_cap,
+            lookback_days=args.verify_lookback_days,
+            step=args.verify_step,
+            window_bars=args.verify_window_bars,
+        )
+        write_verify_output(payload)
+        print_verify_summary(payload)
+        return payload
+
     payload = build_patterns(
         as_of=args.as_of,
         max_cap_yi=max_cap,

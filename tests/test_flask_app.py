@@ -38,7 +38,7 @@ class FlaskAppTest(unittest.TestCase):
     def test_internal_navigation_replaces_main_without_reloading_shell(self):
         script = (ROOT_DIR / "app/static/js/app-navigation.js").read_text(encoding="utf-8")
 
-        self.assertIn('new Set(["/", "/fund", "/fund/report", "/stock"])', script)
+        self.assertIn('new Set(["/", "/fund", "/fund/report", "/stock", "/radar"])', script)
         self.assertIn('headers: {"X-Requested-With": "fetch"}', script)
         self.assertIn("FinancialAnalysisPages.bootId", script)
         self.assertIn('querySelector(".app-main")', script)
@@ -76,6 +76,29 @@ class FlaskAppTest(unittest.TestCase):
         stock_html = self.client.get("/stock").get_data(as_text=True)
         self.assertIn("长线/短线各 300 次随机搜索回测", stock_html)
         self.assertIn("约需 3 分钟左右", stock_html)
+
+    def test_radar_script_shows_market_cap_and_watch_label(self):
+        body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+
+        self.assertIn('"观望⚪"', script)
+        self.assertIn('replace("空仓观望", "观望")', script)
+        self.assertIn('sortTh("market_cap_yi", "市值")', script)
+        self.assertIn("fmtMarketCap(s.market_cap_yi)", script)
+        self.assertIn("pi-stock-meta", script)
+        self.assertIn(".pi-stock-meta", css)
+        self.assertIn('id="radar-export-limit"', body)
+        self.assertIn('value="10"', body)
+        self.assertIn('id="radar-export"', body)
+        self.assertLess(body.index('id="radar-hide-dist"'), body.index('id="radar-export-limit"'))
+        self.assertLess(body.index('id="radar-export-limit"'), body.index('id="radar-export"'))
+        self.assertIn("function exportTopAmbushStocks()", script)
+        self.assertIn("text/plain;charset=utf-8", script)
+        self.assertIn("hot_money_radar_top", script)
+        self.assertIn("Number(b.ambush_score) - Number(a.ambush_score)", script)
+        self.assertIn('${cleanField(s.code)},${cleanField(s.name)},', script)
+        self.assertIn(".radar-export-limit", css)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -162,6 +185,67 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("全量拉取", script)
         self.assertIn("no-proxy", script)
         self.assertIn("数据刷新时间会很久", script)
+
+    def test_stock_long_backtest_chart_endpoint_returns_payload(self):
+        payload = {
+            "is_default": True,
+            "url": "/api/stock/long-backtest-chart/file/stock_strategy_best_fold_paths.svg",
+            "chart": {"chart_type": "existing_default"},
+        }
+        with patch("app.routes.stock.build_long_backtest_chart", return_value=payload) as build_chart:
+            response = self.client.post("/api/stock/long-backtest-chart", json={"config": {"long": {"top_n": 10}}})
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), payload)
+        build_chart.assert_called_once_with({"long": {"top_n": 10}})
+
+    def test_stock_long_backtest_chart_file_serves_svg_only(self):
+        with tempfile.NamedTemporaryFile(suffix=".svg") as tmp:
+            Path(tmp.name).write_text("<svg></svg>", encoding="utf-8")
+            with patch("app.routes.stock.resolve_long_backtest_chart_file", return_value=Path(tmp.name)):
+                response = self.client.get("/api/stock/long-backtest-chart/file/stock_strategy_best_fold_paths.svg")
+                self.assertEqual(response.status_code, 200)
+                self.assertIn("image/svg+xml", response.content_type)
+
+                response.close()
+
+    def test_stock_dashboard_has_long_backtest_chart_button(self):
+        body = (ROOT_DIR / "app/templates/stock/dashboard_body.html").read_text(encoding="utf-8")
+        css = (ROOT_DIR / "app/static/css/stock-dashboard.css").read_text(encoding="utf-8")
+        script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
+
+        self.assertIn('id="long-chart-modal"', body)
+        self.assertIn('id="long-chart-show"', body)
+        self.assertIn(">策略走势</button>", body)
+        self.assertIn('id="export-picks"', body)
+        self.assertIn(">导出</button>", body)
+        self.assertLess(body.index('id="refresh-data"'), body.index('id="long-chart-show"'))
+        self.assertLess(body.index('id="long-chart-show"'), body.index('id="export-picks"'))
+        self.assertIn("/api/stock/long-backtest-chart", script)
+        self.assertIn("button.hidden = !visible", script)
+        self.assertIn('const visible = active === "long"', script)
+        self.assertIn("function exportCurrentPicks()", script)
+        self.assertIn("text/plain;charset=utf-8", script)
+        self.assertIn("anchor.download", script)
+        self.assertIn("slice(0, limit", script)
+        self.assertIn('${cleanField(pick.code)},${cleanField(pick.name)},', script)
+        self.assertIn("/api/stock/kline", script)
+        self.assertIn("period=week", script)
+        self.assertIn("function drawMiniKline", script)
+        self.assertIn('class="stock-mini-kline"', script)
+        self.assertIn(".stock-mini-kline", css)
+        self.assertIn(".chart-modal", css)
+        self.assertNotIn("long-chart-card", css)
+        self.assertNotIn("查看走势", script)
+
+    def test_stock_kline_endpoint_returns_weekly_bars(self):
+        payload = {"code": "002511", "period": "week", "bars": [{"date": "2026-06-19", "close": 10.0}]}
+        with patch("app.routes.stock.kline_bars", return_value=payload) as kline:
+            response = self.client.get("/api/stock/kline?code=002511&period=week&limit=640")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), payload)
+        kline.assert_called_once_with("002511", 640, "week")
 
     def test_stock_page_renders_native_dashboard_without_iframe(self):
         response = self.client.get("/stock")

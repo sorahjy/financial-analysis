@@ -388,6 +388,85 @@
       margin-top: 5px;
       font-size: 22px;
       font-weight: 750;
+    }.stock-native .stock-search-card {
+      grid-column: span 2;
+      display: grid;
+      gap: 7px;
+      align-content: start;
+    }.stock-native .stock-search-card label {
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 650;
+    }.stock-native .stock-search-card input {
+      min-height: 34px;
+    }.stock-native .stock-search-status {
+      min-height: 16px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.35;
+    }.stock-native .stock-search-status.ok {
+      color: var(--green);
+    }.stock-native .stock-search-status.warn {
+      color: var(--amber);
+    }.stock-native .chart-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 120;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 22px;
+      background: rgba(15, 23, 42, 0.48);
+    }.stock-native .chart-modal[hidden] {
+      display: none;
+    }.stock-native .chart-modal-card {
+      width: min(1180px, 100%);
+      max-height: calc(100vh - 44px);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }.stock-native .chart-modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      background: var(--soft);
+    }.stock-native .chart-modal-head strong {
+      display: block;
+      font-size: 14px;
+    }.stock-native .chart-modal-head span {
+      display: block;
+      margin-top: 2px;
+      color: var(--muted);
+      font-size: 12px;
+    }.stock-native .chart-modal-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      justify-content: flex-end;
+    }.stock-native .chart-modal-actions a {
+      text-decoration: none;
+      display: inline-flex;
+      align-items: center;
+    }.stock-native .chart-modal-body {
+      min-height: 0;
+      overflow: auto;
+      background: #f8fafc;
+      padding: 12px;
+    }.stock-native .chart-modal-body img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 6px;
     }.stock-native .notes {
       display: grid;
       gap: 7px;
@@ -476,7 +555,7 @@
     }.stock-native table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 980px;
+      min-width: 1180px;
     }.stock-native th, .stock-native td {
       border-bottom: 1px solid var(--line);
       padding: 9px 10px;
@@ -489,10 +568,16 @@
       z-index: 1;
       font-size: 12px;
       color: var(--muted);
+    }.stock-native tr.is-search-extra td {
+      background: #f0f9ff;
+    }.stock-native tr.is-search-extra td:first-child {
+      box-shadow: inset 3px 0 0 var(--cyan);
     }.stock-native td.rank {
       width: 52px;
       color: var(--muted);
       font-variant-numeric: tabular-nums;
+    }.stock-native td.stock-cell {
+      min-width: 280px;
     }.stock-native .code {
       font-weight: 750;
       white-space: nowrap;
@@ -501,6 +586,31 @@
       font-size: 12px;
       margin-top: 2px;
       white-space: nowrap;
+    }.stock-native .stock-mini-kline {
+      position: relative;
+      width: 320px;
+      max-width: 100%;
+      height: 86px;
+      margin-top: 9px;
+      border: 1px solid #e2e8f0;
+      border-radius: 6px;
+      overflow: hidden;
+      background: #f8fafc;
+    }.stock-native .stock-mini-kline canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+    }.stock-native .mini-kline-status {
+      position: absolute;
+      top: 4px;
+      right: 5px;
+      border-radius: 4px;
+      background: rgba(248, 250, 252, 0.82);
+      color: var(--muted);
+      font-size: 10px;
+      line-height: 1;
+      padding: 2px 4px;
+      pointer-events: none;
     }.stock-native .score {
       font-weight: 750;
       color: var(--green);
@@ -548,6 +658,11 @@
     @media (max-width: 980px) {.stock-native .app { grid-template-columns: 1fr; }.stock-native aside { display: block; max-height: none; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }.stock-native .side-sticky { position: static; }.stock-native .side-body { overflow: visible; }.stock-native main { max-height: none; }.stock-native .cards { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
     }
     @media (max-width: 560px) {.stock-native main { padding: 14px; }.stock-native .side-sticky, .stock-native .side-body { padding-left: 14px; padding-right: 14px; }.stock-native .grid, .stock-native .cards, .stock-native .rule-list { grid-template-columns: 1fr; }.stock-native .factor-tools, .stock-native .factor-actions, .stock-native .factor-group-body { grid-template-columns: 1fr; }.stock-native .factor-row { grid-template-columns: minmax(0, 1fr) 72px; }.stock-native .bar-row { grid-template-columns: 1fr 1fr; }.stock-native .bar-track { grid-column: 1 / -1; }
+      .stock-native .stock-search-card { grid-column: auto; }
+      .stock-native .chart-modal { padding: 10px; }
+      .stock-native .chart-modal-head { align-items: flex-start; flex-direction: column; }
+      .stock-native .chart-modal-actions { width: 100%; justify-content: stretch; }
+      .stock-native .chart-modal-actions .btn { flex: 1; justify-content: center; }
     }
 .stock-native {
   min-height: calc(100vh - 58px);

@@ -18,6 +18,8 @@ import math
 import multiprocessing
 import os
 import statistics
+import subprocess
+import sys
 import threading
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
@@ -25,8 +27,10 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import akshare as ak
+import requests
 
 MAX_RETRIES = 3
+INDEX_CONS_PRIMARY_TIMEOUT_SEC = int(os.getenv("STOCK_INDEX_CONS_PRIMARY_TIMEOUT", "30"))
 _PRINT_LOCK = threading.Lock()
 
 HISTORY_DAILY_FIELD_ALIASES = {
@@ -164,22 +168,79 @@ def symbol_with_prefix(code):
     return exchange_prefix(code) + str(code).zfill(6)
 
 
+def _fetch_csindex_constituents_with_timeout(symbol, timeout_sec=INDEX_CONS_PRIMARY_TIMEOUT_SEC):
+    """Call AkShare's CSIndex constituents API in a subprocess.
+
+    ak.index_stock_cons_csindex can hang inside HTTP/client internals without raising,
+    especially for 000985. A subprocess timeout keeps refresh_stock_universe moving so
+    the normal fallback path can run.
+    """
+    script = r"""
+import contextlib
+import json
+import os
+import sys
+
+if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() in ("1", "true", "yes"):
+    for var in ("http_proxy", "https_proxy", "all_proxy",
+                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
+        os.environ.pop(var, None)
+    os.environ["NO_PROXY"] = "*"
+    os.environ["no_proxy"] = "*"
+
+import akshare as ak
+
+symbol = sys.argv[1]
+with contextlib.redirect_stdout(sys.stderr):
+    df = ak.index_stock_cons_csindex(symbol=symbol)
+sys.stdout.write(json.dumps(df.to_dict(orient="records"), ensure_ascii=False, default=str))
+"""
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", script, str(symbol)],
+            cwd=str(Path(__file__).resolve().parent),
+            env=os.environ.copy(),
+            capture_output=True,
+            text=True,
+            timeout=timeout_sec,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise TimeoutError(f"超过 {timeout_sec}s 未返回") from exc
+
+    if completed.returncode != 0:
+        err = (completed.stderr or completed.stdout or "").strip()
+        if len(err) > 600:
+            err = "..." + err[-600:]
+        raise RuntimeError(f"子进程退出 {completed.returncode}: {err or '无错误输出'}")
+
+    try:
+        rows = json.loads(completed.stdout or "[]")
+    except json.JSONDecodeError as exc:
+        snippet = (completed.stdout or "").strip()
+        if len(snippet) > 300:
+            snippet = snippet[:300] + "..."
+        raise RuntimeError(f"中证官网成分接口返回无法解析: {snippet!r}") from exc
+
+    return {
+        str(row["成分券代码"]).zfill(6): str(row["成分券名称"])
+        for row in rows
+        if row.get("成分券代码") is not None and row.get("成分券名称") is not None
+    }
+
+
 def fetch_index_constituents(symbol):
     """指数全量成分 → {code: name}。
 
     优先中证官网接口 index_stock_cons_csindex(全量)；失败回退新浪
-    index_stock_cons（分页对大样本指数可能只返回部分，仅作兜底）。
+    index_stock_cons。
     """
     try:
-        df = retry_fetch(ak.index_stock_cons_csindex, symbol=symbol)
-        cons = {
-            str(row["成分券代码"]).zfill(6): str(row["成分券名称"])
-            for _, row in df.iterrows()
-        }
+        cons = _fetch_csindex_constituents_with_timeout(symbol)
         if cons:
             return cons
     except Exception as e:
-        print(f"  [WARN] 中证官网成分接口失败({symbol}): {e}, 回退新浪接口(可能不全)")
+        print(f"  [WARN] 中证官网成分接口失败/超时({symbol}): {e}, 回退新浪接口")
     df = retry_fetch(ak.index_stock_cons, symbol=symbol)
     return {
         str(row["品种代码"]).zfill(6): str(row["品种名称"])
@@ -438,32 +499,79 @@ def _fetch_daily_eastmoney_qfq(symbol, start_date, end_date, include_trading_val
     return records
 
 
+def _normalize_volume_to_hands(volume, amount=None, close=None):
+    """成交量统一归一到「手」；当成交额能识别出「股」单位时自动除以 100。"""
+    volume = safe_float(volume)
+    if volume is None or volume <= 0:
+        return None
+    amount = safe_float(amount)
+    close = safe_float(close)
+    if amount is None or amount <= 0 or close is None or close <= 0:
+        return volume
+
+    share_avg = amount / volume
+    hand_avg = amount / (volume * 100.0)
+    if abs(share_avg - close) < abs(hand_avg - close):
+        return round(volume / 100.0, 2)
+    return volume
+
+
 def _fetch_daily_tencent_qfq(symbol, start_date, end_date, include_trading_value=False):
-    df = ak.stock_zh_a_hist_tx(
-        symbol=symbol_with_prefix(symbol),
-        start_date=_lookback_start(start_date),
-        end_date=_date_compact(end_date),
-        adjust="qfq",
-    )
-    if df is None or df.empty:
+    tx_symbol = symbol_with_prefix(symbol)
+    start_compact = _lookback_start(start_date)
+    end_compact = _date_compact(end_date)
+    range_start = int(start_compact[:4])
+    range_end = int(end_compact[:4]) + 1
+    raw_rows = []
+    url = "https://proxy.finance.qq.com/ifzqgtimg/appstock/app/newfqkline/get"
+
+    for year in range(range_start, range_end):
+        params = {
+            "_var": f"kline_dayqfq{year}",
+            "param": f"{tx_symbol},day,{year}-01-01,{year + 1}-12-31,640,qfq",
+            "r": "0.8205512681390605",
+        }
+        resp = requests.get(url, params=params, timeout=15)
+        resp.raise_for_status()
+        text = resp.text
+        start_idx = text.find("={")
+        if start_idx < 0:
+            continue
+        payload = json.loads(text[start_idx + 1:])
+        data = payload.get("data", {}).get(tx_symbol, {})
+        raw_rows.extend(data.get("qfqday") or data.get("day") or [])
+
+    if not raw_rows:
         return []
 
     rows = []
-    for _, row in df.sort_values("date").iterrows():
-        close = safe_float(row["close"])
-        volume = safe_float(row.get("amount"))
+    seen_dates = set()
+    for row in sorted(raw_rows, key=lambda item: str(item[0]) if item else ""):
+        if not row or len(row) < 6:
+            continue
+        date_str = _date_dash(row[0])
+        if date_str in seen_dates:
+            continue
+        seen_dates.add(date_str)
+        close = safe_float(row[2])
+        volume = safe_float(row[5])
+        turnover_rate = safe_float(row[7]) if len(row) > 7 else None
+        amount_wan = safe_float(row[8]) if len(row) > 8 else None
+        amount = round(amount_wan * 10000, 6) if amount_wan is not None else None
         record = {
-            "date": str(row["date"])[:10],
-            "open": safe_float(row.get("open")) if include_trading_value else None,
-            "high": safe_float(row.get("high")) if include_trading_value else None,
-            "low": safe_float(row.get("low")) if include_trading_value else None,
+            "date": date_str,
+            "open": safe_float(row[1]) if include_trading_value else None,
+            "high": safe_float(row[3]) if include_trading_value else None,
+            "low": safe_float(row[4]) if include_trading_value else None,
             "close": close,
-            "turnover_rate": None,
+            "turnover_rate": turnover_rate,
         }
         if include_trading_value:
-            record["volume"] = volume
+            record["volume"] = _normalize_volume_to_hands(volume, amount, close)
             record["amount"] = (
-                round(volume * 100 * close, 6)
+                amount
+                if amount is not None
+                else round(record["volume"] * 100 * close, 6)
                 if volume is not None and close is not None
                 else None
             )
@@ -500,7 +608,9 @@ def _fetch_daily_sina_qfq(symbol, start_date, end_date, include_trading_value=Fa
             "turnover_rate": round(turnover * 100, 6) if turnover is not None else None,
         }
         if include_trading_value:
-            record["volume"] = safe_float(row.get("volume"))
+            # 新浪 stock_zh_a_daily 的 volume 单位是「股」——统一归一到手(÷100)。
+            sina_vol = safe_float(row.get("volume"))
+            record["volume"] = round(sina_vol / 100.0, 2) if sina_vol is not None else None
             record["amount"] = safe_float(row.get("amount"))
         rows.append(record)
     return _records_with_computed_change(rows, start_date, end_date)
@@ -754,5 +864,3 @@ def merge_records_by_date(existing, new_records, date_key="date", overwrite_none
             if overwrite_none or value is not None or key not in merged:
                 merged[key] = value
     return sorted(by_date.values(), key=lambda item: str(item.get(date_key, "")))
-
-

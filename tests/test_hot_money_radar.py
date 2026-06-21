@@ -29,6 +29,12 @@ class HotMoneyRadarTest(unittest.TestCase):
     def test_default_mode_is_ambush(self):
         self.assertEqual(radar.build_parser().parse_args([]).mode, "ambush")
 
+    def test_empty_pattern_phase_uses_watch_label(self):
+        self.assertEqual(radar._pattern_phase([], score=12.3), "观望⚪")
+        self.assertIn("观望⚪", radar.PHASE_ORDER)
+        self.assertNotIn("空仓观望⚪", radar.PHASE_ORDER)
+        self.assertEqual(radar._phase_confidence("观望⚪", [], 12.3, 0), 12.3)
+
     def _run_with_db(self, seed):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_file = Path(tmpdir) / "t.sqlite3"

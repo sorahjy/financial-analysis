@@ -3,6 +3,7 @@
 .idea
 .scrapy
 data/*
+data_back
 .claude
 
 # Generated reports (HTML is built from data/, never edited by hand)

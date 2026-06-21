@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+
+{% block title %}游资雷达 - financial-analysis{% endblock %}
+
+{% block content %}
+<section id="radar-dashboard" class="radar">
+  <div class="radar-topbar">
+    <div class="radar-head">
+      <h1>游资雷达</h1>
+      <span id="radar-status" class="status">读取中…</span>
+    </div>
+    <div class="radar-actions">
+      <label class="toggle"><input id="radar-include-large" type="checkbox" checked>含大盘</label>
+      <button id="radar-run" class="btn primary" type="button">运行 · 刷新结果</button>
+      <button id="radar-refresh-data" class="btn" type="button">刷新数据</button>
+    </div>
+  </div>
+
+  <div id="radar-meta" class="radar-meta">—</div>
+  <div id="radar-phases" class="radar-phases"></div>
+
+  <div id="radar-joblog" class="refresh-log-panel" hidden>
+    <div class="refresh-log-head">
+      <strong id="radar-joblog-title">任务日志</strong>
+      <span id="radar-joblog-count">0 行</span>
+    </div>
+    <pre id="radar-joblog-body">等待任务输出…</pre>
+  </div>
+
+  <div class="radar-filters">
+    <input id="radar-search" type="search" placeholder="搜索 代码 / 名称 / 题材">
+    <select id="radar-phase-filter" aria-label="按阶段筛选">
+      <option value="">全部阶段</option>
+    </select>
+    <label class="filter-num">吸筹分 ≥
+      <input id="radar-min-score" type="number" min="0" max="100" step="1" value="0">
+    </label>
+    <label class="toggle"><input id="radar-hide-dist" type="checkbox">隐藏出货预警</label>
+    <span id="radar-count" class="filter-count"></span>
+    <label class="filter-num radar-export-limit">Top
+      <input id="radar-export-limit" type="number" min="1" max="999" step="1" value="10">
+    </label>
+    <button id="radar-export" class="btn" type="button">导出</button>
+  </div>
+
+  <div class="radar-split">
+    <div id="radar-table" class="table-wrap radar-table">读取中…</div>
+    <aside class="radar-kline">
+      <div class="radar-kline-head">
+        <strong id="radar-kline-title">点击左侧个股查看 K 线</strong>
+        <span id="radar-kline-sub" class="status"></span>
+      </div>
+      <div id="radar-kline-periods" class="radar-kline-periods" role="tablist" aria-label="K线周期">
+        <button class="is-active" type="button" data-period="day">日K</button>
+        <button type="button" data-period="week">周K</button>
+        <button type="button" data-period="month">月K</button>
+      </div>
+      <canvas id="radar-kline-canvas"></canvas>
+      <div id="radar-kline-detail" class="radar-kline-detail"></div>
+      <div class="radar-pattern-head">命中形态解释</div>
+      <div id="radar-pattern-info" class="radar-pattern-info">点击左侧个股查看其命中形态的含义。</div>
+    </aside>
+  </div>
+</section>
+{% endblock %}

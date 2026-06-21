@@ -18,7 +18,11 @@ from fund_storage import (
     save_profile_snapshots,
     save_realtime_estimates,
 )
-from stock_crawl_common import history_payload_from_records, merge_records_by_date
+from stock_crawl_common import (
+    _normalize_volume_to_hands,
+    history_payload_from_records,
+    merge_records_by_date,
+)
 import stock_crawl_price_valuation as stock_price_valuation
 from stock_crawl_price_valuation import (
     _decide_valuation_period,
@@ -72,16 +76,16 @@ class StockBenchmarkEtfTest(unittest.TestCase):
     def test_fetch_benchmark_etfs_includes_optimizer_components(self):
         calls = []
 
-        def fake_fetch(code, output_file, *, label, years):
-            calls.append((code, Path(output_file).name, label, years))
+        def fake_fetch(code, output_file, *, label, start_date, years=None):
+            calls.append((code, Path(output_file).name, label, start_date, years))
             return [{"date": "2026-01-02", "nav_acc": "1.0"}]
 
         with patch.object(stock_price_valuation, "fetch_index_etf_nav", side_effect=fake_fetch):
             result = stock_price_valuation.fetch_benchmark_etfs()
 
         self.assertEqual(set(result.keys()), {"510310", "510580"})
-        self.assertIn(("510310", "csi300_etf_nav.json", "沪深300", 12), calls)
-        self.assertIn(("510580", "csi500_etf_nav.json", "中证500", 12), calls)
+        self.assertIn(("510310", "csi300_etf_nav.json", "沪深300", "2012-01-01", None), calls)
+        self.assertIn(("510580", "csi500_etf_nav.json", "中证500", "2012-01-01", None), calls)
 
 
 class DataRefreshMirrorTest(unittest.TestCase):
@@ -263,35 +267,6 @@ class PlateStorageTest(unittest.TestCase):
             conn.close()
 
 
-class HotMoneyPatternsPrintTest(unittest.TestCase):
-    def test_table_uses_chinese_headers_and_renders_cjk(self):
-        import stock_hot_money_patterns as patterns
-
-        rows = [{
-            "code": "600826",
-            "name": "兰生股份",
-            "pattern_stage": "ambush",
-            "opportunity_score": 65.6,
-            "ambush_score": 79,
-            "ignite_score": 49,
-            "relay_score": 35,
-            "distribution_score": 0,
-            "market_cap_yi": 75,
-            "trading_theme": "工程咨询服务Ⅱ",
-            "evidence": ["价格处于中低位", "低位筹码集中"],
-        }]
-        buffer = io.StringIO()
-        patterns._console(file=buffer, width=220).print(patterns.build_pattern_table(rows, 1))
-        text = buffer.getvalue()
-
-        self.assertIn("排名", text)
-        self.assertIn("机会", text)
-        self.assertIn("依据", text)
-        self.assertIn("工程咨询服务Ⅱ", text)
-        self.assertIn("潜伏", text)
-        self.assertNotIn("rank", text)
-
-
 class ThemeCandidatesPrintTest(unittest.TestCase):
     def test_stock_table_uses_chinese_headers_and_renders_cjk(self):
         import stock_theme_candidates as theme
@@ -305,24 +280,20 @@ class ThemeCandidatesPrintTest(unittest.TestCase):
             "trading_theme": "光学光电子",
             "static_sw2": "照明设备Ⅱ",
             "market_cap_yi": 147.7,
-            "ret_corr": 0.48,
+            "tracking_corr": 0.51,
+            "return_corr": 0.48,
             "turnover_corr": 0.60,
-            "relative_20d": 29.0,
-            "relative_60d": 91.9,
-            "stock_ret_20d": 41.8,
-            "stock_ret_60d": 123.5,
-            "latest_turnover": 1.76,
-            "turn_percentile": 97,
-            "activation_score": 98.5,
+            "trend_corr_60d": 0.42,
+            "matched_days": 168,
             "latest_date": "2026-06-18",
         }]
         buffer = io.StringIO()
         theme._console(file=buffer, width=240).print(theme.build_stock_table(rows))
         text = buffer.getvalue()
 
-        self.assertIn("排名", text)
-        self.assertIn("交易题材", text)
-        self.assertIn("静态二级", text)
+        self.assertIn("#", text)
+        self.assertIn("跟踪题材", text)
+        self.assertIn("静态SW2", text)
         self.assertIn("照明设备Ⅱ", text)
         self.assertNotIn("rank", text)
 
@@ -718,6 +689,18 @@ class StockHistorySchemaTest(unittest.TestCase):
 
         self.assertTrue(records_need_ohlcv_backfill(records))
 
+    def test_normalize_volume_to_hands_converts_share_units(self):
+        self.assertEqual(
+            _normalize_volume_to_hands(12501455, 1528515000, 124.42),
+            125014.55,
+        )
+
+    def test_normalize_volume_to_hands_preserves_hand_units(self):
+        self.assertEqual(
+            _normalize_volume_to_hands(125014.55, 1528515000, 124.42),
+            125014.55,
+        )
+
     def test_sw3_member_schema_adds_official_market_cap_ratio_to_old_db(self):
         import stock_storage as ss
 
@@ -947,12 +930,12 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             },
         ])
 
-        self.assertEqual([row["fold_weight"] for row in pairs], [0.5, 1.25, 2.0])
+        self.assertEqual([row["fold_weight"] for row in pairs], [0.5, 1.0, 1.5])
         summary = long_fold_summary(pairs, 125)
         self.assertEqual(summary["min_fold_weight"], 0.5)
-        self.assertEqual(summary["max_fold_weight"], 2.0)
-        self.assertEqual(summary["avg_excess_pct"], 8.0)
-        self.assertEqual(summary["hit_rate"], 53.33)
+        self.assertEqual(summary["max_fold_weight"], 1.5)
+        self.assertEqual(summary["avg_excess_pct"], 6.667)
+        self.assertEqual(summary["hit_rate"], 50.0)
 
     def test_partial_fold_path_is_chart_only(self):
         from stock_strategy_optimizer import (

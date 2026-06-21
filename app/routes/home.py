@@ -3,6 +3,7 @@ from __future__ import annotations
 from flask import Blueprint, current_app, render_template
 
 from app.utils import file_status
+from stock_hot_money_radar import AMBUSH_RESULT_FILE
 
 
 bp = Blueprint("home", __name__)
@@ -15,4 +16,5 @@ def index():
         fund_report=file_status(current_app.config["FUND_REPORT_DATA_FILE"]),
         stock_result=file_status(current_app.config["STOCK_RESULT_FILE"]),
         optimized_config=file_status(current_app.config["STOCK_OPTIMIZED_CONFIG_FILE"]),
+        radar_result=file_status(AMBUSH_RESULT_FILE),
     )

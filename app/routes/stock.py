@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict
 
-from flask import Blueprint, jsonify, render_template, request
+from flask import Blueprint, abort, jsonify, render_template, request, send_file
 
 from stock_advanced_strategies import (
     get_default_config,
@@ -12,12 +12,15 @@ from stock_crawl_common import load_json_file
 from stock_data_refresh import REFRESH_REPORT_FILE
 
 from app.services.stock_strategy_service import (
+    build_long_backtest_chart,
     optimizer_state_snapshot,
+    resolve_long_backtest_chart_file,
     run_stock_strategies,
     start_stock_data_refresh,
     start_optimizer_job,
     stock_data_refresh_state,
 )
+from app.services.radar_service import kline_bars
 
 
 bp = Blueprint("stock", __name__)
@@ -76,7 +79,38 @@ def stock_optimize():
 def stock_run():
     try:
         payload = request.get_json(silent=True) or {}
-        result = run_stock_strategies(payload.get("config", {}), persist=False, invalidate=False)
+        result = run_stock_strategies(
+            payload.get("config", {}),
+            persist=False,
+            invalidate=False,
+            include_search_pool=True,
+        )
         return jsonify(result)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
+
+
+@bp.get("/api/stock/kline")
+def stock_kline():
+    code = request.args.get("code", "")
+    limit = request.args.get("limit", 640, type=int)
+    period = request.args.get("period", "week")
+    return jsonify(kline_bars(code, limit, period))
+
+
+@bp.post("/api/stock/long-backtest-chart")
+def stock_long_backtest_chart():
+    try:
+        payload = request.get_json(silent=True) or {}
+        return jsonify(build_long_backtest_chart(payload.get("config", {})))
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+
+@bp.get("/api/stock/long-backtest-chart/file/<path:filename>")
+def stock_long_backtest_chart_file(filename: str):
+    try:
+        path = resolve_long_backtest_chart_file(filename)
+    except FileNotFoundError:
+        abort(404)
+    return send_file(path, mimetype="image/svg+xml", max_age=0)

@@ -3,7 +3,7 @@
   window.FinancialAnalysisPages.bootId = window.FinancialAnalysisPages.bootId
     || `${Date.now()}-${Math.random().toString(36).slice(2)}`;
 
-  const navigablePaths = new Set(["/", "/fund", "/fund/report", "/stock"]);
+  const navigablePaths = new Set(["/", "/fund", "/fund/report", "/stock", "/radar"]);
   let navigating = false;
 
   function normalizePath(url) {
@@ -20,6 +20,8 @@
     const pages = window.FinancialAnalysisPages || {};
     if (document.querySelector("#stock-native-dashboard")) {
       pages.stock && pages.stock();
+    } else if (document.querySelector("#radar-dashboard")) {
+      pages.radar && pages.radar();
     } else if (document.querySelector("[data-fund-status]") || document.querySelector("#fund-native-report")) {
       pages.fund && pages.fund();
     } else {

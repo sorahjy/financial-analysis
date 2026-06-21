@@ -52,6 +52,13 @@ DEFAULT_THREAD_COUNT = 32
 VALUATION_FRESH_DAYS = 7   # 最近一条估值在该天数内则跳过重抓（百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略）
 
 
+def _date_dash(value):
+    text = str(value)
+    if len(text) == 8 and text.isdigit():
+        return f"{text[:4]}-{text[4:6]}-{text[6:8]}"
+    return text[:10]
+
+
 def _env_int(name, default, minimum=1, maximum=None):
     raw = os.getenv(name)
     if raw is None:
@@ -462,32 +469,31 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
 # ─── ETF 基准 ─────────────────────────────────────────────────
 #
 # 用 510310（华泰柏瑞沪深300ETF）和 510580（易方达中证500ETF）作为
-# 长线优化器的 50/50 等权基准成分，爬近12年日频累计净值并落库 index_nav。
+# 长线优化器的 50/50 等权基准成分，从 2012-01-01 起爬日频累计净值并落库 index_nav。
 
 CSI300_ETF_CODE = "510310"
-CSI300_ETF_YEARS = 12
+BENCHMARK_ETF_START_DATE = "2012-01-01"
 CSI300_FILE = Path(__file__).resolve().parent / "data" / "csi300_etf_nav.json"
 CSI500_ETF_CODE = "510580"
-CSI500_ETF_YEARS = 12
 CSI500_FILE = Path(__file__).resolve().parent / "data" / "csi500_etf_nav.json"
 BENCHMARK_ETFS = (
     {
         "code": CSI300_ETF_CODE,
         "label": "沪深300",
         "file": CSI300_FILE,
-        "years": CSI300_ETF_YEARS,
+        "start_date": BENCHMARK_ETF_START_DATE,
     },
     {
         "code": CSI500_ETF_CODE,
         "label": "中证500",
         "file": CSI500_FILE,
-        "years": CSI500_ETF_YEARS,
+        "start_date": BENCHMARK_ETF_START_DATE,
     },
 )
 
 
-def fetch_index_etf_nav(code, output_file, *, label, years=CSI300_ETF_YEARS):
-    """爬取单只指数 ETF 近 N 年累计净值并持久化，返回 records 列表。"""
+def fetch_index_etf_nav(code, output_file, *, label, start_date=BENCHMARK_ETF_START_DATE, years=None):
+    """爬取单只指数 ETF 累计净值并持久化，返回 records 列表。"""
     # 基金净值爬取/合并工具在 fund 侧，延迟导入避免常规爬取路径背上依赖
     from fund_fetch_data import fetch_range, merge_records as merge_nav_records
 
@@ -504,9 +510,14 @@ def fetch_index_etf_nav(code, output_file, *, label, years=CSI300_ETF_YEARS):
             existing.sort(key=lambda r: r["date"])
 
     today = latest_weekday_date()
-    start = (
-        datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * years + 10)
-    ).strftime("%Y-%m-%d")
+    if start_date:
+        start = _date_dash(start_date)
+    elif years:
+        start = (
+            datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * years + 10)
+        ).strftime("%Y-%m-%d")
+    else:
+        start = BENCHMARK_ETF_START_DATE
 
     rows = []
     if not existing:
@@ -540,6 +551,7 @@ def fetch_index_etf_nav(code, output_file, *, label, years=CSI300_ETF_YEARS):
     payload = {
         "code": code,
         "target_years": years,
+        "target_start_date": start,
         "start_date": merged[0]["date"],
         "end_date": merged[-1]["date"],
         "records": merged,
@@ -557,14 +569,14 @@ def fetch_index_etf_nav(code, output_file, *, label, years=CSI300_ETF_YEARS):
     return merged
 
 
-def fetch_csi300_etf(years=CSI300_ETF_YEARS):
-    """爬取 510310 近 N 年累计净值并持久化，返回 records 列表。"""
-    return fetch_index_etf_nav(CSI300_ETF_CODE, CSI300_FILE, label="沪深300", years=years)
+def fetch_csi300_etf(start_date=BENCHMARK_ETF_START_DATE, years=None):
+    """爬取 510310 累计净值并持久化，返回 records 列表。"""
+    return fetch_index_etf_nav(CSI300_ETF_CODE, CSI300_FILE, label="沪深300", start_date=start_date, years=years)
 
 
-def fetch_csi500_etf(years=CSI500_ETF_YEARS):
-    """爬取 510580 近 N 年累计净值并持久化，返回 records 列表。"""
-    return fetch_index_etf_nav(CSI500_ETF_CODE, CSI500_FILE, label="中证500", years=years)
+def fetch_csi500_etf(start_date=BENCHMARK_ETF_START_DATE, years=None):
+    """爬取 510580 累计净值并持久化，返回 records 列表。"""
+    return fetch_index_etf_nav(CSI500_ETF_CODE, CSI500_FILE, label="中证500", start_date=start_date, years=years)
 
 
 def fetch_benchmark_etfs():
@@ -575,7 +587,7 @@ def fetch_benchmark_etfs():
             item["code"],
             item["file"],
             label=item["label"],
-            years=item["years"],
+            start_date=item["start_date"],
         )
     return results
 

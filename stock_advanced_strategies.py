@@ -6,7 +6,7 @@ This module is intentionally self-contained and read-only against existing
 project files. It loads the JSON data already produced by the stock_* scripts,
 scores two strategy families, and can be used by both CLI and the dashboard:
 
-1. Long horizon: large-cap CSI300 quality compounders, intended for 2-5 years.
+1. Long horizon: quality compounders, intended for 2-5 years.
 2. Short horizon: non-ST Dragon Tiger List / hot-money tracking, intended for
    1-5 trading days.
 """
@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import threading
@@ -77,10 +78,10 @@ class FactorSpec:
 
 
 LONG_FACTORS: List[FactorSpec] = [
-    FactorSpec("csi300_current", "当前沪深300", "long", "指数约束", "现仍在沪深300成分池。", 2.0, "boolean"),
-    FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、中证大盘池近似长期稳定成分。", 1.6, "direct"),
-    FactorSpec("market_cap", "总市值", "long", "规模流动性", "偏好大盘股。", 1.2, "percentile"),
-    FactorSpec("size_reversal", "小市值因子", "long", "规模流动性", "SMB代理：总市值越小得分越高，给中小盘优质股入场机会，与总市值因子由权重搜索博弈。", 0.5, "percentile", "low", missing_score=40),
+    FactorSpec("csi300_current", "当前沪深300", "long", "指数约束", "现仍在沪深300成分池。", 0.0, "boolean"),
+    FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、中证大盘池近似长期稳定成分。", 0.0, "direct"),
+    FactorSpec("market_cap", "总市值", "long", "规模流动性", "偏好大盘股。", 0.0, "percentile"),
+    FactorSpec("size_reversal", "小市值因子", "long", "规模流动性", "SMB代理：总市值越小得分越高，给中小盘优质股入场机会。", 0.0, "percentile", "low", missing_score=40),
     FactorSpec("liquidity", "日均成交额", "long", "规模流动性", "偏好交易容量更高的股票。", 0.6, "percentile"),
     FactorSpec("low_volatility", "低波动", "long", "风险", "年化波动率越低越好。", 0.8, "percentile", "low", missing_score=40),
     FactorSpec("roe_mean", "ROE均值", "long", "质量", "近年ROE均值。", 1.2, "percentile", missing_score=20),
@@ -94,7 +95,7 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("dividend_consistency", "连续分红", "long", "股东回报", "近三年连续现金分红。", 0.5, "boolean"),
     FactorSpec("debt_safety", "低负债率", "long", "风险", "资产负债率越低越好，银行等行业会由其他质量因子平衡。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("pledge_safety", "低质押", "long", "风险", "股权质押比例越低越好。", 0.4, "percentile", "low", missing_score=60),
-    FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.5, "direct", missing_score=40),
+    FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.0, "direct", missing_score=40),
     FactorSpec("book_to_market", "账面市值比", "long", "估值", "Fama-French HML 代理，净资产 / 市值。", 0.6, "percentile", missing_score=35),
     FactorSpec("earnings_yield", "盈利收益率", "long", "估值", "E/P，净利润TTM / 市值。", 0.7, "percentile", missing_score=35),
     FactorSpec("cashflow_yield", "现金流收益率", "long", "估值", "CF/P，经营现金流TTM / 市值。", 0.7, "percentile", missing_score=35),
@@ -170,9 +171,10 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
+        "use_segment_leaders": True,
         "top_n": 10,
         "min_score": 60,
-        "min_market_cap_yi": 100,
+        "min_market_cap_yi": 0,
         "require_csi300": False,
         "require_high_drawdown": False,
         "min_high_drawdown_pct": 40,
@@ -827,6 +829,27 @@ def _load_sw3_segment_map_cached(
         conn.close()
 
 
+def load_segment_leader_codes() -> set:
+    """当前 `stock_crawl_segment_leaders.py` 选出的 SW3 细分龙头 code 集。"""
+    conn = stock_storage.connect()
+    try:
+        codes = set()
+        for item in stock_storage.leader_members(conn):
+            code = str(item.get("code") or "").strip()
+            if code:
+                codes.add(code.zfill(6))
+        return codes
+    finally:
+        conn.close()
+
+
+def segment_leader_code_signature() -> Dict[str, Any]:
+    """细分龙头集合签名，供候选池磁盘缓存感知 is_leader 变化。"""
+    codes = sorted(load_segment_leader_codes())
+    digest = hashlib.sha256(",".join(codes).encode("utf-8")).hexdigest()[:16]
+    return {"count": len(codes), "digest": digest}
+
+
 _UNKNOWN_INDUSTRY_NAMES = {"", "UNKNOWN", "unknown", "None", "none", "NULL", "null", "nan", "NaN"}
 
 
@@ -1170,15 +1193,32 @@ def build_long_candidates(
         universe: Optional[set] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     stocks = load_fundamental_stocks()
-    if universe is not None:
-        stocks = {c: s for c, s in stocks.items() if c in universe}
-    universe = load_stock_universe()
+    notes = []
+    target_universe = {str(code).zfill(6) for code in universe} if universe is not None else None
+    if bool(config.get("use_segment_leaders", True)):
+        leader_codes = load_segment_leader_codes()
+        if leader_codes:
+            target_universe = (
+                leader_codes if target_universe is None else target_universe & leader_codes
+            )
+            notes.append(
+                "长线候选池限定为 stock_crawl_segment_leaders.py 生成的 "
+                f"SW3 细分龙头池（is_leader=1，{len(leader_codes)} 只）。"
+            )
+        else:
+            notes.append(
+                "sw3_member.is_leader 为空；长线候选暂回退到全量基本面股票池。"
+                "请先运行 python stock_crawl_segment_leaders.py crawl 生成 SW3 细分龙头池。"
+            )
+    if target_universe is not None:
+        stocks = {c: s for c, s in stocks.items() if c in target_universe}
+
+    stock_universe = load_stock_universe()
     snapshot = load_market_snapshot()
     cn_index = load_cn_stock_index()
     sw3_segments = load_sw3_segment_map()
-    csi300 = set(str(code).zfill(6) for code in universe.get("csi300", []))
-    csi_all = set(str(code).zfill(6) for code in universe.get("all", []))
-    notes = []
+    csi300 = set(str(code).zfill(6) for code in stock_universe.get("csi300", []))
+    csi_all = set(str(code).zfill(6) for code in stock_universe.get("all", []))
     if not csi300:
         notes.append("data/stock_universe.json lacks csi300; CSI300 filters are inactive.")
     if as_of is not None:
@@ -1949,11 +1989,13 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     universe_signature = _file_signature(DATA_DIR / "stock_universe.json")
     snapshot_signature = _file_signature(DATA_DIR / "market_snapshot.json")
     stock_data_signature = stock_storage.db_signature()
+    leader_signature = segment_leader_code_signature()
     meta = {
         "config_key": key,
         "stock_data": stock_data_signature,
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
+        "segment_leaders": leader_signature,
     }
     cached = read_live_candidate_cache("long", meta)
     if cached is not None:
@@ -1963,6 +2005,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         universe_signature,
         snapshot_signature,
         _signature_key(stock_data_signature),
+        _signature_key(leader_signature),
         key,
     )
     write_live_candidate_cache("long", meta, candidates, notes)
@@ -1974,11 +2017,12 @@ def _build_live_long_candidates_cached(
         universe_signature: Tuple[int, int],
         snapshot_signature: Tuple[int, int],
         stock_data_signature: Tuple[Tuple[str, Any], ...],
+        leader_signature: Tuple[Tuple[str, Any], ...],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
     # 磁盘候选缓存另用 db_signature()(内容指纹) 校验，无需易变的文件指纹做 key。
-    _ = (universe_signature, snapshot_signature, stock_data_signature)
+    _ = (universe_signature, snapshot_signature, stock_data_signature, leader_signature)
     return build_long_candidates(config_from_key(config_key))
 
 
@@ -2048,7 +2092,11 @@ def passes_short_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> b
 # ---------------------------------------------------------------------------
 
 
-def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def run_long_strategy(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    include_search_pool: bool = False,
+) -> Dict[str, Any]:
     merged = deep_merge(get_default_config()["long"], config or {})
     scoring_config = copy.deepcopy(merged)
     # Keep percentile factor scores comparable when UI controls are used as
@@ -2066,7 +2114,7 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
     min_score = safe_float(merged.get("min_score")) or 0.0
     selected = [item for item in scored if item["score"] >= min_score]
     selected = selected[: max(0, int(first_not_none(merged.get("top_n"), 30)))]
-    return {
+    payload = {
         "strategy": "long",
         "title": "Long horizon CSI300 compounder strategy",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2078,9 +2126,16 @@ def run_long_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]
         "picks": strip_internal(selected),
         "diagnostics": diagnostics(scored, LONG_FACTORS),
     }
+    if include_search_pool:
+        payload["search_pool"] = strip_internal(scored)
+    return payload
 
 
-def run_short_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+def run_short_strategy(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    include_search_pool: bool = False,
+) -> Dict[str, Any]:
     merged = deep_merge(get_default_config()["short"], config or {})
     scoring_config = copy.deepcopy(merged)
     scoring_config["exclude_st"] = False
@@ -2095,7 +2150,7 @@ def run_short_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any
     min_score = safe_float(merged.get("min_score")) or 0.0
     selected = [item for item in scored if item["score"] >= min_score]
     selected = selected[: max(0, int(first_not_none(merged.get("top_n"), 30)))]
-    return {
+    payload = {
         "strategy": "short",
         "title": "Short horizon Dragon Tiger List hot-money strategy",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2107,9 +2162,17 @@ def run_short_strategy(config: Optional[Dict[str, Any]] = None) -> Dict[str, Any
         "picks": strip_internal(selected),
         "diagnostics": diagnostics(scored, SHORT_FACTORS),
     }
+    if include_search_pool:
+        payload["search_pool"] = strip_internal(scored)
+    return payload
 
 
-def run_strategies(config: Optional[Dict[str, Any]] = None, persist: bool = False) -> Dict[str, Any]:
+def run_strategies(
+    config: Optional[Dict[str, Any]] = None,
+    persist: bool = False,
+    *,
+    include_search_pool: bool = False,
+) -> Dict[str, Any]:
     merged = deep_merge(get_default_config(), config or {})
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -2120,8 +2183,16 @@ def run_strategies(config: Optional[Dict[str, Any]] = None, persist: bool = Fals
             "total": len(LONG_FACTORS) + len(SHORT_FACTORS),
         },
         "factor_registry": [spec.to_dict() for spec in LONG_FACTORS + SHORT_FACTORS],
-        "long": run_long_strategy(merged.get("long", {})) if merged.get("long", {}).get("enabled", True) else None,
-        "short": run_short_strategy(merged.get("short", {})) if merged.get("short", {}).get("enabled", True) else None,
+        "long": (
+            run_long_strategy(merged.get("long", {}), include_search_pool=include_search_pool)
+            if merged.get("long", {}).get("enabled", True)
+            else None
+        ),
+        "short": (
+            run_short_strategy(merged.get("short", {}), include_search_pool=include_search_pool)
+            if merged.get("short", {}).get("enabled", True)
+            else None
+        ),
         "self_review": self_review_summary(),
     }
     optimized_meta = merged.get("_optimized_defaults")

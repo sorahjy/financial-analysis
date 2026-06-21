@@ -267,13 +267,13 @@ def fetch_dividend_history(symbol):
 
 
 
-def save_stock_universe(csi300_map, csi_all_map):
+def save_stock_universe(csi300_map, csi_all_map, source="akshare index_stock_cons_csindex"):
     """写 data/stock_universe.json, 供 stock_advanced_strategies.py 的
     沪深300硬过滤(require_csi300)与 csi300_current/csi300_persistence 因子使用。"""
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "akshare index_stock_cons_csindex",
+        "source": source,
         "csi300": sorted(csi300_map),
         "all": sorted(csi_all_map),
     }

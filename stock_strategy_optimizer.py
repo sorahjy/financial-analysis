@@ -57,6 +57,7 @@ from stock_advanced_strategies import (
     deep_merge,
     direct_factor_score,
     first_not_none,
+    load_segment_leader_codes,
     load_cn_stock_index,
     load_fundamental_stocks,
     passes_long_hard_filters,
@@ -71,9 +72,9 @@ OUTPUT_FILE = DATA_DIR / "stock_strategy_optimization.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
 # 长线超额基准：沪深300 与 中证500 按日等权再平衡的混合指数（各占50%）。
 # 不直接用中证800：中证800按市值加权、前300只占权重大头，走势≈沪深300，体现不出中盘；
-# 50/50 等权混合让大盘与中盘平权，更贴合本策略 large-mid 选股域。
+# 50/50 等权混合让大盘与中盘平权，更贴合本策略选股域。
 # 换基准只改 BENCHMARK_COMPONENTS（增删成分即可，单成分时退化为该指数本身）；
-# csi300_current 等仍是"指数成分"选股因子，与收益基准无关、不受影响。
+# csi300_current 等仍是"指数成分"选股因子；当前优化器将其权重固定为0。
 BENCHMARK_NAME = "沪深300+中证500等权"
 BENCHMARK_COMPONENTS = [
     ("510310", DATA_DIR / "csi300_etf_nav.json"),  # 沪深300 ETF
@@ -93,13 +94,17 @@ LONG_MIN_FOLDS = 16        # 有效折数下限，低于此的配置不参与选
 LONG_SOFT_TARGET_FOLDS = 40
 LONG_FOLD_COUNT_PENALTY = 1.25
 LONG_RECENCY_WEIGHT_MIN = 0.5
-LONG_RECENCY_WEIGHT_MAX = 2.0
-LONG_UNTRUSTED_WEIGHT_CAPS = {
-    # 指数约束两因子权重上限（按用户要求压低，避免它们主导选参）；
-    # csi300_current 另因无历史成分快照(前视)只保留极轻偏好。
-    "csi300_current": 0.15,
-    "csi300_persistence": 0.8,
+LONG_RECENCY_WEIGHT_MAX = 1.5
+LONG_FIXED_ZERO_WEIGHTS = {
+    # 市值/指数成分相关信号按当前要求默认关闭，并从搜索空间中移除。
+    "csi300_current",
+    "csi300_persistence",
+    "market_cap",
+    "size_reversal",
+    "industry_leadership",
 }
+LONG_SEARCHABLE_FACTORS = [f for f in LONG_FACTORS if f.key not in LONG_FIXED_ZERO_WEIGHTS]
+LONG_FIXED_MIN_MARKET_CAP_YI = 0
 # 去重叠/尾部稳健参数（针对"最差折超额差"专门加的口径）：
 LONG_MIN_INDEP_FOLDS = 4        # 去相关后折数下限，不足则尾部统计回退到稠密折
 LONG_TAIL_FLOOR = 0.15          # 独立折最差超额跌破 -15% 的部分按硬惩罚计，直击最差折
@@ -192,6 +197,30 @@ def ensure_long_price_history(series: Dict[str, List[Dict[str, Any]]]) -> Dict[s
             "请先刷新 stock_history 的 daily_close/OHLCV，再运行 stock_strategy_optimizer.py。"
         )
     return health
+
+
+def long_optimizer_universe_codes(
+    series: Dict[str, List[Dict[str, Any]]],
+    config: Dict[str, Any],
+) -> Tuple[set, List[str]]:
+    """长线优化股票池：足够长日线 ∩ SW3 细分龙头池。"""
+    min_hist = max(LONG_HOLD_CHOICES) + 260
+    codes = {code for code, rows in series.items() if len(rows) >= min_hist}
+    notes: List[str] = []
+    if bool(config.get("use_segment_leaders", True)):
+        leader_codes = load_segment_leader_codes()
+        if leader_codes:
+            codes &= leader_codes
+            notes.append(
+                "长线优化候选池显式限制为 stock_crawl_segment_leaders.py 生成的 "
+                f"SW3 细分龙头池：{len(leader_codes)} 只龙头，其中 {len(codes)} 只具备至少 {min_hist} 行历史。"
+            )
+        else:
+            notes.append(
+                "sw3_member.is_leader 为空；长线优化暂回退到具备多年日线的全量股票池。"
+                "请先运行 python stock_crawl_segment_leaders.py crawl。"
+            )
+    return codes, notes
 
 
 def long_anchor_offsets(hold_td: int) -> List[int]:
@@ -307,7 +336,7 @@ def random_fold_split(
 
 
 def apply_recency_weights(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按时间远近给折加权：最旧 0.5x，最新 2.0x，只影响优化统计。"""
+    """按时间远近给折加权：最旧 0.5x，最新 1.5x，只影响优化统计。"""
     if not pairs:
         return []
     idxs = [safe_float(pair.get("cal_idx")) for pair in pairs]
@@ -999,10 +1028,9 @@ def mutate_weights(
 
 def constrain_long_search_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     weights = cfg.setdefault("weights", {})
-    for key, cap in LONG_UNTRUSTED_WEIGHT_CAPS.items():
-        current = safe_float(weights.get(key))
-        if current is not None:
-            weights[key] = round(min(current, cap), 3)
+    for key in LONG_FIXED_ZERO_WEIGHTS:
+        weights[key] = 0.0
+    cfg["min_market_cap_yi"] = LONG_FIXED_MIN_MARKET_CAP_YI
     # 当前沪深300成分没有历史快照，优化器不把它作为硬过滤；实盘页面仍可手动开启。
     cfg["require_csi300"] = False
     return cfg
@@ -1020,15 +1048,13 @@ def set_long_high_drawdown_filter(cfg: Dict[str, Any], threshold_pct: Any) -> No
 def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["long"])
     cfg["weights"] = mutate_weights(
-        rng, cfg["weights"], [f.key for f in LONG_FACTORS], iteration, floors=LONG_WEIGHT_FLOORS
+        rng, cfg["weights"], [f.key for f in LONG_SEARCHABLE_FACTORS], iteration, floors=LONG_WEIGHT_FLOORS
     )
     # 高点回撤过滤开关参与搜索；阈值仅在开启时作为历史高点至今跌幅下限。
     set_long_high_drawdown_filter(cfg, cfg.get("min_high_drawdown_pct"))
     if iteration > 0:
         # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
         cfg["min_score"] = rng.choice([45, 50, 55, 58, 60, 63, 66, 70])
-        # 市值下限放开到100亿，让中盘股（中证500档）有入池机会
-        cfg["min_market_cap_yi"] = rng.choice([100, 200, 300, 500, 800])
         cfg["require_high_drawdown"] = rng.choice([False, True])
         set_long_high_drawdown_filter(cfg, rng.choice(LONG_HIGH_DD_PCT_CHOICES))
     return constrain_long_search_config(cfg)
@@ -1069,7 +1095,6 @@ def broad_long_candidate_config() -> Dict[str, Any]:
 # 未安装 optuna 时自动回退到原随机搜索（random_long_config / random_short_config）。
 
 LONG_MIN_SCORE_CHOICES = [45, 50, 55, 58, 60, 63, 66, 70]
-LONG_MARKET_CAP_CHOICES = [100, 200, 300, 500, 800]
 SHORT_MIN_SCORE_CHOICES = [35, 40, 45, 50, 55, 60, 65, 70]
 SHORT_HOLD_DAYS_CHOICES = [1, 2, 3, 4, 5]
 
@@ -1084,7 +1109,7 @@ def _nearest_choice(value: Any, choices: List[Any]) -> Any:
 
 def _long_weight_bounds(key: str) -> Tuple[float, float]:
     low = LONG_WEIGHT_FLOORS.get(key, 0.0)
-    high = LONG_UNTRUSTED_WEIGHT_CAPS.get(key, 3.0)
+    high = 3.0
     return low, max(high, low)
 
 
@@ -1092,10 +1117,9 @@ def _suggest_long_config(trial) -> Tuple[Dict[str, Any], int]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["long"])
     cfg["weights"] = {
         f.key: round(trial.suggest_float(f"w_{f.key}", *_long_weight_bounds(f.key)), 3)
-        for f in LONG_FACTORS
+        for f in LONG_SEARCHABLE_FACTORS
     }
     cfg["min_score"] = trial.suggest_categorical("min_score", LONG_MIN_SCORE_CHOICES)
-    cfg["min_market_cap_yi"] = trial.suggest_categorical("min_market_cap_yi", LONG_MARKET_CAP_CHOICES)
     cfg["require_high_drawdown"] = trial.suggest_categorical("require_high_drawdown", [False, True])
     set_long_high_drawdown_filter(
         cfg,
@@ -1109,11 +1133,10 @@ def _default_long_params() -> Dict[str, Any]:
     base = DEFAULT_CONFIG["long"]
     base_weights = base.get("weights") or {}
     params: Dict[str, Any] = {}
-    for f in LONG_FACTORS:
+    for f in LONG_SEARCHABLE_FACTORS:
         low, high = _long_weight_bounds(f.key)
         params[f"w_{f.key}"] = round(min(max(safe_float(base_weights.get(f.key)) or 0.0, low), high), 3)
     params["min_score"] = _nearest_choice(base.get("min_score"), LONG_MIN_SCORE_CHOICES)
-    params["min_market_cap_yi"] = _nearest_choice(base.get("min_market_cap_yi"), LONG_MARKET_CAP_CHOICES)
     params["require_high_drawdown"] = bool(base.get("require_high_drawdown", False))
     params["min_high_drawdown_pct"] = _nearest_choice(base.get("min_high_drawdown_pct"), LONG_HIGH_DD_PCT_CHOICES)
     params["hold_td"] = LONG_HOLD_CHOICES[0]
@@ -1225,8 +1248,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
     cal_pos = {date: idx for idx, date in enumerate(cal)}  # as_of -> 交易日序号，供去相关/隔离带用
     benchmark_series, benchmark_notes = load_benchmark_series()
     # PIT 候选只在有足够多年日线的票上建（快且干净）；最长持有 + 1年回看
-    min_hist = max(LONG_HOLD_CHOICES) + 260
-    deep_codes = {code for code, rows in series.items() if len(rows) >= min_hist}
+    deep_codes, universe_notes = long_optimizer_universe_codes(series, broad_cfg)
 
     # 折偏移 → PIT 时点日期（全市场日历倒数第 offset 个交易日）。[0] 最近、[-1] 最旧。
     fold_dates_by_hold = {
@@ -1236,7 +1258,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
 
     pit_cache: Dict[str, List[Dict[str, Any]]] = {}       # as_of -> PIT broad 候选预评分
     fold_stats_cache: Dict[Tuple[str, int, Tuple[str, ...]], Optional[Dict[str, float]]] = {}
-    notes: List[str] = []
+    notes: List[str] = list(universe_notes)
 
     def get_pit(as_of: str) -> List[Dict[str, Any]]:
         if as_of not in pit_cache:
@@ -1322,12 +1344,12 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "notes": [search_note] + benchmark_notes + notes + [
             "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有60交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
             "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=60个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
-            "折样本采用时间衰减权重：最旧折 0.5x，最新折 2.0x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
+            "折样本采用时间衰减权重：最旧折 0.5x，最新折 1.5x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
             "完整折每60交易日取一个起点、持有60交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
             "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
-            "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。高点回撤(抄底)过滤开关参与搜索；开启时 min_high_drawdown_pct 在40~70%搜优。",
+            "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。市值/指数成分相关权重与市值下限固定为0，不参与搜索；高点回撤(抄底)过滤开关参与搜索，开启时 min_high_drawdown_pct 在40~70%搜优。",
             "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为全部折最差单折超额，tail_cvar_excess_pct 为尾部最差20%折的平均超额。",
-            "残留前视：沪深300成分与质押用当前快照(无历史数据)；优化器已将 csi300_current/csi300_persistence 权重分别限制到 0.15/0.8，且不再搜索 require_csi300 或成分稳定硬过滤，候选仍限于本地有多年日线的票(约中证800)。",
+            "残留前视：沪深300成分与质押用当前快照(无历史数据)；优化器已将 min_market_cap_yi 以及 csi300_current/csi300_persistence/market_cap/size_reversal/industry_leadership 权重固定为0且不参与搜索，并且不再搜索 require_csi300 或成分稳定硬过滤；候选池显式限制为 stock_crawl_segment_leaders.py 生成的 SW3 细分龙头池，再取其中有多年日线的票。",
         ],
         "best": best,
         "top_iterations": sorted(trace, key=lambda x: x["objective"], reverse=True)[:10],
@@ -1485,6 +1507,7 @@ def write_long_fold_paths_svg(
     paths: List[Dict[str, Any]],
     output_file: Path,
     hold_td: int,
+    title: str = "长线最优参数各折走势小图矩阵",
 ) -> Dict[str, Any]:
     if not paths:
         raise ValueError("没有可用于画图的有效长线回测折。")
@@ -1601,7 +1624,7 @@ def write_long_fold_paths_svg(
 
     elements: List[str] = []
     elements.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#f8fafc"/>')
-    elements.append(text(36, 42, "长线最优参数各折走势小图矩阵", 25, "700"))
+    elements.append(text(36, 42, title, 25, "700"))
     fold_count_text = f"{len(complete_paths)} 个完整回测窗口"
     if partial_paths:
         fold_count_text += f" + {len(partial_paths)} 个未满持有期展示窗口"
@@ -1861,19 +1884,22 @@ def write_long_fold_paths_svg(
     }
 
 
-def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, Any]:
-    best = long_result["best"]
-    cfg = best["config"]
-    hold_td = int(best["hold_td"])
+def create_long_fold_path_chart(
+    cfg: Dict[str, Any],
+    output_file: Path,
+    hold_td: Optional[int] = None,
+    *,
+    title: str = "长线当前参数各折走势小图矩阵",
+) -> Dict[str, Any]:
+    hold_td = int(hold_td or LONG_HOLD_CHOICES[0])
     series = full_series_map()
     cal = fold_calendar(series)
     benchmark_series, _ = load_benchmark_series()
     if not benchmark_series:
         raise RuntimeError(f"缺少{BENCHMARK_NAME}ETF基准序列，无法生成走势图。")
 
-    min_hist = max(LONG_HOLD_CHOICES) + 260
-    deep_codes = {code for code, rows in series.items() if len(rows) >= min_hist}
     broad_cfg = broad_long_candidate_config()
+    deep_codes, _ = long_optimizer_universe_codes(series, broad_cfg)
     fold_dates = [cal[-off] for off in long_anchor_offsets(hold_td) if off <= len(cal)]
     partial_fold_dates = [cal[-off] for off in long_partial_anchor_offsets(hold_td) if off <= len(cal)]
     paths: List[Dict[str, Any]] = []
@@ -1910,7 +1936,17 @@ def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, A
         path["partial"] = True
         paths.append(attach_holdings(path, picks))
 
-    return write_long_fold_paths_svg(paths, LONG_FOLD_PATH_CHART_FILE, hold_td)
+    return write_long_fold_paths_svg(paths, output_file, hold_td, title=title)
+
+
+def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, Any]:
+    best = long_result["best"]
+    return create_long_fold_path_chart(
+        best["config"],
+        LONG_FOLD_PATH_CHART_FILE,
+        int(best["hold_td"]),
+        title="长线最优参数各折走势小图矩阵",
+    )
 
 
 def run_optimization(

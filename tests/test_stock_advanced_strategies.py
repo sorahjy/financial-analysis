@@ -1,8 +1,10 @@
 import unittest
+from unittest.mock import patch
 
 from stock_advanced_strategies import (
     FactorSpec,
     apply_scores,
+    build_long_candidates,
     compute_long_raw_factors,
     csi300_persistence_proxy,
     first_not_none,
@@ -130,6 +132,29 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(sw3, "通信网络设备及器件")
         self.assertEqual(segment_code, "851024")
         self.assertEqual(industry_label_from_sw3(None, fallback="UNKNOWN")[0], "")
+
+    def test_build_long_candidates_defaults_to_sw3_segment_leaders(self):
+        cfg = get_default_config()["long"]
+        cfg.update({"require_csi300": False, "min_market_cap_yi": 0})
+        stocks = {
+            "600000": {"name": "龙头股份", "financials": {}, "indicators": {}, "dividends": {}, "daily": {}},
+            "600001": {"name": "普通股份", "financials": {}, "indicators": {}, "dividends": {}, "daily": {}},
+        }
+        cn_index = {
+            code: {"records": [{"date": "2026-01-02", "close": 10.0, "market_cap": 100.0}]}
+            for code in stocks
+        }
+
+        with patch("stock_advanced_strategies.load_segment_leader_codes", return_value={"600000"}), \
+             patch("stock_advanced_strategies.load_fundamental_stocks", return_value=stocks), \
+             patch("stock_advanced_strategies.load_cn_stock_index", return_value=cn_index), \
+             patch("stock_advanced_strategies.load_stock_universe", return_value={}), \
+             patch("stock_advanced_strategies.load_market_snapshot", return_value={}), \
+             patch("stock_advanced_strategies.load_sw3_segment_map", return_value={}):
+            candidates, notes = build_long_candidates(cfg)
+
+        self.assertEqual([item["code"] for item in candidates], ["600000"])
+        self.assertTrue(any("SW3 细分龙头池" in note for note in notes))
 
     def test_strip_internal_keeps_sw3_industry_fields_for_frontend(self):
         row = strip_internal([{

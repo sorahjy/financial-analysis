@@ -35,6 +35,7 @@ DATA_DIR = ROOT / "data"
 CAPITAL_DIR = DATA_DIR / "capital"
 HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
 REFRESH_REPORT_FILE = DATA_DIR / "stock_data_refresh_report.json"
+UNIVERSE_CACHE_MIN_RATIO = 0.98
 
 
 @dataclass
@@ -269,7 +270,7 @@ def refresh_benchmark_etfs() -> Dict[str, Any]:
         benchmarks.append({
             "code": item["code"],
             "label": item["label"],
-            "target_years": item["years"],
+            "target_start_date": item.get("start_date"),
             "records": len(records),
             "start_date": records[0]["date"] if records else None,
             "end_date": records[-1]["date"] if records else None,
@@ -279,6 +280,29 @@ def refresh_benchmark_etfs() -> Dict[str, Any]:
         "codes": [item["code"] for item in BENCHMARK_ETFS],
         "benchmarks": benchmarks,
     }
+
+
+def _protect_index_universe(
+    label: str,
+    fetched_map: Dict[str, str],
+    cached_codes: Any,
+) -> tuple[Dict[str, str], bool]:
+    if not isinstance(cached_codes, list) or not cached_codes:
+        return fetched_map, False
+
+    cached = [str(code).zfill(6) for code in cached_codes if str(code).strip()]
+    if not cached:
+        return fetched_map, False
+
+    if len(fetched_map) >= len(cached) * UNIVERSE_CACHE_MIN_RATIO:
+        return fetched_map, False
+
+    print(
+        f"  [WARN] {label} 成分本次仅 {len(fetched_map)} 个，旧缓存 {len(cached)} 个；"
+        "保留旧缓存避免部分数据覆盖全量股票池",
+        flush=True,
+    )
+    return {code: fetched_map.get(code, "") for code in cached}, True
 
 
 def refresh_stock_universe() -> Dict[str, Any]:
@@ -291,10 +315,24 @@ def refresh_stock_universe() -> Dict[str, Any]:
     from stock_crawl_common import fetch_index_constituents
     from stock_crawl_fundamentals import save_stock_universe
 
+    existing = load_json_file(DATA_DIR / "stock_universe.json", {})
     csi300 = fetch_index_constituents("000300")
     csi_all = fetch_index_constituents("000985")
-    save_stock_universe(csi300, csi_all)
-    return {"csi300": len(csi300), "all": len(csi_all)}
+
+    used_cache = []
+    if isinstance(existing, dict):
+        csi300, cached = _protect_index_universe("沪深300(000300)", csi300, existing.get("csi300"))
+        if cached:
+            used_cache.append("csi300")
+        csi_all, cached = _protect_index_universe("中证全指(000985)", csi_all, existing.get("all"))
+        if cached:
+            used_cache.append("all")
+
+    source = "akshare index_stock_cons_csindex/index_stock_cons"
+    if used_cache:
+        source += " + cached stock_universe guard"
+    save_stock_universe(csi300, csi_all, source=source)
+    return {"csi300": len(csi300), "all": len(csi_all), "used_cache": used_cache}
 
 
 def collect_data_health() -> Dict[str, Any]:
@@ -358,9 +396,10 @@ def refresh_before_server(
         for var in ("http_proxy", "https_proxy", "all_proxy",
                     "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
             env.pop(var, None)
-        env["NO_PROXY"] = "*"
-        env["no_proxy"] = "*"
-        env["STOCK_CRAWL_NO_PROXY"] = "1"
+            os.environ.pop(var, None)
+        for key, value in (("NO_PROXY", "*"), ("no_proxy", "*"), ("STOCK_CRAWL_NO_PROXY", "1")):
+            env[key] = value
+            os.environ[key] = value
 
     full = mode == "full"
     if mode not in {"full", "quick", "capital-only"}:
@@ -390,13 +429,13 @@ def refresh_before_server(
         steps.append(
             local_step_result(
                 "benchmark_etfs",
-                "fetch 510310 CSI300 and 510580 CSI500 ETF accumulated NAV for 12 years",
+                "fetch 510310 CSI300 and 510580 CSI500 ETF accumulated NAV since 2012-01",
                 refresh_benchmark_etfs,
             )
         )
         steps.append(
             local_step_result(
-                "stock_universe_csi300",
+                "stock_universe_indices",
                 "refresh 沪深300(000300) + 中证全指(000985) 成分 -> data/stock_universe.json",
                 refresh_stock_universe,
             )

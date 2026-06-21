@@ -31,5 +31,15 @@
       <dd>{{ optimized_config.updated_at or "未生成" }}</dd>
     </dl>
   </a>
+  <a class="module-card" href="{{ url_for('radar.radar_page') }}">
+    <span class="module-type">游资</span>
+    <strong>游资雷达</strong>
+    <dl>
+      <dt>吸筹分结果</dt>
+      <dd>{{ radar_result.updated_at or "未生成" }}</dd>
+      <dt>大小</dt>
+      <dd>{{ radar_result.size_kb or "-" }} KB</dd>
+    </dl>
+  </a>
 </section>
 {% endblock %}
