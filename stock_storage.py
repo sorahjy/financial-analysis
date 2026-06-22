@@ -694,12 +694,26 @@ def _sync_sw3_member_market_cap_from_history(conn: sqlite3.Connection, code: str
     return cur.rowcount
 
 
-def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
-    """当前细分龙头，市值优先取 sw3_member，缺失时用 stock_history 最新非空 market_cap 回补。"""
+_POOL_FLAG_COL = {"leader": "is_leader", "hotmoney": "is_hot_money"}
+
+
+def _sw3_has_column(conn: sqlite3.Connection, col: str) -> bool:
+    return any(r[1] == col for r in conn.execute("PRAGMA table_info(sw3_member)").fetchall())
+
+
+def pool_members(conn: sqlite3.Connection, pool: str = "leader") -> List[Dict[str, Any]]:
+    """指定池成分：pool='leader' 细分龙头(is_leader) / 'hotmoney' 游资小盘universe(is_hot_money)。
+
+    市值优先取 sw3_member，缺失时用 stock_history 最新非空 market_cap 回补。
+    若池标记列尚未建(如 is_hot_money 未跑建池脚本)→ 返回空池。
+    """
+    flag = _POOL_FLAG_COL.get(pool, "is_leader")
+    if not _sw3_has_column(conn, flag):
+        return []
     rows = conn.execute(
-        "SELECT m.code, m.name, m.market_cap_yi, m.segment_code, s.segment_name, s.parent_segment "
-        "FROM sw3_member m LEFT JOIN sw3_segment s ON s.segment_code = m.segment_code "
-        "WHERE m.is_leader = 1 ORDER BY m.segment_code, m.code"
+        f"SELECT m.code, m.name, m.market_cap_yi, m.segment_code, s.segment_name, s.parent_segment "
+        f"FROM sw3_member m LEFT JOIN sw3_segment s ON s.segment_code = m.segment_code "
+        f"WHERE m.{flag} = 1 ORDER BY m.segment_code, m.code"
     ).fetchall()
     leaders = [
         {
@@ -719,6 +733,11 @@ def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
             if item["market_cap_yi"] is None:
                 item["market_cap_yi"] = history_caps.get(item["code"])
     return leaders
+
+
+def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
+    """细分龙头(is_leader=1)成分——pool_members(pool='leader') 的兼容别名。"""
+    return pool_members(conn, "leader")
 
 
 # ─── 读取 ──────────────────────────────────────────────────────

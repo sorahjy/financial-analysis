@@ -48,7 +48,8 @@ def radar_kline():
 @bp.post("/api/radar/run")
 def radar_run():
     body = request.get_json(silent=True) or {}
-    if start_radar_run(include_large_cap=bool(body.get("include_large_cap", True))):
+    if start_radar_run(include_large_cap=bool(body.get("include_large_cap", True)),
+                       pool=str(body.get("pool") or "leader")):
         return jsonify({"started": True}), 202
     return jsonify({"error": "雷达运行已在进行中"}), 409
 

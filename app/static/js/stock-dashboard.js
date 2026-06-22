@@ -228,9 +228,9 @@
     }
 
     async function startOptimize() {
-      const msg = "将对长线/短线各运行 300 次参数搜索回测"
-        + "（相当于 python stock_strategy_optimizer.py --iterations 300），"
-        + "约需 3 分钟左右，期间页面将锁定。确定开始吗？";
+      const msg = "将对长线/短线各运行 1000 次参数搜索回测"
+        + "（相当于 python stock_strategy_optimizer.py --iterations 1000），"
+        + "约需 10 分钟左右，期间页面将锁定。确定开始吗？";
       if (!window.confirm(msg)) return;
       try {
         const resp = await fetch("/api/optimize", {method: "POST"});
@@ -667,6 +667,7 @@
       chartInFlight = true;
       updateLongChartButton();
       status("生成策略走势");
+      showLongChartStatus("正在回测策略走势，请稍后...");
       try {
         const resp = await fetch("/api/stock/long-backtest-chart", {
           method: "POST",
@@ -680,10 +681,24 @@
         status(payload.is_default ? "默认参数走势" : "当前参数走势");
       } catch (err) {
         status(`走势失败: ${err.message}`);
+        showLongChartStatus(`走势失败: ${err.message}`, true);
       } finally {
         chartInFlight = false;
         updateLongChartButton();
       }
+    }
+
+    function showLongChartStatus(message, isError = false) {
+      $("long-chart-title").textContent = "长线历史回测走势";
+      $("long-chart-meta").textContent = "";
+      $("long-chart-status").textContent = message;
+      $("long-chart-status").hidden = false;
+      $("long-chart-status").classList.toggle("warn", Boolean(isError));
+      $("long-chart-image").hidden = true;
+      $("long-chart-image").removeAttribute("src");
+      $("long-chart-open").removeAttribute("href");
+      $("long-chart-open").hidden = true;
+      $("long-chart-modal").hidden = false;
     }
 
     function renderLongBacktestChart(payload) {
@@ -695,14 +710,22 @@
         chart.partial_folds ? `${chart.partial_folds} 个未满折` : "",
         chart.full_path_start_date && chart.full_path_end_date ? `${chart.full_path_start_date} ~ ${chart.full_path_end_date}` : "",
       ].filter(Boolean).join(" · ");
+      $("long-chart-status").hidden = true;
+      $("long-chart-status").classList.remove("warn");
       $("long-chart-image").src = url;
+      $("long-chart-image").hidden = false;
       $("long-chart-open").href = url;
+      $("long-chart-open").hidden = false;
       $("long-chart-modal").hidden = false;
     }
 
     function hideLongBacktestChart() {
       $("long-chart-modal").hidden = true;
       $("long-chart-image").removeAttribute("src");
+      $("long-chart-image").hidden = false;
+      $("long-chart-status").hidden = true;
+      $("long-chart-status").classList.remove("warn");
+      $("long-chart-open").hidden = false;
     }
 
     function exportCurrentPicks() {

@@ -17,6 +17,11 @@
     return "w";
   }
   const fmt = (v, d = 2) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? "-" : Number(v).toFixed(d));
+  const scoreValue = (s, key, fallbackKey) => {
+    const v = s && s[key];
+    if (v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(v))) return Number(v);
+    return s ? s[fallbackKey] : null;
+  };
   const fmtMarketCap = (v) => {
     if (v === null || v === undefined || v === "" || Number.isNaN(Number(v))) return "-";
     const n = Number(v);
@@ -64,16 +69,22 @@
     let klineFetchSeq = 0;
     let pollTimer = null;
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
-    let sortState = { key: "ambush_score", dir: "desc" };   // 默认按吸筹分从高到低
+    let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
     const $ = (id) => document.getElementById(id);
 
     function normalizePayload(raw) {
       const out = raw || {};
-      out.stocks = Array.isArray(out.stocks) ? out.stocks.map((s) => ({
-        ...s,
-        pattern_phase: normalizePhase(s && s.pattern_phase),
-      })) : [];
+      out.stocks = Array.isArray(out.stocks) ? out.stocks.map((s) => {
+        const accPct = scoreValue(s, "accumulation_percentile", "ambush_score");
+        const distPct = scoreValue(s, "distribution_percentile", "distribution_score");
+        return {
+          ...s,
+          accumulation_percentile: accPct,
+          distribution_percentile: distPct,
+          pattern_phase: normalizePhase(s && s.pattern_phase),
+        };
+      }) : [];
       const nextCounts = {};
       Object.entries(out.phase_counts || {}).forEach(([phase, count]) => {
         const key = normalizePhase(phase);
@@ -122,16 +133,27 @@
       const cap = p.max_market_cap_yi;
       // 「含大盘」勾选框同步到当前结果口径（null=全市值=勾上）；程序化赋值不触发 change，不会误触重跑
       $("radar-include-large").checked = (cap === null || cap === undefined);
-      const pool = cap ? `≤${cap}亿小中盘龙头` : "全市值龙头(含大盘)";
+      if (p.pool) $("radar-pool").value = p.pool;
+      const pool = p.pool === "hotmoney"
+        ? "游资小盘池(龙虎榜活跃·流通≤100亿·反转分排序)"
+        : (cap ? `≤${cap}亿小中盘龙头` : "全市值龙头(含大盘)");
       const asOf = p.as_of ? ` · 数据截至 ${p.as_of}(历史复盘)` : "";
       const theme = (p.theme_source && p.theme_source.available)
         ? `题材热度 ${p.theme_source.generated_at || ""}${p.theme_source.stale ? " ⚠️偏旧" : ""}`
         : "题材热度: 缺/未挂载";
+      const cc = p.capital_counts || {};
+      const capLine = p.capital_available
+        ? `<span>资金面: 户数降<strong>${cc.holder_down ?? 0}</strong> · 回购<strong>${cc.repurchase ?? 0}</strong> · 上榜避雷<strong>${cc.lhb_avoid ?? 0}</strong> · 户数/回购已并入吸筹总分</span>`
+        : `<span>资金面: 未挂载（跑 stock_crawl_holders / stock_crawl_capital 后生效）</span>`;
+      const mr = p.market_regime;
+      const regimeLine = (mr && mr.available)
+        ? `<span>大盘 <strong>${mr.above_ma20 ? "强势(>MA20)·反转分可做多" : "弱势(<MA20)·做多易接刀"}</strong></span>`
+        : "";
       $("radar-meta").innerHTML =
         `<span>生成 <strong>${esc(p.generated_at)}</strong>${asOf}</span>` +
         `<span>候选 <strong>${p.candidate_count ?? "-"}</strong>（${esc(pool)}）</span>` +
         `<span>已打分 <strong>${p.scored_count ?? "-"}</strong></span>` +
-        `<span>${esc(theme)}</span>`;
+        `<span>${esc(theme)}</span>` + capLine + regimeLine;
     }
 
     function orderedPhases() {
@@ -180,9 +202,9 @@
       const list = stocks.filter((s) => {
         if (f.phase && s.pattern_phase !== f.phase) return false;
         if (f.hideDist && String(s.pattern_phase || "").includes("出货")) return false;
-        if ((Number(s.ambush_score) || 0) < f.minScore) return false;
+      if ((Number(s.ambush_score) || 0) < f.minScore) return false;
         if (f.q) {
-          const hay = `${s.code} ${s.name || ""} ${s.tracking_theme || ""} ${s.segment_name || ""}`.toLowerCase();
+          const hay = `${s.code} ${s.name || ""} ${s.tracking_theme || ""} ${s.parent_segment || ""} ${s.segment_name || ""}`.toLowerCase();
           if (!hay.includes(f.q)) return false;
         }
         return true;
@@ -196,14 +218,15 @@
       renderTable(list);
     }
 
-    function exportTopAmbushStocks() {
+    function exportTopOpportunityStocks() {
       const limitInput = $("radar-export-limit");
       const limit = Math.max(1, Math.floor(Number(limitInput.value) || 10));
       limitInput.value = String(limit);
       const rows = stocks
-        .filter((s) => s.ambush_score !== null && s.ambush_score !== undefined && !Number.isNaN(Number(s.ambush_score)))
+        .filter((s) => !Number.isNaN(Number(s.opportunity_score)))
         .slice()
         .sort((a, b) =>
+          (Number(b.opportunity_score) - Number(a.opportunity_score)) ||
           (Number(b.ambush_score) - Number(a.ambush_score)) ||
           String(a.code || "").localeCompare(String(b.code || ""))
         )
@@ -219,19 +242,28 @@
       const anchor = document.createElement("a");
       const today = new Date().toISOString().slice(0, 10).replace(/-/g, "");
       anchor.href = url;
-      anchor.download = `hot_money_radar_top${limit}_${today}.txt`;
+      anchor.download = `hot_money_radar_opportunity_top${limit}_${today}.txt`;
       document.body.appendChild(anchor);
       anchor.click();
       anchor.remove();
       URL.revokeObjectURL(url);
-      $("radar-status").textContent = `已导出吸筹分Top${rows.length}`;
+      $("radar-status").textContent = `已导出机会分Top${rows.length}`;
     }
 
     function themeCell(s) {
-      const t = s.tracking_theme || s.segment_name || "";
+      const t = s.tracking_theme || "";
+      if (!t) return "<span class='dim'>-</span>";
       const heat = (s.theme_heat_pctile === null || s.theme_heat_pctile === undefined)
         ? "" : ` <small>热${Math.round(s.theme_heat_pctile)}</small>`;
       return esc(t) + heat;
+    }
+
+    function sw2Cell(s) {
+      const industry = s.parent_segment || "";
+      if (!industry) return "<span class='dim'>-</span>";
+      const heat = (s.sw2_heat_pctile === null || s.sw2_heat_pctile === undefined)
+        ? "" : ` <small>热${Math.round(s.sw2_heat_pctile)}</small>`;
+      return esc(industry) + heat;
     }
 
     function renderTable(list) {
@@ -245,9 +277,9 @@
         return `<th class="num sortable${active ? " active" : ""}" data-key="${key}">${label} <span class="sort-arrow">${arrow}</span></th>`;
       };
       const head = `<tr>
-        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${sortTh("ambush_score", "吸筹分")}${sortTh("distribution_score", "出货分")}
+        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${sortTh("opportunity_score", "机会分")}${sortTh("ambush_score", "吸筹分")}${sortTh("distribution_score", "出货分")}
         <th class="num">量比</th><th class="num">价分位</th><th class="num">换手分位</th><th class="num">CMF</th><th class="num">筹码</th>
-        <th class="num">连板</th><th>命中形态</th><th>阶段·把握</th><th>跟踪二级行业</th><th>依据</th>
+        <th class="num">连板</th><th>命中形态</th><th>阶段·把握</th><th>走势相似行业</th><th>二级行业</th><th>依据</th>
       </tr>`;
       const rows = list.map((s, i) => {
         const sig = s.signals || {};
@@ -270,8 +302,9 @@
           <td class="mono">${esc(s.code)}</td>
           <td>${esc(s.name || "")}</td>
           <td class="num">${fmtMarketCap(s.market_cap_yi)}</td>
-          <td class="num strong">${fmt(s.ambush_score, 1)}</td>
-          <td class="num">${fmt(s.distribution_score, 0)}</td>
+          <td class="num strong">${fmt(s.opportunity_score, 1)}</td>
+          <td class="num" title="机会分计算用吸筹分位 ${fmt(s.accumulation_percentile, 1)}">${fmt(s.ambush_score, 1)}</td>
+          <td class="num" title="机会分计算用出货分位 ${fmt(s.distribution_percentile, 1)}">${fmt(s.distribution_score, 1)}</td>
           <td class="num">${fmt(sig.vol_ratio, 2)}</td>
           <td class="num">${fmt(sig.close_pctile, 2)}</td>
           <td class="num${(sig.turnover_pctile != null && sig.turnover_pctile > 0.84) ? " hot-turnover" : ""}">${fmt(sig.turnover_pctile, 2)}</td>
@@ -281,6 +314,7 @@
           <td class="pats mono">${patCell}</td>
           <td><span class="phase phase-${cls}">${esc(s.pattern_phase || "")}</span>${conf}${isBreakdownConflict(s) ? ` <span class="pi-warn" title="${esc(CONFLICT_TIP)}">⚠破位</span>` : ""}</td>
           <td>${themeCell(s)}</td>
+          <td>${sw2Cell(s)}</td>
           <td class="ev-cell">${evCell}</td>
         </tr>`;
       }).join("");
@@ -681,6 +715,7 @@
       $("radar-run").disabled = busy;
       $("radar-refresh-data").disabled = busy;
       $("radar-include-large").disabled = busy;
+      $("radar-pool").disabled = busy;
     }
 
     function showJobLog(job, label) {
@@ -727,12 +762,17 @@
 
     // ---------- 绑定 ----------
     function boot() {
-      $("radar-run").onclick = () =>
-        startJob("/api/radar/run", "运行", { include_large_cap: $("radar-include-large").checked });
+      const runBody = () => ({ include_large_cap: $("radar-include-large").checked, pool: $("radar-pool").value });
+      $("radar-run").onclick = () => startJob("/api/radar/run", "运行", runBody());
       // 勾选/取消「含大盘」即自动重跑（市值口径变了，需要重新生成候选池）
       $("radar-include-large").addEventListener("change", () => {
         const scope = $("radar-include-large").checked ? "含大盘全市值" : "仅小中盘(剔除大盘)";
-        startJob("/api/radar/run", `运行 · ${scope}`, { include_large_cap: $("radar-include-large").checked });
+        startJob("/api/radar/run", `运行 · ${scope}`, runBody());
+      });
+      // 切换候选池(龙头/游资小盘)即自动重跑
+      $("radar-pool").addEventListener("change", () => {
+        const label = $("radar-pool").value === "hotmoney" ? "游资小盘池(反转分)" : "细分龙头池";
+        startJob("/api/radar/run", `运行 · ${label}`, runBody());
       });
       $("radar-refresh-data").onclick = () => {
         if (!window.confirm("刷新数据将重爬全市场行情 + 板块 + 题材，大约需要 10–30 分钟，期间请勿关闭页面。\n\n确认现在开始吗？")) return;
@@ -742,7 +782,7 @@
         const el = $(id);
         el.addEventListener(el.tagName === "SELECT" || el.type === "checkbox" ? "change" : "input", applyFilters);
       });
-      $("radar-export").onclick = exportTopAmbushStocks;
+      $("radar-export").onclick = exportTopOpportunityStocks;
       const canvas = $("radar-kline-canvas");
       $("radar-kline-periods").querySelectorAll("button").forEach((btn) => {
         btn.addEventListener("click", () => setKlinePeriod(btn.dataset.period));

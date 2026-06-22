@@ -11,8 +11,8 @@ The optimizer deliberately separates two layers:
    excess return on the available recent window with risk, hit rate, and for
    short-term Dragon Tiger List picks, event-quality statistics.
 
-Run 300 iterations per strategy:
-    python3 -B stock_strategy_optimizer.py --iterations 300
+Run 1000 iterations per strategy:
+    python3 -B stock_strategy_optimizer.py --iterations 1000
 """
 
 from __future__ import annotations
@@ -81,7 +81,7 @@ BENCHMARK_COMPONENTS = [
     ("510580", DATA_DIR / "csi500_etf_nav.json"),  # 中证500 ETF
 ]
 LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
-DEFAULT_OPTIMIZATION_ITERATIONS = 300
+DEFAULT_OPTIMIZATION_ITERATIONS = 1000
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
 # 每 60 个交易日取一折，固定持有 60 个交易日；相邻完整折首尾衔接。
@@ -93,8 +93,8 @@ LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
 LONG_MIN_FOLDS = 16        # 有效折数下限，低于此的配置不参与选优(防少数折彩票配置)
 LONG_SOFT_TARGET_FOLDS = 40
 LONG_FOLD_COUNT_PENALTY = 1.25
-LONG_RECENCY_WEIGHT_MIN = 0.5
-LONG_RECENCY_WEIGHT_MAX = 1.5
+LONG_RECENCY_WEIGHT_MIN = 1.0
+LONG_RECENCY_WEIGHT_MAX = 1.0
 LONG_FIXED_ZERO_WEIGHTS = {
     # 市值/指数成分相关信号按当前要求默认关闭，并从搜索空间中移除。
     "csi300_current",
@@ -105,6 +105,7 @@ LONG_FIXED_ZERO_WEIGHTS = {
 }
 LONG_SEARCHABLE_FACTORS = [f for f in LONG_FACTORS if f.key not in LONG_FIXED_ZERO_WEIGHTS]
 LONG_FIXED_MIN_MARKET_CAP_YI = 0
+LONG_FIXED_MIN_SCORE = 50
 # 去重叠/尾部稳健参数（针对"最差折超额差"专门加的口径）：
 LONG_MIN_INDEP_FOLDS = 4        # 去相关后折数下限，不足则尾部统计回退到稠密折
 LONG_TAIL_FLOOR = 0.15          # 独立折最差超额跌破 -15% 的部分按硬惩罚计，直击最差折
@@ -118,14 +119,17 @@ LONG_WEIGHT_FLOORS = {
 }
 # 高点回撤(抄底)过滤开关参与搜索；开启时搜索"高点至今跌幅下限"40~70%。
 LONG_HIGH_DD_PCT_CHOICES = list(range(40, 71))
+LONG_MAX_ABS_DAILY_RETURN = 0.45
 OPTUNA_MIN_STARTUP_TRIALS = 40
 OPTUNA_STARTUP_TRIAL_FRACTION = 0.35
 OPTUNA_EI_CANDIDATES = 64
+_RETURN_PREFIX_CACHE: Dict[Tuple[int, int, str, str], Tuple[List[int], List[float]]] = {}
 RESEARCH_BASIS = [
     "Fama-French: size, value, profitability, investment; plus momentum/reversal sorts from the Kenneth French data library.",
     "Barra/MSCI-style families: size, value, momentum, volatility, liquidity, growth, leverage and quality.",
     "Conservative formula: low volatility + momentum + payout yield.",
     "WorldQuant-style short-horizon price-volume alphas.",
+    "Long-horizon capital signals: shareholder-count change, buyback announcements and recent Dragon Tiger List avoidance.",
     "A-share Dragon Tiger List event factors: net buy, reason strength, hot-money seat network, institution/hot-money resonance and tradability risk.",
 ]
 
@@ -336,7 +340,7 @@ def random_fold_split(
 
 
 def apply_recency_weights(pairs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """按时间远近给折加权：最旧 0.5x，最新 1.5x，只影响优化统计。"""
+    """给每个折设置优化统计权重；当前口径为所有折等权 1.0x。"""
     if not pairs:
         return []
     idxs = [safe_float(pair.get("cal_idx")) for pair in pairs]
@@ -472,6 +476,24 @@ def row_index_on_or_before(rows: List[Dict[str, Any]], target_date: str) -> Opti
     return lo - 1 if lo > 0 else None
 
 
+def row_index_on_date(rows: List[Dict[str, Any]], target_date: str) -> Optional[int]:
+    idx = row_index_on_or_before(rows, target_date)
+    if idx is None or str(rows[idx].get("date", "")) != target_date:
+        return None
+    return idx
+
+
+def has_trade_on_date(
+    series: Optional[Dict[str, List[Dict[str, Any]]]],
+    code: str,
+    trade_date: Optional[str],
+) -> bool:
+    """Whether code has an actual daily bar on trade_date."""
+    if not series or not trade_date:
+        return True
+    return row_index_on_date(series.get(code) or [], trade_date) is not None
+
+
 def price_path_on_dates(rows: List[Dict[str, Any]], dates: List[str]) -> List[Optional[float]]:
     start_idx = row_index_on_or_before(rows, dates[0]) if dates else None
     if start_idx is None:
@@ -482,6 +504,83 @@ def price_path_on_dates(rows: List[Dict[str, Any]], dates: List[str]) -> List[Op
         while idx + 1 < len(rows) and str(rows[idx + 1].get("date", "")) <= date:
             idx += 1
         values.append(safe_float(rows[idx].get("close")))
+    return values
+
+
+def _daily_return_from_row(rows: List[Dict[str, Any]], idx: int) -> Optional[float]:
+    if idx <= 0 or idx >= len(rows):
+        return None
+    change_pct = safe_float(rows[idx].get("change_pct"))
+    if change_pct is not None:
+        daily_return = change_pct / 100.0
+    else:
+        prev_close = safe_float(rows[idx - 1].get("close"))
+        close = safe_float(rows[idx].get("close"))
+        if prev_close is None or close is None or prev_close <= 0 or close <= 0:
+            return None
+        daily_return = close / prev_close - 1.0
+    if (
+        not math.isfinite(daily_return)
+        or daily_return <= -1.0
+        or abs(daily_return) > LONG_MAX_ABS_DAILY_RETURN
+    ):
+        return None
+    return daily_return
+
+
+def return_prefix_for_rows(rows: List[Dict[str, Any]]) -> Tuple[List[int], List[float]]:
+    if not rows:
+        return [], []
+    key = (
+        id(rows),
+        len(rows),
+        str(rows[0].get("date", "")),
+        str(rows[-1].get("date", "")),
+    )
+    cached = _RETURN_PREFIX_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    segment_ids = [0] * len(rows)
+    cum_logs = [0.0] * len(rows)
+    segment_id = 0
+    cum_log = 0.0
+    for idx in range(1, len(rows)):
+        daily_return = _daily_return_from_row(rows, idx)
+        if daily_return is None:
+            segment_id += 1
+            cum_log = 0.0
+        else:
+            cum_log += math.log1p(daily_return)
+        segment_ids[idx] = segment_id
+        cum_logs[idx] = cum_log
+
+    value = (segment_ids, cum_logs)
+    _RETURN_PREFIX_CACHE[key] = value
+    return value
+
+
+def return_path_on_dates(rows: List[Dict[str, Any]], dates: List[str]) -> Optional[List[float]]:
+    if not dates:
+        return None
+    start_idx = row_index_on_date(rows, dates[0])
+    if start_idx is None:
+        return None
+    if row_index_on_date(rows, dates[-1]) is None:
+        return None
+    segment_ids, cum_logs = return_prefix_for_rows(rows)
+    if not segment_ids:
+        return None
+    base_segment = segment_ids[start_idx]
+    base_log = cum_logs[start_idx]
+    idx = start_idx
+    values = []
+    for date in dates:
+        while idx + 1 < len(rows) and str(rows[idx + 1].get("date", "")) <= date:
+            idx += 1
+        if segment_ids[idx] != base_segment:
+            return None
+        values.append(math.exp(cum_logs[idx] - base_log))
     return values
 
 
@@ -532,14 +631,10 @@ def portfolio_fold_path(
 
     stock_paths = []
     for pick in picks:
-        prices = price_path_on_dates(series.get(pick["code"]) or [], dates)
-        entry = prices[0]
-        if entry is None or entry <= 0 or prices[-1] is None:
+        path = return_path_on_dates(series.get(pick["code"]) or [], dates)
+        if path is None:
             continue
-        stock_paths.append([
-            price / entry if price is not None and price > 0 else None
-            for price in prices
-        ])
+        stock_paths.append(path)
     if len(stock_paths) < LONG_MIN_VALID_PICKS:
         return None
 
@@ -804,6 +899,9 @@ def score_prepared_long_candidates(
     prepared: List[Dict[str, Any]],
     config: Dict[str, Any],
     include_details: bool = False,
+    *,
+    entry_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    as_of: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     weights = config.get("weights", {})
     min_score = safe_float(config.get("min_score")) or 0.0
@@ -813,6 +911,8 @@ def score_prepared_long_candidates(
     for row in prepared:
         item = row["item"]
         if not passes_long_hard_filters(item, config):
+            continue
+        if not has_trade_on_date(entry_series, item.get("code"), as_of):
             continue
         raw = item.get("raw_factors", {})
         prepared_scores = row["scores"]
@@ -1031,6 +1131,7 @@ def constrain_long_search_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     for key in LONG_FIXED_ZERO_WEIGHTS:
         weights[key] = 0.0
     cfg["min_market_cap_yi"] = LONG_FIXED_MIN_MARKET_CAP_YI
+    cfg["min_score"] = LONG_FIXED_MIN_SCORE
     # 当前沪深300成分没有历史快照，优化器不把它作为硬过滤；实盘页面仍可手动开启。
     cfg["require_csi300"] = False
     return cfg
@@ -1053,8 +1154,7 @@ def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     # 高点回撤过滤开关参与搜索；阈值仅在开启时作为历史高点至今跌幅下限。
     set_long_high_drawdown_filter(cfg, cfg.get("min_high_drawdown_pct"))
     if iteration > 0:
-        # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
-        cfg["min_score"] = rng.choice([45, 50, 55, 58, 60, 63, 66, 70])
+        # top_n 与 min_score 不参与搜索，分别固定为 DEFAULT_CONFIG 与 50。
         cfg["require_high_drawdown"] = rng.choice([False, True])
         set_long_high_drawdown_filter(cfg, rng.choice(LONG_HIGH_DD_PCT_CHOICES))
     return constrain_long_search_config(cfg)
@@ -1094,7 +1194,6 @@ def broad_long_candidate_config() -> Dict[str, Any]:
 # 比无记忆随机搜索样本效率高得多。目标函数/折回测/输出结构完全不变。
 # 未安装 optuna 时自动回退到原随机搜索（random_long_config / random_short_config）。
 
-LONG_MIN_SCORE_CHOICES = [45, 50, 55, 58, 60, 63, 66, 70]
 SHORT_MIN_SCORE_CHOICES = [35, 40, 45, 50, 55, 60, 65, 70]
 SHORT_HOLD_DAYS_CHOICES = [1, 2, 3, 4, 5]
 
@@ -1119,7 +1218,6 @@ def _suggest_long_config(trial) -> Tuple[Dict[str, Any], int]:
         f.key: round(trial.suggest_float(f"w_{f.key}", *_long_weight_bounds(f.key)), 3)
         for f in LONG_SEARCHABLE_FACTORS
     }
-    cfg["min_score"] = trial.suggest_categorical("min_score", LONG_MIN_SCORE_CHOICES)
     cfg["require_high_drawdown"] = trial.suggest_categorical("require_high_drawdown", [False, True])
     set_long_high_drawdown_filter(
         cfg,
@@ -1136,7 +1234,6 @@ def _default_long_params() -> Dict[str, Any]:
     for f in LONG_SEARCHABLE_FACTORS:
         low, high = _long_weight_bounds(f.key)
         params[f"w_{f.key}"] = round(min(max(safe_float(base_weights.get(f.key)) or 0.0, low), high), 3)
-    params["min_score"] = _nearest_choice(base.get("min_score"), LONG_MIN_SCORE_CHOICES)
     params["require_high_drawdown"] = bool(base.get("require_high_drawdown", False))
     params["min_high_drawdown_pct"] = _nearest_choice(base.get("min_high_drawdown_pct"), LONG_HIGH_DD_PCT_CHOICES)
     params["hold_td"] = LONG_HOLD_CHOICES[0]
@@ -1284,7 +1381,9 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         fold_dates = fold_dates_by_hold[hold_td]
         pairs: List[Dict[str, Any]] = []
         for as_of in fold_dates:
-            picks = score_prepared_long_candidates(get_pit(as_of), cfg)  # 该折用 PIT 因子重新选股
+            picks = score_prepared_long_candidates(
+                get_pit(as_of), cfg, entry_series=series, as_of=as_of
+            )  # 该折用 PIT 因子重新选股，并要求入场日真实可交易
             fold_stats = get_fold_stats(picks, as_of, hold_td)
             if fold_stats is None:
                 continue
@@ -1302,7 +1401,12 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         else:
             objective = adjusted_obj
         # 报告用最近一折的选股（最接近实盘当下）
-        repr_picks = score_prepared_long_candidates(get_pit(fold_dates[0]), cfg) if fold_dates else []
+        repr_picks = (
+            score_prepared_long_candidates(
+                get_pit(fold_dates[0]), cfg, entry_series=series, as_of=fold_dates[0]
+            )
+            if fold_dates else []
+        )
         row = {
             "objective": round(objective, 5),
             "hold_td": hold_td,
@@ -1342,12 +1446,12 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "candidate_count": len(deep_codes),
         "price_history_health": price_health,
         "notes": [search_note] + benchmark_notes + notes + [
-            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，消除前视偏差；固定持有60交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
+            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，且入选前要求 as_of 当天有真实交易行；固定持有60交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
             "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=60个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
-            "折样本采用时间衰减权重：最旧折 0.5x，最新折 1.5x，越接近现在的样本在均值、命中率、CVaR、Sortino 和回撤惩罚中权重越高。",
+            "折样本采用等权口径：最旧折到最新折均为 1.0x，所有历史折在均值、命中率、CVaR、Sortino 和回撤惩罚中权重一致。",
             "完整折每60交易日取一个起点、持有60交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
             "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
-            "③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。市值/指数成分相关权重与市值下限固定为0，不参与搜索；高点回撤(抄底)过滤开关参与搜索，开启时 min_high_drawdown_pct 在40~70%搜优。",
+            f"③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。市值/指数成分相关权重与市值下限固定为0，不参与搜索；长线 min_score 固定为 {LONG_FIXED_MIN_SCORE}，不参与搜索；高点回撤(抄底)过滤开关参与搜索，开启时 min_high_drawdown_pct 在40~70%搜优。",
             "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为全部折最差单折超额，tail_cvar_excess_pct 为尾部最差20%折的平均超额。",
             "残留前视：沪深300成分与质押用当前快照(无历史数据)；优化器已将 min_market_cap_yi 以及 csi300_current/csi300_persistence/market_cap/size_reversal/industry_leadership 权重固定为0且不参与搜索，并且不再搜索 require_csi300 或成分稳定硬过滤；候选池显式限制为 stock_crawl_segment_leaders.py 生成的 SW3 细分龙头池，再取其中有多年日线的票。",
         ],
@@ -1507,6 +1611,7 @@ def write_long_fold_paths_svg(
     paths: List[Dict[str, Any]],
     output_file: Path,
     hold_td: int,
+    holding_top_n: Optional[int] = None,
     title: str = "长线最优参数各折走势小图矩阵",
 ) -> Dict[str, Any]:
     if not paths:
@@ -1519,6 +1624,17 @@ def write_long_fold_paths_svg(
     avg_portfolio = average_paths(avg_source, "portfolio_path")
     avg_benchmark = average_paths(avg_source, "benchmark_path")
     full_path = stitched_fold_path(paths)
+    try:
+        replacement_top_n = int(holding_top_n if holding_top_n is not None else 10)
+    except (TypeError, ValueError):
+        replacement_top_n = 10
+    replacement_top_n = max(1, replacement_top_n)
+    replacement_prefix = f"Top{replacement_top_n}"
+    visible_holding_count = min(replacement_top_n, 20)
+    stock_names_per_line = 5
+    stock_line_gap = 15
+    stock_line_count = max(2, math.ceil(visible_holding_count / stock_names_per_line))
+    stock_extra_h = max(0, stock_line_count - 2) * stock_line_gap
 
     cols = 4
     rows = math.ceil(len(paths) / cols)
@@ -1532,7 +1648,7 @@ def write_long_fold_paths_svg(
     gap_x = 24
     gap_y = 22
     cell_w = (width - left - right - gap_x * (cols - 1)) / cols
-    cell_h = 230
+    cell_h = 230 + stock_extra_h
     grid_h = rows * cell_h + (rows - 1) * gap_y
     height = int(header_h + grid_h + full_chart_gap + full_chart_h + footer_h)
 
@@ -1575,23 +1691,27 @@ def write_long_fold_paths_svg(
 
         return x_scale, y_scale, y_min, y_max
 
-    def holding_name_lines(path: Dict[str, Any]) -> List[str]:
+    def holding_names(path: Dict[str, Any], limit: int) -> List[str]:
         holdings = path.get("holdings", []) or []
-        names = [
+        return [
             str(item.get("name") or item.get("code") or "").strip()
-            for item in holdings[:10]
+            for item in holdings[:limit]
             if isinstance(item, dict) and (item.get("name") or item.get("code"))
         ]
+
+    def holding_name_lines(path: Dict[str, Any]) -> List[str]:
+        names = holding_names(path, visible_holding_count)
         if not names:
             return []
-        first = " · ".join(names[:5])
-        second = " · ".join(names[5:10])
-        return [line for line in (first, second) if line]
+        return [
+            " · ".join(names[idx:idx + stock_names_per_line])
+            for idx in range(0, len(names), stock_names_per_line)
+        ]
 
-    def holding_top10_keys(path: Dict[str, Any]) -> List[str]:
+    def holding_topn_keys(path: Dict[str, Any]) -> List[str]:
         keys = []
         seen = set()
-        for item in (path.get("holdings", []) or [])[:10]:
+        for item in (path.get("holdings", []) or [])[:replacement_top_n]:
             if isinstance(item, dict):
                 key = str(item.get("code") or item.get("name") or "").strip()
             else:
@@ -1601,26 +1721,26 @@ def write_long_fold_paths_svg(
                 seen.add(key)
         return keys
 
-    top10_replacement_counts = []
-    prev_top10_keys: Optional[List[str]] = None
+    topn_replacement_counts = []
+    prev_topn_keys: Optional[List[str]] = None
     for path in paths:
-        top10_keys = holding_top10_keys(path)
+        topn_keys = holding_topn_keys(path)
         replaced_count = None
-        if prev_top10_keys is not None and top10_keys:
-            replaced_count = len(set(top10_keys) - set(prev_top10_keys))
-        path["top10_replaced_count"] = replaced_count
-        top10_replacement_counts.append({
+        if prev_topn_keys is not None and topn_keys:
+            replaced_count = len(set(topn_keys) - set(prev_topn_keys))
+        path["topn_replaced_count"] = replaced_count
+        topn_replacement_counts.append({
             "as_of": path.get("as_of"),
             "replaced_count": replaced_count,
         })
-        if top10_keys:
-            prev_top10_keys = top10_keys
+        if topn_keys:
+            prev_topn_keys = topn_keys
 
-    def top10_replacement_label(path: Dict[str, Any]) -> str:
-        replaced_count = path.get("top10_replaced_count")
+    def topn_replacement_label(path: Dict[str, Any]) -> str:
+        replaced_count = path.get("topn_replaced_count")
         if replaced_count is None:
-            return "Top10替换 --"
-        return f"Top10替换 {int(replaced_count)}只"
+            return f"{replacement_prefix}替换 --"
+        return f"{replacement_prefix}替换 {int(replaced_count)}只"
 
     elements: List[str] = []
     elements.append(f'<rect x="0" y="0" width="{width}" height="{height}" fill="#f8fafc"/>')
@@ -1657,7 +1777,7 @@ def write_long_fold_paths_svg(
         plot_x = cell_x + 40
         plot_y = cell_y + 42
         plot_w = cell_w - 52
-        plot_h = cell_h - 104
+        plot_h = cell_h - 104 - stock_extra_h
         x_scale, y_scale, y_min, y_max = path_scale(path, plot_x, plot_y, plot_w, plot_h)
         excess_pct = path["excess_return"] * 100
         is_partial = bool(path.get("partial"))
@@ -1665,12 +1785,13 @@ def write_long_fold_paths_svg(
         title_color = "#b45309" if is_partial else ("#b91c1c" if excess_pct >= 0 else "#475569")
         window_label = f"未满 {actual_hold_td}/{hold_td}日" if is_partial else f"完整 {hold_td}日"
         stock_lines = holding_name_lines(path)
-        stock_title = " · 股票：" + "、".join(stock_lines).replace(" · ", "、") if stock_lines else ""
-        replacement_label = top10_replacement_label(path)
+        title_names = holding_names(path, replacement_top_n)
+        stock_title = " · 股票：" + "、".join(title_names) if title_names else ""
+        replacement_label = topn_replacement_label(path)
         replacement_title = (
-            " · 首期Top10无上期可比"
-            if path.get("top10_replaced_count") is None
-            else f" · 较上期Top10替换 {int(path['top10_replaced_count'])} 只"
+            f" · 首期{replacement_prefix}无上期可比"
+            if path.get("topn_replaced_count") is None
+            else f" · 较上期{replacement_prefix}替换 {int(path['topn_replaced_count'])} 只"
         )
         fold_title = (
             f"起点 {path['as_of']} · {window_label} · 有效持仓 {path['stock_count']} 只 · "
@@ -1727,9 +1848,18 @@ def write_long_fold_paths_svg(
             )
             elements.append(text(progress_x, plot_y + plot_h + 28, f"{actual_hold_td}日", 9, "600", "middle", "#b45309"))
         if stock_lines:
-            elements.append(text(cell_x + 12, plot_y + plot_h + 34, "股票：" + stock_lines[0], 9, "500", color="#334155"))
-            if len(stock_lines) > 1:
-                elements.append(text(cell_x + 12, plot_y + plot_h + 49, stock_lines[1], 9, "500", color="#334155"))
+            for line_idx, line in enumerate(stock_lines):
+                prefix = "股票：" if line_idx == 0 else ""
+                elements.append(
+                    text(
+                        cell_x + 12,
+                        plot_y + plot_h + 34 + line_idx * stock_line_gap,
+                        prefix + line,
+                        9,
+                        "500",
+                        color="#334155",
+                    )
+                )
         elements.append(
             '<polyline fill="none" stroke="#1d4ed8" stroke-width="1.8" stroke-opacity="0.9" '
             f'points="{svg_points(path["benchmark_path"], x_scale, y_scale)}"><title>{html_escape(BENCHMARK_NAME + " " + fold_title)}</title></polyline>'
@@ -1865,8 +1995,9 @@ def write_long_fold_paths_svg(
         "displayed_folds": len(paths),
         "hold_td": hold_td,
         "fold_interval_td": LONG_FOLD_STEP_TD,
-        "latest_top10_replaced_count": top10_replacement_counts[-1]["replaced_count"] if top10_replacement_counts else None,
-        "top10_replacement_counts": top10_replacement_counts,
+        "replacement_top_n": replacement_top_n,
+        "latest_topn_replaced_count": topn_replacement_counts[-1]["replaced_count"] if topn_replacement_counts else None,
+        "topn_replacement_counts": topn_replacement_counts,
         "chart_type": "small_multiples_with_full_path" if full_path else "small_multiples",
         "columns": cols,
         "rows": rows,
@@ -1918,7 +2049,7 @@ def create_long_fold_path_chart(
     for as_of in fold_dates:
         cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
         prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-        picks = score_prepared_long_candidates(prepared, cfg)
+        picks = score_prepared_long_candidates(prepared, cfg, entry_series=series, as_of=as_of)
         path = portfolio_fold_path(picks, series, benchmark_series, as_of, hold_td)
         if path is None:
             continue
@@ -1927,7 +2058,7 @@ def create_long_fold_path_chart(
     for as_of in partial_fold_dates:
         cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
         prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-        picks = score_prepared_long_candidates(prepared, cfg)
+        picks = score_prepared_long_candidates(prepared, cfg, entry_series=series, as_of=as_of)
         path = portfolio_fold_path(
             picks, series, benchmark_series, as_of, hold_td, allow_partial=True
         )
@@ -1936,7 +2067,13 @@ def create_long_fold_path_chart(
         path["partial"] = True
         paths.append(attach_holdings(path, picks))
 
-    return write_long_fold_paths_svg(paths, output_file, hold_td, title=title)
+    return write_long_fold_paths_svg(
+        paths,
+        output_file,
+        hold_td,
+        holding_top_n=cfg.get("top_n"),
+        title=title,
+    )
 
 
 def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, Any]:
@@ -2100,7 +2237,7 @@ def print_summary(result: Dict[str, Any]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="搜索股票策略因子权重和参数")
     parser.add_argument("--iterations", type=int, default=DEFAULT_OPTIMIZATION_ITERATIONS, help="每个策略的搜索迭代次数")
-    parser.add_argument("--seed", type=int, default=20260611, help="随机种子")
+    parser.add_argument("--seed", type=int, default=2333, help="随机种子")
     parser.add_argument("--no-persist", action="store_true", help="只打印结果，不写入结果文件")
     args = parser.parse_args()
     try:

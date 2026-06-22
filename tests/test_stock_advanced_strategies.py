@@ -66,6 +66,17 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertGreaterEqual(len(registry["long"]), 20)
         self.assertGreaterEqual(len(registry["short"]), 20)
 
+    def test_long_factor_registry_exposes_capital_group(self):
+        registry = get_factor_registry()
+        long_by_key = {item["key"]: item for item in registry["long"]}
+        defaults = get_default_config()["long"]["weights"]
+
+        for key in ("holder_count_change", "repurchase_recent", "lhb_recent_avoid"):
+            self.assertIn(key, long_by_key)
+            self.assertEqual(long_by_key[key]["group"], "资金面")
+            self.assertIn(key, defaults)
+            self.assertGreater(defaults[key], 0)
+
     def test_csi300_persistence_proxy_rewards_current_member(self):
         current_member = csi300_persistence_proxy(True, True)
         broad_member = csi300_persistence_proxy(False, True)
@@ -150,7 +161,10 @@ class StockAdvancedStrategyTest(unittest.TestCase):
              patch("stock_advanced_strategies.load_cn_stock_index", return_value=cn_index), \
              patch("stock_advanced_strategies.load_stock_universe", return_value={}), \
              patch("stock_advanced_strategies.load_market_snapshot", return_value={}), \
-             patch("stock_advanced_strategies.load_sw3_segment_map", return_value={}):
+             patch("stock_advanced_strategies.load_sw3_segment_map", return_value={}), \
+             patch("stock_advanced_strategies.load_long_capital_signals", return_value=({}, {
+                 "holder": False, "repurchase": False, "lhb": False,
+             })):
             candidates, notes = build_long_candidates(cfg)
 
         self.assertEqual([item["code"] for item in candidates], ["600000"])
@@ -315,6 +329,26 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertAlmostEqual(live["roe_mean"], 20.0)
         self.assertAlmostEqual(pit["roe_mean"], 10.0)
         self.assertNotAlmostEqual(live["net_margin"], pit["net_margin"])
+
+    def test_compute_long_factors_maps_capital_signals(self):
+        raw = compute_long_raw_factors(
+            "X", PIT_SYNTH_STOCK, {}, False, False, 1e10, None,
+            capital_signal={"holder_change": -8.5, "repurchase_recent": True, "lhb_recent": True},
+            capital_available={"holder": True, "repurchase": True, "lhb": True},
+        )
+
+        self.assertEqual(raw["holder_count_change"], -8.5)
+        self.assertEqual(raw["repurchase_recent"], 1.0)
+        self.assertEqual(raw["lhb_recent_avoid"], 1.0)
+
+        missing = compute_long_raw_factors(
+            "X", PIT_SYNTH_STOCK, {}, False, False, 1e10, None,
+            capital_signal={"holder_change": -8.5, "repurchase_recent": True, "lhb_recent": True},
+            capital_available={"holder": False, "repurchase": False, "lhb": False},
+        )
+        self.assertIsNone(missing["holder_count_change"])
+        self.assertIsNone(missing["repurchase_recent"])
+        self.assertIsNone(missing["lhb_recent_avoid"])
 
     def test_run_strategies_returns_usable_sections(self):
         result = run_strategies(persist=False)

@@ -25,6 +25,7 @@ _OPTIMIZE_STATE: Dict[str, Any] = {
     "elapsed_sec": None,
 }
 STOCK_REFRESH_JOB_ID = "stock-refresh"
+STOCK_REFRESH_SCRIPT = "stock_radar_fresh_data.sh"
 
 
 def run_stock_strategies(
@@ -69,10 +70,7 @@ def build_long_backtest_chart(config: Optional[Dict[str, Any]] = None) -> Dict[s
         title = "长线当前参数各折走势小图矩阵"
 
     with _RUN_LOCK:
-        if not is_default or not output_file.exists():
-            chart = create_long_fold_path_chart(merged, output_file, title=title)
-        else:
-            chart = {"file": str(output_file), "chart_type": "existing_default"}
+        chart = create_long_fold_path_chart(merged, output_file, title=title)
 
     return {
         "is_default": is_default,
@@ -102,15 +100,9 @@ def resolve_long_backtest_chart_file(filename: str) -> Path:
 def start_stock_data_refresh() -> bool:
     return start_command_job(
         STOCK_REFRESH_JOB_ID,
-        [
-            "python",
-            "stock_data_refresh.py",
-            "--mode",
-            "full",
-            "--no-proxy",
-        ],
+        ["bash", STOCK_REFRESH_SCRIPT],
         cwd=ROOT_DIR,
-        timeout=1800,
+        timeout=10800,
         on_success=_after_stock_data_refresh,
     )
 
@@ -143,9 +135,16 @@ def optimizer_state_snapshot() -> Dict[str, Any]:
 def _run_optimizer_job() -> None:
     from stock_advanced_strategies import invalidate_dir_fingerprints
     from stock_data_refresh import resolve_python
+    from stock_strategy_optimizer import DEFAULT_OPTIMIZATION_ITERATIONS
 
     started = time.time()
-    cmd = [resolve_python(), "-B", "stock_strategy_optimizer.py", "--iterations", "300"]
+    cmd = [
+        resolve_python(),
+        "-B",
+        "stock_strategy_optimizer.py",
+        "--iterations",
+        str(DEFAULT_OPTIMIZATION_ITERATIONS),
+    ]
     ok = False
     error = ""
     try:

@@ -26,13 +26,16 @@ def radar_pattern_catalog() -> List[Dict[str, Any]]:
     return pattern_catalog()
 
 
-def start_radar_run(include_large_cap: bool = True) -> bool:
-    """后台跑 `python stock_hot_money_radar.py ambush`（刷新吸筹分+形态结果）。
+def start_radar_run(include_large_cap: bool = True, pool: str = "leader") -> bool:
+    """后台跑 `python stock_hot_money_radar.py ambush`（刷新吸筹分/反转分+形态结果）。
 
-    显式传市值口径（不依赖 CLI 默认）：含大盘=纳入全市值，否则剔除大盘(≤300亿)。
+    显式传市值口径与候选池（不依赖 CLI 默认）：含大盘=纳入全市值，否则剔除大盘(≤300亿)；
+    pool='leader' 细分龙头(吸筹/机会分) / 'hotmoney' 游资小盘universe(超短反转分)。
     """
+    pool = pool if pool in ("leader", "hotmoney") else "leader"
     cmd = ["python", "stock_hot_money_radar.py", "ambush",
-           "--no-exclude-large-cap" if include_large_cap else "--exclude-large-cap"]
+           "--no-exclude-large-cap" if include_large_cap else "--exclude-large-cap",
+           "--pool", pool]
     return start_command_job(RADAR_RUN_JOB_ID, cmd, cwd=ROOT_DIR, timeout=1800)
 
 

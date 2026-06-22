@@ -39,7 +39,11 @@ LEGACY_HOT_MONEY_SCORED_FILE = CAPITAL_DIR / "scored_stocks.json"
 OUTPUT_FILE = DATA_DIR / "stock_advanced_strategy_results.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
-LIVE_CANDIDATE_CACHE_VERSION = 1
+LIVE_CANDIDATE_CACHE_VERSION = 2
+LONG_CAPITAL_EVENT_DAYS = 90
+HOLDER_TABLE = "shareholder_count"
+REPURCHASE_TABLE = "repurchase"
+LHB_ALL_TABLE = "lhb_all"
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +97,9 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("cashflow_quality", "现金流质量", "long", "质量", "经营现金流 / 净利润，1附近及以上更好。", 0.9, "bounded", "high", 0.0, 2.0, 35),
     FactorSpec("dividend_yield_5y", "五年股息率", "long", "股东回报", "近五年平均每股分红 / 当前股价。", 0.7, "percentile", missing_score=20),
     FactorSpec("dividend_consistency", "连续分红", "long", "股东回报", "近三年连续现金分红。", 0.5, "boolean"),
+    FactorSpec("holder_count_change", "股东户数变化", "long", "资金面", "最近已公告股东户数增减比例，户数下降代表筹码集中。", 0.7, "percentile", "low", missing_score=50),
+    FactorSpec("repurchase_recent", "公司回购", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日有回购公告。", 0.4, "bounded", "high", 0.0, 1.0, 50),
+    FactorSpec("lhb_recent_avoid", "近期龙虎榜", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日上过龙虎榜按避雷处理。", 0.5, "bounded", "low", 0.0, 1.0, 50),
     FactorSpec("debt_safety", "低负债率", "long", "风险", "资产负债率越低越好，银行等行业会由其他质量因子平衡。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("pledge_safety", "低质押", "long", "风险", "股权质押比例越低越好。", 0.4, "percentile", "low", missing_score=60),
     FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.0, "direct", missing_score=40),
@@ -167,12 +174,15 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
     spec.key: spec for spec in LONG_FACTORS + SHORT_FACTORS
 }
 
+LONG_DEFAULT_TOP_N = 20
+SHORT_DEFAULT_TOP_N = 10
+
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "long": {
         "enabled": True,
         "use_segment_leaders": True,
-        "top_n": 10,
+        "top_n": LONG_DEFAULT_TOP_N,
         "min_score": 60,
         "min_market_cap_yi": 0,
         "require_csi300": False,
@@ -185,7 +195,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "short": {
         "enabled": True,
-        "top_n": 10,
+        "top_n": SHORT_DEFAULT_TOP_N,
         "min_score": 55,
         "hold_days_min": 1,
         "hold_days_max": 5,
@@ -287,6 +297,7 @@ def invalidate_dir_fingerprints() -> None:
     for cached in (
         _load_cn_stock_index_cached,
         _load_fundamental_stocks_cached,
+        _load_long_capital_signals_cached,
         _build_live_long_candidates_cached,
         _build_live_short_candidates_cached,
     ):
@@ -372,6 +383,7 @@ def clear_live_candidate_cache() -> None:
         _build_live_long_candidates_cached.cache_clear()
         _build_live_short_candidates_cached.cache_clear()
         _load_sw3_segment_map_cached.cache_clear()
+        _load_long_capital_signals_cached.cache_clear()
     except NameError:
         pass
     with _candidate_cache_lock:
@@ -850,6 +862,129 @@ def segment_leader_code_signature() -> Dict[str, Any]:
     return {"count": len(codes), "digest": digest}
 
 
+def _db_table_exists(conn, table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _db_table_columns(conn, table: str) -> set:
+    if not _db_table_exists(conn, table):
+        return set()
+    return {str(row["name"]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _latest_stock_history_date(conn) -> Optional[str]:
+    if not _db_table_exists(conn, "stock_history"):
+        return None
+    row = conn.execute(
+        "SELECT MAX(date) AS latest_date FROM stock_history WHERE daily_close IS NOT NULL"
+    ).fetchone()
+    return str(row["latest_date"]) if row and row["latest_date"] else None
+
+
+def long_capital_signal_signature() -> Dict[str, Any]:
+    tables = {
+        "holder": (HOLDER_TABLE, "disclose_date"),
+        "repurchase": (REPURCHASE_TABLE, "disclose_date"),
+        "lhb": (LHB_ALL_TABLE, "date"),
+    }
+    conn = stock_storage.connect()
+    try:
+        sig: Dict[str, Any] = {}
+        for key, (table, date_col) in tables.items():
+            if not _db_table_exists(conn, table):
+                sig[f"{key}_rows"] = 0
+                sig[f"{key}_min_date"] = None
+                sig[f"{key}_max_date"] = None
+                sig[f"{key}_max_updated_at"] = None
+                continue
+            columns = _db_table_columns(conn, table)
+            min_expr = f"MIN({date_col})" if date_col in columns else "NULL"
+            max_expr = f"MAX({date_col})" if date_col in columns else "NULL"
+            updated_expr = "MAX(updated_at)" if "updated_at" in columns else "NULL"
+            row = conn.execute(
+                f"SELECT COUNT(*) AS c, {min_expr} AS min_date, {max_expr} AS max_date, "
+                f"{updated_expr} AS max_updated FROM {table}"
+            ).fetchone()
+            sig[f"{key}_rows"] = int(row["c"] or 0) if row else 0
+            sig[f"{key}_min_date"] = row["min_date"] if row else None
+            sig[f"{key}_max_date"] = row["max_date"] if row else None
+            sig[f"{key}_max_updated_at"] = row["max_updated"] if row else None
+        return sig
+    finally:
+        conn.close()
+
+
+def load_long_capital_signals(as_of: Optional[str] = None) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, bool]]:
+    signature = _signature_key(long_capital_signal_signature())
+    signals, availability = _load_long_capital_signals_cached(as_of or "", signature)
+    return {code: dict(info) for code, info in signals.items()}, dict(availability)
+
+
+@lru_cache(maxsize=256)
+def _load_long_capital_signals_cached(
+        as_of_key: str,
+        signature: Tuple[Tuple[str, Any], ...],
+) -> Tuple[Dict[str, Dict[str, Any]], Dict[str, bool]]:
+    _ = signature
+    conn = stock_storage.connect()
+    try:
+        asof = as_of_key or _latest_stock_history_date(conn) or datetime.now().strftime("%Y-%m-%d")
+        asof = str(asof)[:10]
+        try:
+            cutoff = (
+                datetime.strptime(asof, "%Y-%m-%d") - timedelta(days=LONG_CAPITAL_EVENT_DAYS)
+            ).strftime("%Y-%m-%d")
+        except ValueError:
+            cutoff = (datetime.now() - timedelta(days=LONG_CAPITAL_EVENT_DAYS)).strftime("%Y-%m-%d")
+
+        availability = {
+            "holder": _db_table_exists(conn, HOLDER_TABLE) and stock_storage.table_count(conn, HOLDER_TABLE) > 0,
+            "repurchase": _db_table_exists(conn, REPURCHASE_TABLE) and stock_storage.table_count(conn, REPURCHASE_TABLE) > 0,
+            "lhb": _db_table_exists(conn, LHB_ALL_TABLE) and stock_storage.table_count(conn, LHB_ALL_TABLE) > 0,
+        }
+        signals: Dict[str, Dict[str, Any]] = {}
+
+        def slot(code: str) -> Dict[str, Any]:
+            return signals.setdefault(code, {
+                "holder_change": None,
+                "repurchase_recent": False,
+                "lhb_recent": False,
+            })
+
+        if availability["holder"]:
+            for row in conn.execute(
+                f"SELECT code, change_pct FROM {HOLDER_TABLE} "
+                "WHERE disclose_date IS NOT NULL AND change_pct IS NOT NULL AND disclose_date <= ? "
+                "ORDER BY code, disclose_date",
+                (asof,),
+            ).fetchall():
+                code = stock_storage._normalize_code(row["code"])
+                if code:
+                    slot(code)["holder_change"] = safe_float(row["change_pct"])
+        if availability["repurchase"]:
+            for row in conn.execute(
+                f"SELECT DISTINCT code FROM {REPURCHASE_TABLE} "
+                "WHERE disclose_date > ? AND disclose_date <= ?",
+                (cutoff, asof),
+            ).fetchall():
+                code = stock_storage._normalize_code(row["code"])
+                if code:
+                    slot(code)["repurchase_recent"] = True
+        if availability["lhb"]:
+            for row in conn.execute(
+                f"SELECT DISTINCT code FROM {LHB_ALL_TABLE} WHERE date > ? AND date <= ?",
+                (cutoff, asof),
+            ).fetchall():
+                code = stock_storage._normalize_code(row["code"])
+                if code:
+                    slot(code)["lhb_recent"] = True
+        return signals, availability
+    finally:
+        conn.close()
+
+
 _UNKNOWN_INDUSTRY_NAMES = {"", "UNKNOWN", "unknown", "None", "none", "NULL", "null", "nan", "NaN"}
 
 
@@ -1217,6 +1352,7 @@ def build_long_candidates(
     snapshot = load_market_snapshot()
     cn_index = load_cn_stock_index()
     sw3_segments = load_sw3_segment_map()
+    capital_signals, capital_availability = load_long_capital_signals(as_of)
     csi300 = set(str(code).zfill(6) for code in stock_universe.get("csi300", []))
     csi_all = set(str(code).zfill(6) for code in stock_universe.get("all", []))
     if not csi300:
@@ -1224,7 +1360,15 @@ def build_long_candidates(
     if as_of is not None:
         notes.append(
             f"PIT 时点 {as_of}：财报/价格/估值/分红已按当时可见切片；"
-            "但沪深300成分、申万行业与质押用的是当前快照(无历史数据)，这几维仍有轻微前视。"
+            "资金面按公告/上榜日切片；但沪深300成分、申万行业与质押用的是当前快照(无历史数据)，这几维仍有轻微前视。"
+        )
+    if any(capital_availability.values()):
+        notes.append(
+            "长线资金面已挂载：股东户数变化、公司回购、近期龙虎榜避雷。"
+        )
+    else:
+        notes.append(
+            "长线资金面数据表为空；运行 stock_crawl_holders.py 与 stock_crawl_capital.py 后生效。"
         )
 
     min_cap_yi = safe_float(config.get("min_market_cap_yi")) or 0.0
@@ -1274,6 +1418,8 @@ def build_long_candidates(
         raw = compute_long_raw_factors(
             code, stock, snap, in_csi300, in_csi_all, market_cap_cny,
             high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
+            capital_signal=capital_signals.get(code),
+            capital_available=capital_availability,
         )
 
         legacy_industry = (
@@ -1295,7 +1441,7 @@ def build_long_candidates(
             "sw3_segment_code": sw3_segment_code,
             "raw_factors": raw,
             "reasons": [],
-            "warnings": [],
+            "warnings": long_warnings(raw),
         }
         candidates.append(item)
         if market_cap_cny:
@@ -1340,6 +1486,8 @@ def compute_long_raw_factors(
         high_drawdown_pct: Optional[float] = None,
         as_of: Optional[str] = None,
         hist_rows: Optional[List[Dict[str, Any]]] = None,
+        capital_signal: Optional[Dict[str, Any]] = None,
+        capital_available: Optional[Dict[str, bool]] = None,
 ) -> Dict[str, Any]:
     # PIT(as_of 给定)：财报只取截止 as_of 已公告可见的；as_of=None 时原样(实盘)。
     financials = stock.get("financials", {})
@@ -1468,6 +1616,20 @@ def compute_long_raw_factors(
         )
         dividend_consistency = 1.0 if consecutive_dividend_asof(stock, as_of) else 0.0
 
+    capital_signal = capital_signal or {}
+    capital_available = capital_available or {}
+    holder_count_change = (
+        safe_float(capital_signal.get("holder_change"))
+        if capital_available.get("holder")
+        else None
+    )
+    repurchase_recent = (
+        1.0 if capital_signal.get("repurchase_recent") else 0.0
+    ) if capital_available.get("repurchase") else None
+    lhb_recent_avoid = (
+        1.0 if capital_signal.get("lhb_recent") else 0.0
+    ) if capital_available.get("lhb") else None
+
     return {
         "csi300_current": 1.0 if in_csi300 else 0.0,
         "csi300_persistence": persistence,
@@ -1484,6 +1646,9 @@ def compute_long_raw_factors(
         "cashflow_quality": cash_quality,
         "dividend_yield_5y": dividend_yield_5y,
         "dividend_consistency": dividend_consistency,
+        "holder_count_change": holder_count_change,
+        "repurchase_recent": repurchase_recent,
+        "lhb_recent_avoid": lhb_recent_avoid,
         "debt_safety": safe_float(latest_ind.get("asset_liability_ratio")),
         "pledge_safety": first_not_none(
             stock.get("pledge", {}).get("pledge_ratio"), snapshot.get("pledge_ratio")
@@ -1552,7 +1717,22 @@ def long_reasons(item: Dict[str, Any]) -> List[str]:
         reasons.append(f"五年股息率{raw['dividend_yield_5y']:.2f}%")
     if safe_float(raw.get("cashflow_quality")) is not None:
         reasons.append(f"现金流/利润{raw['cashflow_quality']:.2f}")
+    holder_change = safe_float(raw.get("holder_count_change"))
+    if holder_change is not None and holder_change < 0:
+        reasons.append(f"股东户数下降{abs(holder_change):.1f}%")
+    if safe_float(raw.get("repurchase_recent")):
+        reasons.append("近期回购")
     return reasons[:5]
+
+
+def long_warnings(raw: Dict[str, Any]) -> List[str]:
+    warnings = []
+    if safe_float(raw.get("lhb_recent_avoid")):
+        warnings.append("近期上龙虎榜，长线按避雷处理")
+    holder_change = safe_float(raw.get("holder_count_change"))
+    if holder_change is not None and holder_change > 15:
+        warnings.append("股东户数明显增加，筹码集中度走弱")
+    return warnings
 
 
 # ---------------------------------------------------------------------------
@@ -1990,12 +2170,14 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     snapshot_signature = _file_signature(DATA_DIR / "market_snapshot.json")
     stock_data_signature = stock_storage.db_signature()
     leader_signature = segment_leader_code_signature()
+    capital_signature = long_capital_signal_signature()
     meta = {
         "config_key": key,
         "stock_data": stock_data_signature,
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
         "segment_leaders": leader_signature,
+        "capital_signals": capital_signature,
     }
     cached = read_live_candidate_cache("long", meta)
     if cached is not None:
@@ -2006,6 +2188,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         snapshot_signature,
         _signature_key(stock_data_signature),
         _signature_key(leader_signature),
+        _signature_key(capital_signature),
         key,
     )
     write_live_candidate_cache("long", meta, candidates, notes)
@@ -2018,11 +2201,12 @@ def _build_live_long_candidates_cached(
         snapshot_signature: Tuple[int, int],
         stock_data_signature: Tuple[Tuple[str, Any], ...],
         leader_signature: Tuple[Tuple[str, Any], ...],
+        capital_signature: Tuple[Tuple[str, Any], ...],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
     # 磁盘候选缓存另用 db_signature()(内容指纹) 校验，无需易变的文件指纹做 key。
-    _ = (universe_signature, snapshot_signature, stock_data_signature, leader_signature)
+    _ = (universe_signature, snapshot_signature, stock_data_signature, leader_signature, capital_signature)
     return build_long_candidates(config_from_key(config_key))
 
 

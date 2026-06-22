@@ -10,6 +10,10 @@
       <span id="radar-status" class="status">读取中…</span>
     </div>
     <div class="radar-actions">
+      <label class="toggle">池&nbsp;<select id="radar-pool" aria-label="候选池">
+        <option value="leader">细分龙头</option>
+        <option value="hotmoney">游资小盘</option>
+      </select></label>
       <label class="toggle"><input id="radar-include-large" type="checkbox" checked>含大盘</label>
       <button id="radar-run" class="btn primary" type="button">运行 · 刷新结果</button>
       <button id="radar-refresh-data" class="btn" type="button">刷新数据</button>

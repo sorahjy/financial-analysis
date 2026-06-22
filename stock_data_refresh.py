@@ -460,6 +460,25 @@ def refresh_before_server(
         )
     )
 
+    steps.append(
+        run_step(
+            "shareholder_count_history",
+            [python_bin, "-B", "stock_crawl_holders.py", "--no-proxy"],
+            timeout=timeout,
+            env=env,
+            skip=(mode == "quick"),
+        )
+    )
+    steps.append(
+        run_step(
+            "long_capital_events",
+            [python_bin, "-B", "stock_crawl_capital.py", "--no-proxy"],
+            timeout=timeout,
+            env=env,
+            skip=(mode == "quick"),
+        )
+    )
+
     mirror_step = local_step_result(
         "mirror_capital_outputs",
         "mirror data/capital/hot_money_candidates.json -> data/main_capital_picks.json",

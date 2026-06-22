@@ -90,6 +90,7 @@ EASTMONEY_HEADERS = {
 STOCK_DB_FILE = DATA_DIR.parent / "stock_data.sqlite3"
 
 DEFAULT_TOP_PER_SEGMENT = 3
+FORCED_SEGMENT_LEADER_CODES = ["002741"]  # 光华科技：筛完各 SW3 topN 后仍强制纳入其所属赛道
 DEFAULT_POOL_MAX_AGE_DAYS = 14
 LOCAL_TAXONOMY_MIN_BACKUP_RATIO = 0.80
 
@@ -1107,6 +1108,7 @@ def build_segment_leader_pool(
         refresh_membership: bool = False,
         refresh_slice: int = 0,
         enrich_weights_online: bool = False,
+        forced_leader_codes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """生成细分行业龙头池并落盘（归属缓存 + 主库K线，可选滚动刷新 membership）。
 
@@ -1157,6 +1159,8 @@ def build_segment_leader_pool(
         except Exception as exc:
             print(f"  [membership] 指标补齐回写失败({exc!r})，继续生成龙头池", flush=True)
 
+    forced_source = FORCED_SEGMENT_LEADER_CODES if forced_leader_codes is None else forced_leader_codes
+    forced_codes = {code for code in (_norm_code(item) for item in forced_source) if code}
     segments = []
 
     for seg in membership.get("segments", []):
@@ -1213,6 +1217,12 @@ def build_segment_leader_pool(
         score_segment_leaders(rows)
         rows.sort(key=lambda item: (-item["leader_score"], -(item.get("size_proxy") or 0.0)))
         leaders = rows[:top_per_segment]
+        if forced_codes:
+            selected_codes = {item["code"] for item in leaders}
+            leaders.extend(
+                item for item in rows
+                if item["code"] in forced_codes and item["code"] not in selected_codes
+            )
 
         segments.append({
             "segment_code": segment_code,
@@ -1244,6 +1254,7 @@ def build_segment_leader_pool(
         "params": {
             "top_per_segment": top_per_segment,
             "min_market_cap_yi": min_market_cap_yi,
+            "forced_leader_codes": sorted(forced_codes),
             "membership_generated_at": membership.get("generated_at"),
         },
         "segment_count": len(segments),

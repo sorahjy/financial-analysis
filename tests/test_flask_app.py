@@ -65,17 +65,17 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("if (!disposed && data.refresh && data.refresh.running)", fund_script)
         self.assertIn("FinancialAnalysisPages.stock = initStockDashboard", stock_script)
         self.assertIn("dataset.stockDashboardInitialized", stock_script)
-        self.assertIn("将对长线/短线各运行 300 次参数搜索回测", stock_script)
-        self.assertIn("python stock_strategy_optimizer.py --iterations 300", stock_script)
-        self.assertIn("约需 3 分钟左右", stock_script)
+        self.assertIn("将对长线/短线各运行 1000 次参数搜索回测", stock_script)
+        self.assertIn("python stock_strategy_optimizer.py --iterations 1000", stock_script)
+        self.assertIn("约需 10 分钟左右", stock_script)
         self.assertNotIn("约需 2 分钟左右", stock_script)
         self.assertIn("clearTimeout(runTimer)", stock_script)
         self.assertIn("clearInterval(optimizeTimer)", stock_script)
         self.assertIn("clearInterval(refreshTimer)", stock_script)
 
         stock_html = self.client.get("/stock").get_data(as_text=True)
-        self.assertIn("长线/短线各 300 次随机搜索回测", stock_html)
-        self.assertIn("约需 3 分钟左右", stock_html)
+        self.assertIn("长线/短线各 1000 次随机搜索回测", stock_html)
+        self.assertIn("约需 10 分钟左右", stock_html)
 
     def test_radar_script_shows_market_cap_and_watch_label(self):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
@@ -85,6 +85,11 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('"观望⚪"', script)
         self.assertIn('replace("空仓观望", "观望")', script)
         self.assertIn('sortTh("market_cap_yi", "市值")', script)
+        self.assertIn('sortTh("opportunity_score", "机会分")', script)
+        self.assertIn('sortTh("ambush_score", "吸筹分")', script)
+        self.assertIn('sortTh("distribution_score", "出货分")', script)
+        self.assertIn('key: "opportunity_score"', script)
+        self.assertIn("户数/回购已并入吸筹总分", script)
         self.assertIn("fmtMarketCap(s.market_cap_yi)", script)
         self.assertIn("pi-stock-meta", script)
         self.assertIn(".pi-stock-meta", css)
@@ -93,12 +98,22 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('id="radar-export"', body)
         self.assertLess(body.index('id="radar-hide-dist"'), body.index('id="radar-export-limit"'))
         self.assertLess(body.index('id="radar-export-limit"'), body.index('id="radar-export"'))
-        self.assertIn("function exportTopAmbushStocks()", script)
+        self.assertIn("function exportTopOpportunityStocks()", script)
         self.assertIn("text/plain;charset=utf-8", script)
-        self.assertIn("hot_money_radar_top", script)
+        self.assertIn("hot_money_radar_opportunity_top", script)
+        self.assertIn("Number(b.opportunity_score) - Number(a.opportunity_score)", script)
         self.assertIn("Number(b.ambush_score) - Number(a.ambush_score)", script)
+        self.assertIn("已导出机会分Top", script)
         self.assertIn('${cleanField(s.code)},${cleanField(s.name)},', script)
+        self.assertNotIn('sortTh("capital_score", "资金分")', script)
         self.assertIn(".radar-export-limit", css)
+        self.assertIn("走势相似行业", script)
+        self.assertIn("二级行业", script)
+        self.assertIn("function sw2Cell(s)", script)
+        self.assertIn("s.sw2_heat_pctile", script)
+        self.assertIn("esc(industry) + heat", script)
+        self.assertNotIn("三级行业", script)
+        self.assertNotIn("跟踪二级行业", script)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -168,12 +183,12 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"started": True})
 
-    def test_stock_refresh_uses_full_no_proxy_command(self):
+    def test_stock_refresh_uses_radar_refresh_script(self):
         with patch("app.services.stock_strategy_service.start_command_job", return_value=True) as start_job:
             self.assertTrue(stock_strategy_service.start_stock_data_refresh())
 
         command = start_job.call_args.args[1]
-        self.assertEqual(command, ["python", "stock_data_refresh.py", "--mode", "full", "--no-proxy"])
+        self.assertEqual(command, ["bash", "stock_radar_fresh_data.sh"])
         self.assertNotIn("--strict", command)
         self.assertNotIn("--timeout", command)
 
@@ -199,6 +214,20 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(response.get_json(), payload)
         build_chart.assert_called_once_with({"long": {"top_n": 10}})
 
+    def test_stock_long_backtest_chart_rebuilds_existing_default_file(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output = Path(tmp_dir) / "stock_strategy_best_fold_paths.svg"
+            output.write_text("<svg>Top10替换</svg>", encoding="utf-8")
+            chart_payload = {"file": str(output), "replacement_top_n": 20}
+            with patch("stock_strategy_optimizer.LONG_FOLD_PATH_CHART_FILE", output), \
+                 patch("stock_strategy_optimizer.create_long_fold_path_chart", return_value=chart_payload) as build_chart:
+                payload = stock_strategy_service.build_long_backtest_chart({})
+
+        self.assertTrue(payload["is_default"])
+        self.assertEqual(payload["chart"], chart_payload)
+        build_chart.assert_called_once()
+        self.assertEqual(build_chart.call_args.args[1], output)
+
     def test_stock_long_backtest_chart_file_serves_svg_only(self):
         with tempfile.NamedTemporaryFile(suffix=".svg") as tmp:
             Path(tmp.name).write_text("<svg></svg>", encoding="utf-8")
@@ -216,12 +245,15 @@ class FlaskAppTest(unittest.TestCase):
 
         self.assertIn('id="long-chart-modal"', body)
         self.assertIn('id="long-chart-show"', body)
+        self.assertIn('id="long-chart-status"', body)
         self.assertIn(">策略走势</button>", body)
         self.assertIn('id="export-picks"', body)
         self.assertIn(">导出</button>", body)
         self.assertLess(body.index('id="refresh-data"'), body.index('id="long-chart-show"'))
         self.assertLess(body.index('id="long-chart-show"'), body.index('id="export-picks"'))
         self.assertIn("/api/stock/long-backtest-chart", script)
+        self.assertIn("正在回测策略走势，请稍后...", script)
+        self.assertIn("function showLongChartStatus", script)
         self.assertIn("button.hidden = !visible", script)
         self.assertIn('const visible = active === "long"', script)
         self.assertIn("function exportCurrentPicks()", script)
@@ -235,6 +267,7 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('class="stock-mini-kline"', script)
         self.assertIn(".stock-mini-kline", css)
         self.assertIn(".chart-modal", css)
+        self.assertIn(".chart-modal-status", css)
         self.assertNotIn("long-chart-card", css)
         self.assertNotIn("查看走势", script)
 

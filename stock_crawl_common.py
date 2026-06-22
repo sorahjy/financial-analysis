@@ -622,7 +622,7 @@ DAILY_QFQ_SOURCES = (
     ("新浪", _fetch_daily_sina_qfq),
 )
 _DAILY_QFQ_SOURCE_MAP = {source: fetcher for source, fetcher in DAILY_QFQ_SOURCES}
-DAILY_QFQ_PRIORITY = [["新浪", "腾讯"], ["东财"]]
+DAILY_QFQ_PRIORITY = [["新浪"], ["腾讯"], ["东财"]]
 
 _DAILY_SOURCE_LOCK = threading.Lock()
 _DAILY_SOURCE_FAILURES = {source: 0 for source, _ in DAILY_QFQ_SOURCES}
@@ -669,15 +669,26 @@ _DAILY_PROCESS_POOL = None
 _DAILY_PROCESS_POOL_LOCK = threading.Lock()
 
 
+def _daily_priority_groups():
+    groups = []
+    for item in DAILY_QFQ_PRIORITY:
+        if isinstance(item, str):
+            groups.append((item,))
+        else:
+            groups.append(tuple(item))
+    return groups
+
+
 def _enabled_daily_source_groups(include_trading_value=False):
     with _DAILY_SOURCE_LOCK:
         disabled = set(_DAILY_SOURCE_DISABLED)
+    priority_groups = _daily_priority_groups()
     active_groups = []
-    for group in DAILY_QFQ_PRIORITY:
+    for group in priority_groups:
         active = tuple(source for source in group if source not in disabled)
         if active:
             active_groups.append(active)
-    return active_groups or [tuple(group) for group in DAILY_QFQ_PRIORITY]
+    return active_groups or priority_groups
 
 
 def _enabled_daily_sources(include_trading_value=False):

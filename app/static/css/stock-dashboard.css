@@ -460,6 +460,20 @@
       overflow: auto;
       background: #f8fafc;
       padding: 12px;
+    }.stock-native .chart-modal-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 220px;
+      color: var(--muted);
+      font-size: 14px;
+      font-weight: 600;
+      text-align: center;
+      background: #fff;
+      border: 1px dashed var(--line);
+      border-radius: 6px;
+    }.stock-native .chart-modal-status.warn {
+      color: var(--red);
     }.stock-native .chart-modal-body img {
       display: block;
       width: 100%;

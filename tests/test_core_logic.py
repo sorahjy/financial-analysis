@@ -857,12 +857,19 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "没有产生有效 trial"):
             select_best_long_trace(trace)
 
-    def test_default_strategy_top_n_is_ten_for_long_and_short(self):
-        from stock_advanced_strategies import DEFAULT_CONFIG, get_default_config
+    def test_default_strategy_top_n_uses_named_constants(self):
+        from stock_advanced_strategies import (
+            DEFAULT_CONFIG,
+            LONG_DEFAULT_TOP_N,
+            SHORT_DEFAULT_TOP_N,
+            get_default_config,
+        )
 
         cfg = get_default_config()
-        self.assertEqual(cfg["long"]["top_n"], 10)
-        self.assertEqual(cfg["short"]["top_n"], 10)
+        self.assertEqual(LONG_DEFAULT_TOP_N, 20)
+        self.assertEqual(SHORT_DEFAULT_TOP_N, 10)
+        self.assertEqual(cfg["long"]["top_n"], LONG_DEFAULT_TOP_N)
+        self.assertEqual(cfg["short"]["top_n"], SHORT_DEFAULT_TOP_N)
         self.assertFalse(DEFAULT_CONFIG["long"]["require_high_drawdown"])
 
     def test_long_objective_penalizes_sparse_fold_coverage(self):
@@ -897,7 +904,7 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertEqual(sparse_detail["fold_count_penalty"], round(expected_penalty, 5))
         self.assertEqual(full_detail["fold_count_penalty"], 0)
 
-    def test_recency_weights_make_recent_folds_heavier(self):
+    def test_recency_weights_are_equal_for_all_folds(self):
         from stock_strategy_optimizer import apply_recency_weights, long_fold_summary
 
         pairs = apply_recency_weights([
@@ -930,12 +937,12 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             },
         ])
 
-        self.assertEqual([row["fold_weight"] for row in pairs], [0.5, 1.0, 1.5])
+        self.assertEqual([row["fold_weight"] for row in pairs], [1.0, 1.0, 1.0])
         summary = long_fold_summary(pairs, 125)
-        self.assertEqual(summary["min_fold_weight"], 0.5)
-        self.assertEqual(summary["max_fold_weight"], 1.5)
-        self.assertEqual(summary["avg_excess_pct"], 6.667)
-        self.assertEqual(summary["hit_rate"], 50.0)
+        self.assertEqual(summary["min_fold_weight"], 1.0)
+        self.assertEqual(summary["max_fold_weight"], 1.0)
+        self.assertEqual(summary["avg_excess_pct"], 0.0)
+        self.assertEqual(summary["hit_rate"], 33.33)
 
     def test_partial_fold_path_is_chart_only(self):
         from stock_strategy_optimizer import (
@@ -975,6 +982,14 @@ class StockStrategyOptimizerTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp) / "folds.svg"
+            first_holdings = [
+                {"code": f"0000{idx:02d}", "name": f"样本{idx}"}
+                for idx in range(1, 13)
+            ]
+            second_holdings = first_holdings[:10] + [
+                {"code": "000099", "name": "换手样本A"},
+                {"code": "000100", "name": "换手样本B"},
+            ]
             meta = write_long_fold_paths_svg(
                 [
                     {
@@ -985,11 +1000,11 @@ class StockStrategyOptimizerTest(unittest.TestCase):
                         "partial": False,
                         "portfolio_path": [1.0, 1.1, 1.2],
                         "benchmark_path": [1.0, 1.05, 1.1],
-                        "stock_count": 5,
+                        "stock_count": 12,
                         "portfolio_return": 0.196,
                         "benchmark_return": 0.1,
                         "excess_return": 0.096,
-                        "holdings": [{"name": "完整样本"}],
+                        "holdings": first_holdings,
                     },
                     {
                         "as_of": "2026-01-03",
@@ -999,15 +1014,16 @@ class StockStrategyOptimizerTest(unittest.TestCase):
                         "partial": True,
                         "portfolio_path": [1.0, 1.3],
                         "benchmark_path": [1.0, 1.0],
-                        "stock_count": 5,
+                        "stock_count": 12,
                         "portfolio_return": 0.296,
                         "benchmark_return": 0.0,
                         "excess_return": 0.296,
-                        "holdings": [{"name": "未满样本"}],
+                        "holdings": second_holdings,
                     },
                 ],
                 output,
                 2,
+                holding_top_n=12,
             )
 
             svg = output.read_text(encoding="utf-8")
@@ -1019,11 +1035,12 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertEqual(meta["full_path_start_date"], "2026-01-01")
         self.assertEqual(meta["full_path_end_date"], "2026-01-04")
         self.assertEqual(meta["full_portfolio_final_nav"], 1.56)
-        self.assertEqual(meta["latest_top10_replaced_count"], 1)
-        self.assertEqual(meta["top10_replacement_counts"][0]["replaced_count"], None)
-        self.assertEqual(meta["top10_replacement_counts"][1]["replaced_count"], 1)
+        self.assertEqual(meta["replacement_top_n"], 12)
+        self.assertEqual(meta["latest_topn_replaced_count"], 2)
+        self.assertEqual(meta["topn_replacement_counts"][0]["replaced_count"], None)
+        self.assertEqual(meta["topn_replacement_counts"][1]["replaced_count"], 2)
         self.assertIn("未满 1/2日", svg)
-        self.assertIn("Top10替换 1只", svg)
+        self.assertIn("Top12替换 2只", svg)
         self.assertIn("组合等权平均期末 1.20x（完整折）", svg)
         self.assertIn("完整历史拼接收益图", svg)
 
@@ -1437,6 +1454,48 @@ class HotMoneyFastBuildTest(unittest.TestCase):
         # 赛道内综合分 top2(默认 top_per_segment=2)，市值直接进 leaders 供展示
         self.assertEqual([x["code"] for x in leaders], ["300308", "300394"])
         self.assertEqual(leaders[0]["market_cap_yi"], 13915.0)
+
+    def test_build_appends_forced_leaders_after_top_n(self):
+        import tempfile
+        from datetime import datetime
+        from pathlib import Path
+        import stock_crawl_segment_leaders as r
+        import stock_storage as ss
+
+        membership = {
+            "schema": r.SW3_MEMBERSHIP_SCHEMA,
+            "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "segments": [{
+                "segment_code": "850333", "segment_name": "电子化学品",
+                "parent_segment": "基础化工", "member_count": 3,
+                "members": [
+                    {"code": "300308", "name": "中际旭创", "price": 1248.0, "market_cap_yi": 13915.0,
+                     "roe_pct": 22.0, "profit_growth_pct": 150.0, "revenue_growth_pct": 60.0},
+                    {"code": "300394", "name": "天孚通信", "price": 324.0, "market_cap_yi": 3532.0,
+                     "roe_pct": 18.0, "profit_growth_pct": 80.0, "revenue_growth_pct": 40.0},
+                    {"code": "002741", "name": "光华科技", "price": 18.0, "market_cap_yi": 80.0,
+                     "roe_pct": 5.0, "profit_growth_pct": 10.0, "revenue_growth_pct": 5.0},
+                ],
+            }], "errors": []}
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path, pool_path = tmp / "stock.sqlite3", tmp / "pool.json"
+            conn = ss.connect(db_path)
+            ss.save_sw3_membership(conn, membership)
+            conn.close()
+            with patch.object(r, "STOCK_DB_FILE", db_path), \
+                 patch.object(r, "SEGMENT_LEADER_POOL_FILE", pool_path), \
+                 patch.object(r, "DATA_DIR", tmp), \
+                 patch.object(r, "membership_db_needs_full_recrawl", return_value=(False, 0, 0)):
+                payload = r.build_segment_leader_pool(
+                    top_per_segment=1,
+                    forced_leader_codes=["002741"],
+                )
+
+        segment = payload["segments"][0]
+        self.assertEqual([x["code"] for x in segment["leaders"]], ["300308", "002741"])
+        self.assertEqual(segment["leaders"][1]["rank"], 2)
+        self.assertEqual(payload["params"]["forced_leader_codes"], ["002741"])
 
 
 class HotMoneySliceRefreshTest(unittest.TestCase):
