@@ -65,8 +65,8 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("if (!disposed && data.refresh && data.refresh.running)", fund_script)
         self.assertIn("FinancialAnalysisPages.stock = initStockDashboard", stock_script)
         self.assertIn("dataset.stockDashboardInitialized", stock_script)
-        self.assertIn("将对长线/短线各运行 1000 次参数搜索回测", stock_script)
-        self.assertIn("python stock_strategy_optimizer.py --iterations 1000", stock_script)
+        self.assertIn("将对长线/短线各运行 1500 次参数搜索回测", stock_script)
+        self.assertIn("python stock_strategy_optimizer.py --iterations 1500", stock_script)
         self.assertIn("约需 10 分钟左右", stock_script)
         self.assertNotIn("约需 2 分钟左右", stock_script)
         self.assertIn("clearTimeout(runTimer)", stock_script)
@@ -74,7 +74,7 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("clearInterval(refreshTimer)", stock_script)
 
         stock_html = self.client.get("/stock").get_data(as_text=True)
-        self.assertIn("长线/短线各 1000 次随机搜索回测", stock_html)
+        self.assertIn("长线/短线各 1500 次随机搜索回测", stock_html)
         self.assertIn("约需 10 分钟左右", stock_html)
 
     def test_radar_script_shows_market_cap_and_watch_label(self):

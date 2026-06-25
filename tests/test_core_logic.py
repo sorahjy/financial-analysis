@@ -520,7 +520,7 @@ class StockFilePathTest(unittest.TestCase):
                 ss._thread_local.conns = {}
                 conn.close()
 
-    def test_save_stock_file_syncs_latest_market_cap_to_sw3_member(self):
+    def test_sync_sw3_member_market_caps_picks_latest_non_null(self):
         import stock_storage as ss
         with tempfile.TemporaryDirectory() as tmp:
             conn = ss.connect(Path(tmp) / "stock.sqlite3")
@@ -550,6 +550,8 @@ class StockFilePathTest(unittest.TestCase):
                     },
                 ]})
 
+                synced = ss.sync_sw3_member_market_caps(conn)
+                self.assertEqual(synced, 1)
                 cap = conn.execute(
                     "SELECT market_cap_yi FROM sw3_member WHERE code = ?", ("000001",)
                 ).fetchone()["market_cap_yi"]

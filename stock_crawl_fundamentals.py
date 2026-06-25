@@ -977,16 +977,28 @@ def refetch_daily(codes=None, years=1, workers=8, limit=0):
             daily = fetch_daily_price(code, years=years)
             new_records = daily.pop("history_records", [])
             existing_records = (data.get("history") or {}).get("records", [])
-            merged_records = merge_records_by_date(existing_records, new_records, overwrite_none=False)
-            data["history"] = history_payload_from_records(
+            merged = normalize_history_records(
+                merge_records_by_date(existing_records, new_records, overwrite_none=False),
+                include_valuation=True,
+            )
+            # 只 upsert refetch 窗口内(本次回拉到的日期)的合并行：覆盖变动日 / 插入新日，
+            # 窗口外的多年老行原样不动(merged==existing，本就无变化)，免去 DELETE 整只 +
+            # 全段历史重插的写放大。daily.stats / 起止日仍按全量 merged 算，口径不变。
+            new_dates = {r["date"] for r in normalize_history_records(new_records, include_valuation=True)}
+            window_rows = [r for r in merged if r["date"] in new_dates]
+            hist = history_payload_from_records(
                 code,
                 data.get("name") or code,
-                merged_records,
+                window_rows,
                 "stock_data.history+stock_crawl_fundamentals.refetch_daily",
             )
-            data["daily"] = daily_payload_from_history_records(merged_records)
+            if merged:
+                hist["start_date"] = merged[0]["date"]
+                hist["end_date"] = merged[-1]["date"]
+            data["history"] = hist
+            data["daily"] = daily_payload_from_history_records(merged)
             data["daily_refetched_at"] = datetime.now().isoformat()
-            ss.save_stock(conn, data)
+            ss.save_stock(conn, data, replace_history=False)
             return code, True, ""
         except Exception as e:
             return code, False, str(e)

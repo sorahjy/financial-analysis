@@ -126,12 +126,31 @@ def load_stock_file(code, name):
 
 def save_stock_file(code, name, data):
     conn = ss.thread_conn()
+    full_records = data.get("records", [])
+    has_fundamentals = (
+        any(data.get(k) is not None for k in ("financials", "indicators", "dividends", "pledge"))
+        or data.get("financials_refetched_at")
+    )
+    # 增量快路：纯日线 append(history_replace=False)且本轮没刷财报时，直接只 upsert 新增日线行
+    # + 刷新 daily.stats/history 元，跳过「load_stock 读回整只 → 把没变的 financials/indicators/
+    # dividends JSON blob parse 再 dump → 整行重写 stock_meta」这一整套往返开销。
+    if full_records and data.get("history_replace") is False and not has_fundamentals:
+        write_records = data.get("history_write_records", full_records)
+        ss.upsert_history_records(
+            conn,
+            str(code).zfill(6),
+            name,
+            write_records,
+            source="stock_crawl_price_valuation",
+            daily_stats=daily_payload_from_history_records(full_records).get("stats"),
+        )
+        return
+
     # 读回整只(保留已有 financials/indicators/... 等 meta blob)，按需更新 history/daily 与财报。
     # include_history=False：本次的全量历史已在内存 data["records"] 里，不必再读回数万行日线。
     payload = ss.load_stock(conn, str(code).zfill(6), include_history=False) or {}
     payload.setdefault("symbol", str(code).zfill(6))
     payload.setdefault("name", name)
-    full_records = data.get("records", [])
     replace_history = True
     if full_records:
         # history 元信息(start/end)与 daily.stats 取全量序列；实际写入的行可能只是增量(append)。
@@ -669,6 +688,13 @@ def main():
             f"已排队 {db_writer.enqueued} / 已写 {db_writer.completed} / 队列 {db_writer.queue.qsize()}"
         )
         db_writer.wait()
+
+    # 整轮写完后批量把最新总市值同步进 sw3_member（取代旧的每只 save 都查大表同步单只）。
+    try:
+        synced = ss.sync_sw3_member_market_caps(ss.thread_conn())
+        safe_print(f"sw3 市值批量同步: {synced} 行")
+    except Exception as exc:
+        safe_print(f"[WARN] sw3 市值批量同步失败: {exc}")
 
     fetch_failed_count = len(failed)
     failed.extend(db_writer.failed)

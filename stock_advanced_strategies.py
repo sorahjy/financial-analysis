@@ -18,6 +18,8 @@ import copy
 import hashlib
 import json
 import math
+
+import numpy as np
 import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass
@@ -213,16 +215,73 @@ DEFAULT_CONFIG: Dict[str, Any] = {
 # ---------------------------------------------------------------------------
 
 
+_SF_INF = float("inf")
+
+
 def safe_float(value: Any) -> Optional[float]:
+    # fast path：DB REAL/已转值多为 float，内联 nan/inf 比较省去 float()+math.isnan()+math.isinf()
+    # 三次函数调用开销（该函数在因子计算里被调上亿次，是 profile 头号热点）。
+    if type(value) is float:
+        return value if (value == value and value != _SF_INF and value != -_SF_INF) else None
     if value is None:
         return None
     try:
         num = float(value)
     except (TypeError, ValueError):
         return None
-    if math.isnan(num) or math.isinf(num):
+    if num != num or num == _SF_INF or num == -_SF_INF:
         return None
     return num
+
+
+_PRICE_NUM_FIELDS = ("close", "open", "high", "low", "turnover_rate", "amount", "volume", "change_pct")
+_pretransformed_row_ids: set = set()
+
+
+def pretransform_price_rows(rows: List[Dict[str, Any]]) -> None:
+    """全历史日线行的数值字段原地转 float/None 一次（幂等，按 id 缓存避免重复转换）。
+
+    因子计算里 `safe_float(row.get("close"))` 这类列表推导被调上亿次（profile 头号热点），
+    且每个回测折(fold)对同一份全历史重复转换。rows 来自 cn_index/stock history 等长存活模块缓存、
+    跨 fold/trial 复用同一批 row 对象，故只需预转一次，之后下游 safe_float 全走 float fast-path。"""
+    if not rows:
+        return
+    rid = id(rows)
+    if rid in _pretransformed_row_ids:
+        return
+    for r in rows:
+        for k in _PRICE_NUM_FIELDS:
+            v = r.get(k)
+            if v is not None and type(v) is not float:
+                r[k] = safe_float(v)
+    _pretransformed_row_ids.add(rid)
+
+
+_price_arr_cache: Dict[int, Dict[str, Any]] = {}
+
+
+def price_arrays(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """全历史 close/turnover_rate 的 numpy 数组(脏值→nan)，按 id 缓存一次。
+
+    供因子计算向量化(numpy 运算释放 GIL，解锁 optuna n_jobs 多线程)+各 fold 切前缀复用，
+    替代每 fold 对全历史逐行 safe_float(profile 头号热点)。"""
+    rid = id(rows)
+    cached = _price_arr_cache.get(rid)
+    if cached is not None:
+        return cached
+    n = len(rows)
+    close = np.empty(n, dtype=np.float64)
+    turn = np.empty(n, dtype=np.float64)
+    for i, r in enumerate(rows):
+        c = r.get("close")
+        cv = c if type(c) is float else safe_float(c)
+        close[i] = np.nan if cv is None else cv
+        t = r.get("turnover_rate")
+        tv = t if type(t) is float else safe_float(t)
+        turn[i] = np.nan if tv is None else tv
+    cached = {"close": close, "turnover_rate": turn}
+    _price_arr_cache[rid] = cached
+    return cached
 
 
 def first_not_none(*values: Any) -> Optional[float]:
@@ -667,6 +726,41 @@ def pit_liquidity(
     if not tos:
         return None
     return (sum(tos) / len(tos)) / 100.0 * market_cap_cny
+
+
+# ── numpy 向量化版（与上面 rows 版逐字等价，供 optimizer 走缓存数组路径，释放 GIL）──
+def _drawdown_np(close_full: "np.ndarray", asof_len: int) -> Optional[float]:
+    """= high_to_latest_drawdown_pct：全历史(切到asof)过滤>0后 (peak-last)/peak*100。"""
+    ca = close_full[:asof_len]
+    ca = ca[~np.isnan(ca) & (ca > 0.0)]
+    if ca.size < 2:
+        return None
+    peak = float(ca.max())
+    if peak <= 0:
+        return None
+    return (peak - float(ca[-1])) / peak * 100.0
+
+
+def _vol_np(close_full: "np.ndarray", asof_len: int, window: int = 250) -> Optional[float]:
+    """= annualized_vol_from_rows：近 window+1 收盘(先切窗再过滤>0)日收益 std×sqrt(252)。"""
+    w = close_full[:asof_len][-(window + 1):]
+    w = w[~np.isnan(w) & (w > 0.0)]
+    if w.size < 20:
+        return None
+    rets = (w[1:] / w[:-1] - 1.0)
+    return stdev_or_zero(rets.tolist()) * math.sqrt(252)   # 复用原 std 函数保证口径一致
+
+
+def _liquidity_np(turn_full: "np.ndarray", asof_len: int,
+                  market_cap_cny: Optional[float], window: int = 60) -> Optional[float]:
+    """= pit_liquidity：近 window 换手率(先切窗再过滤>0)均值/100 × 总市值。"""
+    if not market_cap_cny:
+        return None
+    w = turn_full[:asof_len][-window:]
+    w = w[~np.isnan(w) & (w > 0.0)]
+    if w.size == 0:
+        return None
+    return float(w.mean()) / 100.0 * market_cap_cny
 
 
 def safe_ratio(numerator: Any, denominator: Any) -> Optional[float]:
@@ -1392,6 +1486,7 @@ def build_long_candidates(
 
         cn_records = (cn_index.get(code) or {}).get("records", [])
         base_price_rows = cn_records or stock_history_records(stock)
+        pretransform_price_rows(base_price_rows)   # 全历史数值字段预转 float 一次，下游 safe_float 走 fast-path
         hist_rows = price_rows_asof(base_price_rows, as_of)
 
         if as_of is None:
@@ -1410,7 +1505,7 @@ def build_long_candidates(
         if min_cap_yi and (market_cap_yi is None or market_cap_yi < min_cap_yi):
             continue
 
-        high_drawdown_pct = historical_high_drawdown_pct(code, stock, as_of=as_of, hist_rows=hist_rows)
+        high_drawdown_pct = _drawdown_np(price_arrays(base_price_rows)["close"], len(hist_rows))
         if require_high_drawdown:
             if high_drawdown_pct is None or high_drawdown_pct < min_high_drawdown_pct:
                 continue
@@ -1420,6 +1515,7 @@ def build_long_candidates(
             high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
             capital_signal=capital_signals.get(code),
             capital_available=capital_availability,
+            price_arr=price_arrays(base_price_rows), asof_len=len(hist_rows),
         )
 
         legacy_industry = (
@@ -1488,6 +1584,8 @@ def compute_long_raw_factors(
         hist_rows: Optional[List[Dict[str, Any]]] = None,
         capital_signal: Optional[Dict[str, Any]] = None,
         capital_available: Optional[Dict[str, bool]] = None,
+        price_arr: Optional[Dict[str, Any]] = None,
+        asof_len: Optional[int] = None,
 ) -> Dict[str, Any]:
     # PIT(as_of 给定)：财报只取截止 as_of 已公告可见的；as_of=None 时原样(实盘)。
     financials = stock.get("financials", {})
@@ -1513,35 +1611,46 @@ def compute_long_raw_factors(
     # 价格行为因子用历史日线（stock_data.history 最长约10年）；PIT 下切到 as_of 之前
     if hist_rows is None:
         hist_rows = price_rows_asof(price_history_rows(code, stock), as_of)
-    hist_closes = [safe_float(row.get("close")) for row in hist_rows]
-    hist_closes = [c for c in hist_closes if c is not None and c > 0]
-    if high_drawdown_pct is None and len(hist_closes) >= 2:
-        peak_close = max(hist_closes)
+    # 价格/换手序列：优先用缓存的全历史 numpy 数组切前缀(向量化释放 GIL、各折复用免重转)，
+    # 无缓存则回退逐行 safe_float。两路数值等价(None/脏值→nan，过滤 >0 同语义)。
+    if price_arr is not None and asof_len is not None:
+        ca = price_arr["close"][:asof_len]
+        ca = ca[~np.isnan(ca) & (ca > 0.0)]                 # 等价 [c for c if c is not None and c>0]
+        ta = price_arr["turnover_rate"][:asof_len]
+    else:
+        _hc = [safe_float(row.get("close")) for row in hist_rows]
+        ca = np.array([c for c in _hc if c is not None and c > 0], dtype=np.float64)
+        ta = np.array([safe_float(row.get("turnover_rate")) if row.get("turnover_rate") is not None
+                       else np.nan for row in hist_rows], dtype=np.float64) if hist_rows else np.empty(0)
+    n_close = ca.size
+
+    if high_drawdown_pct is None and n_close >= 2:
+        peak_close = float(ca.max())
         if peak_close > 0:
-            high_drawdown_pct = (peak_close - hist_closes[-1]) / peak_close * 100.0
+            high_drawdown_pct = (peak_close - float(ca[-1])) / peak_close * 100.0
     reversal_1m = None
     momentum_12_1 = None
     dist_52w_high = None
     reversal_long_term = None
-    if len(hist_closes) >= 21:
-        reversal_1m = hist_closes[-1] / hist_closes[-21] - 1
-    if len(hist_closes) >= 250:
-        momentum_12_1 = hist_closes[-21] / hist_closes[-250] - 1
-    if len(hist_closes) >= 120:
-        window = hist_closes[-250:]
-        peak = max(window)
-        dist_52w_high = hist_closes[-1] / peak if peak > 0 else None
-    if len(hist_closes) >= 750:
-        reversal_long_term = hist_closes[-1] / hist_closes[-750] - 1
+    if n_close >= 21:
+        reversal_1m = float(ca[-1] / ca[-21] - 1)
+    if n_close >= 250:
+        momentum_12_1 = float(ca[-21] / ca[-250] - 1)
+    if n_close >= 120:
+        peak = float(ca[-250:].max())
+        dist_52w_high = float(ca[-1] / peak) if peak > 0 else None
+    if n_close >= 750:
+        reversal_long_term = float(ca[-1] / ca[-750] - 1)
 
-    hist_turnovers = [safe_float(row.get("turnover_rate")) for row in hist_rows]
-    recent_to = [t for t in hist_turnovers[-20:] if t is not None and t > 0]
-    base_to = [t for t in hist_turnovers[-250:] if t is not None and t > 0]
+    recent_arr = ta[-20:]
+    recent_arr = recent_arr[~np.isnan(recent_arr) & (recent_arr > 0.0)]
+    base_arr = ta[-250:]
+    base_arr = base_arr[~np.isnan(base_arr) & (base_arr > 0.0)]
     abnormal_turnover = None
-    if len(recent_to) >= 10 and len(base_to) >= 60:
-        base_avg = sum(base_to) / len(base_to)
+    if recent_arr.size >= 10 and base_arr.size >= 60:
+        base_avg = float(base_arr.mean())
         if base_avg > 1e-9:
-            abnormal_turnover = (sum(recent_to) / len(recent_to)) / base_avg
+            abnormal_turnover = float(recent_arr.mean() / base_avg)
 
     roe_values = [safe_float(row.get("roe")) for row in indicators]
     roe_values = [v for v in roe_values if v is not None]
@@ -1608,9 +1717,13 @@ def compute_long_raw_factors(
         dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
         dividend_consistency = 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0
     else:
-        low_volatility = annualized_vol_from_rows(hist_rows)
-        liquidity = pit_liquidity(hist_rows, market_cap_cny)
-        price_asof = hist_closes[-1] if hist_closes else None
+        if price_arr is not None and asof_len is not None:
+            low_volatility = _vol_np(price_arr["close"], asof_len)
+            liquidity = _liquidity_np(price_arr["turnover_rate"], asof_len, market_cap_cny)
+        else:
+            low_volatility = annualized_vol_from_rows(hist_rows)
+            liquidity = pit_liquidity(hist_rows, market_cap_cny)
+        price_asof = float(ca[-1]) if n_close else None
         dividend_yield_5y = scale_ratio_to_pct(
             dividend_yield(stock, years=5, as_of=as_of, price=price_asof)
         )

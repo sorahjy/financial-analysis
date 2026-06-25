@@ -11,8 +11,8 @@ The optimizer deliberately separates two layers:
    excess return on the available recent window with risk, hit rate, and for
    short-term Dragon Tiger List picks, event-quality statistics.
 
-Run 1000 iterations per strategy:
-    python3 -B stock_strategy_optimizer.py --iterations 1000
+Run 1500 iterations per strategy:
+    python3 -B stock_strategy_optimizer.py --iterations 1500
 """
 
 from __future__ import annotations
@@ -21,7 +21,9 @@ import argparse
 import copy
 import json
 import math
+import os
 import random
+import threading
 from contextlib import nullcontext
 from html import escape as html_escape
 from datetime import datetime
@@ -42,6 +44,8 @@ try:
     from tqdm import tqdm
 except ImportError:  # tqdm 只影响 CLI 进度展示，不影响优化逻辑
     tqdm = None
+
+import numpy as np
 
 import stock_storage
 from stock_advanced_strategies import (
@@ -81,7 +85,7 @@ BENCHMARK_COMPONENTS = [
     ("510580", DATA_DIR / "csi500_etf_nav.json"),  # 中证500 ETF
 ]
 LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
-DEFAULT_OPTIMIZATION_ITERATIONS = 1000
+DEFAULT_OPTIMIZATION_ITERATIONS = 1500
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
 # 每 60 个交易日取一折，固定持有 60 个交易日；相邻完整折首尾衔接。
@@ -872,6 +876,33 @@ def select_best_long_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
     return max(valid, key=lambda r: r["objective"])
 
 
+_prepared_matrix_cache: Dict[int, Any] = {}
+_prepared_matrix_lock = threading.Lock()
+
+
+def _prepared_matrix(prepared: List[Dict[str, Any]]):
+    """把 prepared 的因子分预转成 (score_matrix[n股×n因子], items) numpy 矩阵，按 id 缓存。
+
+    供 score_prepared 向量化加权(矩阵×权重向量,释放 GIL)，各 trial 复用同一 pit 的矩阵。
+    预热阶段构建一次后只读;n_jobs 多线程下 setdefault 幂等(CPython dict 原子)。"""
+    key = id(prepared)
+    cached = _prepared_matrix_cache.get(key)
+    if cached is not None:
+        return cached
+    n = len(prepared)
+    nf = len(LONG_FACTORS)
+    matrix = np.empty((n, nf), dtype=np.float64)
+    items = []
+    for i, row in enumerate(prepared):
+        s = row["scores"]
+        for j, spec in enumerate(LONG_FACTORS):
+            matrix[i, j] = s.get(spec.key, spec.missing_score)
+        items.append(row["item"])
+    cached = (matrix, items)
+    _prepared_matrix_cache[key] = cached
+    return cached
+
+
 def prepare_candidate_factor_scores(
     items: List[Dict[str, Any]],
     specs: List[Any],
@@ -906,43 +937,57 @@ def score_prepared_long_candidates(
     weights = config.get("weights", {})
     min_score = safe_float(config.get("min_score")) or 0.0
     top_n = max(0, int(first_not_none(config.get("top_n"), 30)))
+
+    # 权重向量(config 级，所有股票相同)：缺失/脏值→默认权重，负→0。等价原逐因子 weight 逻辑。
+    w = np.empty(len(LONG_FACTORS), dtype=np.float64)
+    for j, spec in enumerate(LONG_FACTORS):
+        v = safe_float(weights.get(spec.key))
+        w[j] = max(0.0, v if v is not None else spec.default_weight)
+    weight_sum = float(w.sum())
+    positive_weight_count = int((w > 0.0).sum())
+
     scored = []
-
-    for row in prepared:
-        item = row["item"]
-        if not passes_long_hard_filters(item, config):
-            continue
-        if not has_trade_on_date(entry_series, item.get("code"), as_of):
-            continue
-        raw = item.get("raw_factors", {})
-        prepared_scores = row["scores"]
-        factor_scores = {} if include_details else None
-        weighted_sum = 0.0
-        weight_sum = 0.0
-        positive_weight_count = 0
-
-        for spec in LONG_FACTORS:
-            weight = safe_float(weights.get(spec.key))
-            if weight is None:
-                weight = spec.default_weight
-            weight = max(0.0, weight)
-            score = prepared_scores.get(spec.key, spec.missing_score)
-            if weight > 0:
-                weighted_sum += score * weight
-                weight_sum += weight
-                positive_weight_count += 1
-            if factor_scores is not None:
+    if not include_details:
+        # 主路径(评估)：totals = (因子分矩阵 @ 权重) / weight_sum，numpy 向量化释放 GIL；过滤逐股保留。
+        matrix, items = _prepared_matrix(prepared)
+        with np.errstate(all="ignore"):   # 被硬过滤股票的 nan/inf/overflow 运算噪声;它们随后过滤掉,结果同原标量版
+            totals = (matrix @ w) / weight_sum if weight_sum > 0 else np.zeros(len(items))
+        for i, item in enumerate(items):
+            if not passes_long_hard_filters(item, config):
+                continue
+            if not has_trade_on_date(entry_series, item.get("code"), as_of):
+                continue
+            total = round(float(totals[i]), 2)
+            if total < min_score:
+                continue
+            scored.append((total, item, positive_weight_count, None))
+    else:
+        # 明细路径(repr 选股，少量调用)：逐因子保留 factor_scores 明细。
+        for row in prepared:
+            item = row["item"]
+            if not passes_long_hard_filters(item, config):
+                continue
+            if not has_trade_on_date(entry_series, item.get("code"), as_of):
+                continue
+            raw = item.get("raw_factors", {})
+            prepared_scores = row["scores"]
+            factor_scores = {}
+            weighted_sum = 0.0
+            for j, spec in enumerate(LONG_FACTORS):
+                weight = float(w[j])
+                score = prepared_scores.get(spec.key, spec.missing_score)
+                if weight > 0:
+                    weighted_sum += score * weight
                 factor_scores[spec.key] = {
                     "label": spec.label,
                     "raw": clean_round(raw.get(spec.key), 6),
                     "score": round(score, 2),
                     "weight": round(weight, 4),
                 }
-
-        total = round(weighted_sum / weight_sum if weight_sum > 0 else 0.0, 2)
-        if total < min_score:
-            continue
-        scored.append((total, item, positive_weight_count, factor_scores))
+            total = round(weighted_sum / weight_sum if weight_sum > 0 else 0.0, 2)
+            if total < min_score:
+                continue
+            scored.append((total, item, positive_weight_count, factor_scores))
 
     scored.sort(key=lambda entry: entry[0], reverse=True)
     result = []
@@ -1291,6 +1336,13 @@ def advance_progress(progress) -> None:
         progress.update(1)
 
 
+# trial 并行度默认 1。实测多线程在本场景是负收益，故只向量化(单核提速)、默认不并行：
+#   ① 预热以财报计算(纯 python)为主=GIL-bound，ThreadPool 并行因 GIL 争用反而更慢(53.7s vs 串行23.2s)，故预热串行；
+#   ② optuna n_jobs>1 多线程并发退化 TPE 序贯采样、降搜索质量(实测 8 trials best -7.69→-13.6)。
+# 真正吃满多核需多进程重写(绕 GIL + 异步 ask/tell + series 跨进程)，ROI 存疑。要试可 env OPTUNA_TRIAL_JOBS=N。
+OPTUNA_TRIAL_JOBS = max(1, int(os.environ.get("OPTUNA_TRIAL_JOBS", "1")))
+
+
 def _run_config_search(
     iterations,
     rng,
@@ -1300,6 +1352,7 @@ def _run_config_search(
     random_config,
     record,
     progress_label: str,
+    n_jobs: int = 1,
 ) -> str:
     """跑 iterations 次配置搜索。有 optuna → TPE 贝叶斯（第1次试默认基线 + 随机预热后后验采样）；
     否则回退随机搜索。suggest(trial)->(cfg,extra)；random_config(i)->(cfg,extra)；
@@ -1323,7 +1376,7 @@ def _run_config_search(
                 finally:
                     advance_progress(progress)
 
-            study.optimize(objective, n_trials=iterations, n_jobs=1)
+            study.optimize(objective, n_trials=iterations, n_jobs=n_jobs)
         return (f"参数搜索：Optuna TPE 贝叶斯优化（{iterations} trials，第1次为默认配置基线，"
                 f"前 {startup_trials} 次保留随机/默认预热，之后按代理目标的后验采样选下一组参数；"
                 "代理目标本身存在过拟合/前视风险，"
@@ -1356,13 +1409,18 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
     pit_cache: Dict[str, List[Dict[str, Any]]] = {}       # as_of -> PIT broad 候选预评分
     fold_stats_cache: Dict[Tuple[str, int, Tuple[str, ...]], Optional[Dict[str, float]]] = {}
     notes: List[str] = list(universe_notes)
+    _notes_lock = threading.Lock()
+    _fold_stats_lock = threading.Lock()
 
     def get_pit(as_of: str) -> List[Dict[str, Any]]:
         if as_of not in pit_cache:
             cands, nts = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
-            pit_cache[as_of] = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-            if not notes:
-                notes.extend(nts)
+            pit = prepare_candidate_factor_scores(cands, LONG_FACTORS)
+            _prepared_matrix(pit)              # 预构因子分矩阵(预热期建好，trial 期只读)
+            pit_cache[as_of] = pit             # 末尾赋值；并发同 as_of 最多重复算(幂等)
+            with _notes_lock:
+                if not notes:
+                    notes.extend(nts)
         return pit_cache[as_of]
 
     def get_fold_stats(
@@ -1371,11 +1429,18 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         hold_td: int,
     ) -> Optional[Dict[str, float]]:
         key = (as_of, hold_td, tuple(p["code"] for p in picks))
-        if key not in fold_stats_cache:
-            fold_stats_cache[key] = portfolio_fold_stats(
-                picks, series, benchmark_series, as_of, hold_td
-            )
-        return fold_stats_cache[key]
+        with _fold_stats_lock:
+            if key in fold_stats_cache:
+                return fold_stats_cache[key]
+        val = portfolio_fold_stats(picks, series, benchmark_series, as_of, hold_td)  # 锁外算(慢)
+        with _fold_stats_lock:
+            fold_stats_cache[key] = val
+        return val
+
+    # 串行预热所有折的 PIT(填 pit_cache + 因子分矩阵)，使 trial 期缓存只读、n_jobs 多线程安全。
+    # 不用 ThreadPool：预热是 GIL-bound 的财报计算为主，多线程并行因 GIL 争用反而更慢(见上方常量说明)。
+    for _as_of in sorted({d for dates in fold_dates_by_hold.values() for d in dates}):
+        get_pit(_as_of)
 
     def evaluate_long(cfg: Dict[str, Any], hold_td: int) -> Tuple[float, Dict[str, Any]]:
         fold_dates = fold_dates_by_hold[hold_td]
@@ -1438,6 +1503,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         ),
         record=_record,
         progress_label="长线参数搜索",
+        n_jobs=OPTUNA_TRIAL_JOBS,
     )
     best = select_best_long_trace(trace)
     return {

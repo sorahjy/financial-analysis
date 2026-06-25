@@ -14,6 +14,7 @@ load_stock() 把行重新拼回原 JSON dict，消费方(stock_advanced_strategi
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from datetime import datetime
@@ -35,6 +36,11 @@ DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
 SCHEMA_VERSION = 4
 SQLITE_BUSY_TIMEOUT_MS = 120000
+# 批量刷新友好的连接级调优（均为连接局部或不写库文件，不扰动 user_version/mtime）：
+#   cache_size 负值=KB，每连接一块页缓存减少大表反复读盘（多线程下 N 连接各占一份，故默认偏保守 16MB）；
+#   wal_autocheckpoint 调大，批量写时少做 checkpoint 抖动（连接关闭/末尾自然收尾）。env 可覆盖。
+SQLITE_CACHE_SIZE_KB = -int(os.getenv("STOCK_SQLITE_CACHE_MB", "16")) * 1024
+SQLITE_WAL_AUTOCHECKPOINT = int(os.getenv("STOCK_SQLITE_WAL_AUTOCHECKPOINT", "4000"))
 
 # 大表列：8 个日频行情字段 + 5 个估值字段，与 stock_crawl_common 的 canonical schema 同源。
 HISTORY_COLUMNS: tuple = tuple(HISTORY_PRICE_FIELDS) + tuple(HISTORY_VALUATION_FIELDS)
@@ -75,6 +81,10 @@ def connect(db_file: Path | str = DEFAULT_DB_FILE) -> sqlite3.Connection:
             conn.execute("PRAGMA foreign_keys = ON")
             conn.execute("PRAGMA journal_mode = WAL")
             conn.execute("PRAGMA synchronous = NORMAL")
+            # 让 strategies 那步对 ~300 万行的 ORDER BY/GROUP BY 临时结果走内存而非落盘临时文件。
+            conn.execute("PRAGMA temp_store = MEMORY")
+            conn.execute(f"PRAGMA cache_size = {SQLITE_CACHE_SIZE_KB}")
+            conn.execute(f"PRAGMA wal_autocheckpoint = {SQLITE_WAL_AUTOCHECKPOINT}")
             ensure_schema(conn)
     return conn
 
@@ -290,7 +300,6 @@ def save_stock(
                         _HISTORY_INSERT_SQL,
                         [_history_value_tuple(code, record) for record in records],
                     )
-                _sync_sw3_member_market_cap_from_history(conn, code)
     return code
 
 
@@ -302,11 +311,14 @@ def upsert_history_records(
     *,
     source: str = "stock_history_upsert",
     price_adjust: str = "qfq",
+    daily_stats: Optional[Mapping[str, Any]] = None,
 ) -> int:
     """只增量写入 stock_history，并保留 stock_meta 里的财报/指标等 JSON blob。
 
     适合短线/雷达这类临时补 K 线场景：不需要构造整只股票 payload，也不能因为补日线
     把已有 financials_json / indicators_json / dividends_json 覆盖成空。
+    daily_stats 给定时一并刷新 daily_stats_json（价格爬虫增量快路用，避免读回整只再 dump 财报 blob）。
+    market_cap 不再逐只同步到 sw3_member——见 sync_sw3_member_market_caps（爬完批量跑一次）。
     """
     code = _normalize_code(code)
     if not code:
@@ -359,7 +371,11 @@ def upsert_history_records(
                 _HISTORY_INSERT_SQL,
                 [_history_value_tuple(code, row) for row in rows],
             )
-            _sync_sw3_member_market_cap_from_history(conn, code)
+            if daily_stats:
+                conn.execute(
+                    "UPDATE stock_meta SET daily_stats_json = ? WHERE code = ?",
+                    (_json_or_none(daily_stats), code),
+                )
     return len(rows)
 
 
@@ -679,19 +695,30 @@ def _latest_history_market_caps(conn: sqlite3.Connection, codes: Sequence[str]) 
     return out
 
 
-def _sync_sw3_member_market_cap_from_history(conn: sqlite3.Connection, code: str) -> int:
-    """把该股票 stock_history 最新非空 market_cap 同步到 sw3_member.market_cap_yi。"""
-    norm = _normalize_code(code)
+def sync_sw3_member_market_caps(
+    conn: sqlite3.Connection, codes: Optional[Sequence[str]] = None
+) -> int:
+    """批量把 sw3_member.market_cap_yi 刷成各股 stock_history 最新非空总市值(亿元)。
+
+    取代旧的「每次 save_stock/upsert 都查 stock_history 大表同步单只」热路开销：整轮爬完后
+    调一次即可（_latest_history_market_caps 已按 500 分批，全量同步只需 ~N/500 条查询）。
+    codes=None 同步全部 sw3_member；读端 pool_members 仍对残留 NULL 做兜底。返回写入的行数。
+    """
+    if codes is None:
+        codes = [row["code"] for row in conn.execute("SELECT code FROM sw3_member")]
+    norm = sorted({_normalize_code(c) for c in codes if _normalize_code(c)})
     if not norm:
         return 0
-    cap = _latest_history_market_caps(conn, [norm]).get(norm)
-    if cap is None:
+    caps = _latest_history_market_caps(conn, norm)
+    if not caps:
         return 0
-    cur = conn.execute(
-        "UPDATE sw3_member SET market_cap_yi = ? WHERE code = ?",
-        (cap, norm),
-    )
-    return cur.rowcount
+    with _WRITE_LOCK:
+        with conn:
+            conn.executemany(
+                "UPDATE sw3_member SET market_cap_yi = ? WHERE code = ?",
+                [(cap, code) for code, cap in caps.items()],
+            )
+    return len(caps)
 
 
 _POOL_FLAG_COL = {"leader": "is_leader", "hotmoney": "is_hot_money"}

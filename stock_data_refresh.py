@@ -335,6 +335,20 @@ def refresh_stock_universe() -> Dict[str, Any]:
     return {"csi300": len(csi300), "all": len(csi_all), "used_cache": used_cache}
 
 
+def sync_sw3_market_caps() -> Dict[str, Any]:
+    """整轮爬完后批量把各股 stock_history 最新总市值同步进 sw3_member.market_cap_yi。
+
+    取代旧的「每次 save_stock 都查 stock_history 大表同步单只」热路开销；读端 pool_members
+    仍对残留 NULL 做兜底，故本步骤纯属把雷达/龙头池要用的市值列一次性刷新到位。
+    """
+    conn = ss.connect()
+    try:
+        updated = ss.sync_sw3_member_market_caps(conn)
+    finally:
+        conn.close()
+    return {"sw3_members_market_cap_synced": updated}
+
+
 def collect_data_health() -> Dict[str, Any]:
     conn = ss.connect()
     try:
@@ -448,6 +462,14 @@ def refresh_before_server(
                 fill_stock_history_from_local_data,
             )
         )
+
+    steps.append(
+        local_step_result(
+            "sync_sw3_market_caps",
+            "batch sync latest market cap from stock_history -> sw3_member.market_cap_yi",
+            sync_sw3_market_caps,
+        )
+    )
 
     steps.append(
         run_step(
