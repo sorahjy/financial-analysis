@@ -74,7 +74,6 @@ from stock_advanced_strategies import (
 
 OUTPUT_FILE = DATA_DIR / "stock_strategy_optimization.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
-OPTIMIZED_CONFIG_BACKUP_FILE = Path(__file__).resolve().parent / "meta_data_backup" / "stock_strategy_optimized_config.json"
 # 长线超额基准：沪深300 与 中证500 按日等权再平衡的混合指数（各占50%）。
 # 不直接用中证800：中证800按市值加权、前300只占权重大头，走势≈沪深300，体现不出中盘；
 # 50/50 等权混合让大盘与中盘平权，更贴合本策略选股域。
@@ -2198,15 +2197,9 @@ def run_optimization(
             },
             "caveat": "基于当前可用的本地/代理数据优化；刷新历史价格与龙虎榜快照后建议重新运行。",
         }
-        save_optimized_config_snapshot(optimized_config)
-    return result
-
-
-def save_optimized_config_snapshot(optimized_config: Dict[str, Any]) -> None:
-    for path in (OPTIMIZED_CONFIG_FILE, OPTIMIZED_CONFIG_BACKUP_FILE):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fp:
+        with open(OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
             json.dump(optimized_config, fp, ensure_ascii=False, indent=2)
+    return result
 
 
 LONG_SUMMARY_FIELDS = [
@@ -2322,7 +2315,6 @@ def main() -> None:
     if not args.no_persist:
         print(f"\n已保存优化结果: {OUTPUT_FILE}")
         print(f"已保存优化默认配置: {OPTIMIZED_CONFIG_FILE}")
-        print(f"已同步优化默认配置备份: {OPTIMIZED_CONFIG_BACKUP_FILE}")
 
 
 if __name__ == "__main__":
