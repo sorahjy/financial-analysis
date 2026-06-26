@@ -978,6 +978,35 @@ def load_recent_history_records(
     ]
 
 
+def load_recent_news(conn: sqlite3.Connection, code: str, *,
+                     since: Optional[str] = None, until: Optional[str] = None,
+                     limit: int = 50) -> List[Dict[str, Any]]:
+    """取该 code 近端新闻(降序)；stock_news 表由 stock_crawl_news.py 建，缺表返回 []。
+
+    since/until 按 pub_time 过滤（until 供 as-of PIT 防泄漏，只取该时点前的新闻）。
+    """
+    code = _normalize_code(code)
+    if not code:
+        return []
+    where = ["code = ?"]
+    params: List[Any] = [code]
+    if since:
+        where.append("pub_time >= ?")
+        params.append(str(since))
+    if until:
+        where.append("pub_time <= ?")
+        params.append(str(until))
+    params.append(int(limit))
+    try:
+        rows = conn.execute(
+            f"SELECT pub_time, title, source, url, keyword, themes FROM stock_news "
+            f"WHERE {' AND '.join(where)} ORDER BY pub_time DESC LIMIT ?", params,
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return []   # 新闻表尚未建立（未爬过新闻）
+    return [dict(r) for r in rows]
+
+
 def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:
     row = conn.execute(
         "SELECT history_refetched_at FROM stock_meta WHERE code = ?", (_normalize_code(code),)

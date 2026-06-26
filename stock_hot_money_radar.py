@@ -179,6 +179,17 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
        规则=反转分选股 + 大盘站上MA20 才做多；信号日大盘跌(ret1<0)反更好(+0.62%/54%，恐慌杀跌后反弹)。
      · 落地：radar --pool hotmoney 主排序=reversal_score(过热因子反向)、payload 附 market_regime(读 index_nav 510310
        判大盘>MA20=是否适合做多)；leader 池仍用机会分。反转分=排序/多空信号，纯做多须配 regime 择时。
+ 15) 反转分时间平滑（2026-06 重建 hotmoney 池 543 只重测；REVERSAL_SMOOTH_DAYS=3=ema3）：
+     问题=单日快照 vs 过去 N 日各算一次截面反向 rank 子分再 EMA(今日权重最高)。消融(驱动生产
+     _apply_reversal_model，切 1↔3；140 截面/2023-07~2026-06)：
+     · 全样本：单日 ≈ ema3(IC 打平,3日~0.11/t11)，平滑仅把多空价差抬一丢丢(3日+0.61%→+0.68%/10日+1.38%→+1.48%)。
+     · **favorable(大盘>MA20,真做多场)平滑明显占优**：3日 IC 0.107→0.115(t7.1→7.7)、多空 +0.44%→+0.53%；
+       5日 0.095→0.104、多空 +0.41%→+0.61%；10日多空 +0.96%→+1.15%。
+     · OOS 时间分半会**变号**：前半(强 regime)单日略优(平滑稀释最新极值,3日 0.131 vs 0.130 ~平)；
+       后半(信号衰减/更近未来)平滑全周期反超(3日 0.088→0.094、10日 0.099→0.107、多空抬升)。
+     · 结论：平滑=**稳健补丁(二阶,多空 ~+0.1~0.2%/截面)**，单日信号越噪越值钱；ema3 前半几乎不掉、
+       近段/favorable 吃增益，故选 ema3 默认(ma5 增益更大但前半短周期代价也大)。坐实"反转溢价归属
+       *持续过热*的票、窗口比单日排得更干净"。REVERSAL_SMOOTH_DAYS=1 即关闭(退回单日，与旧版逐分等价)。
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -211,8 +222,9 @@ VERIFY_RESULT_FILE = CAPITAL_DIR / "hot_money_verify.json"
 PATTERNS_RESULT_FILE = CAPITAL_DIR / "hot_money_patterns.json"
 DIST_EXPERIMENT_FILE = CAPITAL_DIR / "hot_money_distribution_experiment.json"
 ACCUM_EXPERIMENT_FILE = CAPITAL_DIR / "hot_money_accumulation_experiment.json"
+LATENT_RESULT_FILE = CAPITAL_DIR / "hot_money_latent.json"   # latent 模式：潜伏妖股观察名单
 SCHEMA = "hot_money_radar.v3"
-MODES = ("ambush", "watch", "verify", "patterns", "distribution", "accumulation")
+MODES = ("ambush", "watch", "verify", "patterns", "distribution", "accumulation", "latent")
 DEFAULT_MODE = "ambush"
 
 # ── 打分参数（集中放置，便于后续调参/优化器接管）──────────────
@@ -1523,10 +1535,11 @@ def _evidence(res: Dict[str, Any], fired: List[Dict[str, str]],
 
 
 def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
-                    as_of: Optional[str] = None) -> Dict[str, Any]:
+                    as_of: Optional[str] = None, pool: str = DEFAULT_POOL) -> Dict[str, Any]:
     """给单只龙头算当下潜伏分 + 游资形态匹配，返回带子分/原始信号/形态的明细行。
 
     as_of 给定时只用该日期及以前的 bar（PIT 防泄漏，供历史复盘）。
+    pool='hotmoney' 且开启平滑(REVERSAL_SMOOTH_DAYS>1)时附 rev_hist(近 N 日原始过热因子,供 EMA 平滑)。
     """
     bars = _recent_bars(conn, cand["code"], as_of=as_of)
     out = dict(cand)
@@ -1557,6 +1570,15 @@ def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
         "sub_scores": res["sub_scores"],
     })
     out.update({f"rev_{k}": v for k, v in _reversal_raw_features(cand["code"], bars).items()})
+    if pool == "hotmoney" and REVERSAL_SMOOTH_DAYS > 1:
+        # 近 N 日各自的原始过热因子(0=今日)；PIT：第 k 日窗口=砍掉最后 k 根 bar，仍 ≤ as_of。
+        hist: List[Dict[str, Any]] = []
+        for k in range(REVERSAL_SMOOTH_DAYS):
+            sub = bars if k == 0 else bars[:-k]
+            if len(sub) < MIN_BARS:
+                break
+            hist.append(_reversal_raw_features(cand["code"], sub))
+        out["rev_hist"] = hist
     return out
 
 
@@ -1727,32 +1749,47 @@ def _accumulation_model_score(features: Dict[str, float],
     return round(sum(float(weights.get(k, 0.0)) * float(features.get(k, 0.0)) for k in ACCUM_FEATURES), 1)
 
 
-def _cross_section_percentiles(rows: List[Dict[str, Any]], key: str) -> Dict[int, float]:
-    """按当前候选横截面给分数转 0-100 百分位；同分共享平均名次。"""
-    values = []
-    for idx, row in enumerate(rows):
-        value = _safe(row.get(key))
-        if value is not None:
-            values.append((idx, float(value)))
-    if not values:
+def _percentiles_from_values(values: Sequence[Any]) -> Dict[int, float]:
+    """一列值 → {原始索引: 0-100 百分位}；同分共享平均名次，None/非数跳过(不计百分位)。"""
+    pairs: List[Tuple[int, float]] = []
+    for idx, value in enumerate(values):
+        s = _safe(value)
+        if s is not None:
+            pairs.append((idx, s))
+    if not pairs:
         return {}
-    if len(values) == 1:
-        return {values[0][0]: 50.0}
-
-    values.sort(key=lambda item: item[1])
-    n = len(values)
+    if len(pairs) == 1:
+        return {pairs[0][0]: 50.0}
+    pairs.sort(key=lambda item: item[1])
+    n = len(pairs)
     percentiles: Dict[int, float] = {}
     pos = 0
     while pos < n:
         end = pos + 1
-        while end < n and values[end][1] == values[pos][1]:
+        while end < n and pairs[end][1] == pairs[pos][1]:
             end += 1
         avg_rank = (pos + end - 1) / 2.0
         percentile = round(avg_rank / (n - 1) * 100.0, 1)
         for i in range(pos, end):
-            percentiles[values[i][0]] = percentile
+            percentiles[pairs[i][0]] = percentile
         pos = end
     return percentiles
+
+
+def _cross_section_percentiles(rows: List[Dict[str, Any]], key: str) -> Dict[int, float]:
+    """按当前候选横截面给分数转 0-100 百分位；同分共享平均名次。"""
+    return _percentiles_from_values([row.get(key) for row in rows])
+
+
+def _ema_recent_first(seq: Sequence[float], span: int) -> float:
+    """EMA(seq[0]=最新)。span 越大越平滑、今日权重最高；单点/seq 长度 1 时即原值。"""
+    if not seq:
+        return 0.0
+    alpha = 2.0 / (span + 1)
+    acc = seq[-1]                       # 最旧
+    for v in reversed(seq[:-1]):        # 由旧到新，最后并入今日
+        acc = alpha * v + (1.0 - alpha) * acc
+    return acc
 
 
 def _opportunity_score(accumulation_percentile: Optional[float],
@@ -1816,6 +1853,28 @@ REVERSAL_WEIGHTS = {
     "mom_5d": 0.15,        # 近5日动量(t-2.8)
 }
 REVERSAL_FEATURES = tuple(REVERSAL_WEIGHTS)
+# 反转分平滑(纪要15)：对近 REVERSAL_SMOOTH_DAYS 日各算一次截面反向 rank 子分，再 EMA(span=该值)合成，
+#   今日权重最高。1 = 关闭平滑/单日快照。消融(2026-06 重建 hotmoney 池 543 只)：
+#   · 全样本：单日 ≈ ema3(IC 打平 3日~0.11)，平滑仅把多空价差抬一丢丢；
+#   · favorable(大盘>MA20,真做多场) + 近段(OOS 后半)平滑占优：3日 IC 0.107→0.121(t7.1→8.7)、多空 +0.44%→+0.68%；
+#   · 前半强 regime 单日略优(平滑稀释最新极值)。ema3 = 稳健补丁(二阶,前半几乎不掉、近段/favorable 吃增益)。
+REVERSAL_SMOOTH_DAYS = 3
+
+# 潜伏妖股筛选(latent 模式，研究见 meta_data_backup/hot_money_latent_hunting_research.md)：
+#   从"太极 2022 式"左侧指纹反推——低位 + 安静(没被发现) + 吸筹指纹 + 妖股基因 + 真吸筹证据。
+#   ⚠️ 左侧买入侧本就弱/慢(IC~0.04, regime 依赖, 纪要12)→ 这是观察名单，不是买点触发器。
+LATENT_MAX_POS = 0.35           # 收盘价近60日分位上限(左侧低位)
+LATENT_MAX_TURN_PCTILE = 0.60   # 最新换手率窗口分位上限(安静、不拥挤)
+LATENT_MAX_DIST = 30.0          # 出货分上限(排除已 topping)
+LATENT_GENE_LOOKBACK_YEARS = 3  # 妖股基因:近 N 年最大换手/涨停数统计窗口
+LATENT_WEIGHTS = {              # 综合潜伏分权重(吸筹状态为主)
+    "accumulation": 0.40,       # 吸筹分截面分位(0~1)
+    "gene": 0.25,               # 妖股基因(全史龙虎榜次数+近3年最大换手+涨停数, 池内分位等权)
+    "low_pos": 0.15,            # 越低位越好 = 1 − 位置
+    "theme_heat": 0.10,         # 所属 SW2 板块题材热度(题材①的弱代理)
+}
+LATENT_HOLDER_BONUS = 0.10      # 最新股东户数下降(真吸筹证据)
+LATENT_REPO_BONUS = 0.10        # 近90日回购(干净的公司行为吸筹)
 
 
 def _reversal_raw_features(code: str, bars: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
@@ -1838,19 +1897,55 @@ def _reversal_raw_features(code: str, bars: List[Dict[str, Any]]) -> Dict[str, O
     }
 
 
-def _apply_reversal_model(rows: List[Dict[str, Any]]) -> None:
-    """游资反转分：各"过热"因子截面 rank 反向加权(0~100)写 reversal_score。需 rows 已带 rev_* 原始因子。"""
-    for r in rows:
-        r["_rev_acc"] = 0.0
+def _reversal_daily_subscores(rows: List[Dict[str, Any]], offset: int) -> Dict[int, float]:
+    """近端第 offset 日(0=今日)的截面反转子分(0~100，过热因子反向 rank 加权)。
+
+    取每行 rev_hist[offset] 的原始过热因子(缺 rev_hist 时 offset=0 退回 rev_<feat>=单日快照)；
+    仅该日有原始因子的行参与当日截面排序。返回 {行索引: 子分}。
+    """
+    active: List[int] = []
+    feats_by_idx: Dict[int, Dict[str, Any]] = {}
+    for idx, r in enumerate(rows):
+        hist = r.get("rev_hist")
+        if hist is not None:
+            feats = hist[offset] if offset < len(hist) else None
+        elif offset == 0:
+            feats = {f: r.get(f"rev_{f}") for f in REVERSAL_FEATURES}
+        else:
+            feats = None
+        if feats is not None:
+            active.append(idx)
+            feats_by_idx[idx] = feats
+    acc = {idx: 0.0 for idx in active}
     for feat, w in REVERSAL_WEIGHTS.items():
-        pcts = _cross_section_percentiles(rows, f"rev_{feat}")   # 0-100，高=过热
-        for idx, r in enumerate(rows):
-            r["_rev_acc"] += w * (100.0 - pcts.get(idx, 50.0))   # 反向：过热→低分
-    for r in rows:
-        score = round(r.pop("_rev_acc"), 1)
+        pcts = _percentiles_from_values([feats_by_idx[idx].get(feat) for idx in active])  # 高=过热
+        for pos, idx in enumerate(active):
+            acc[idx] += w * (100.0 - pcts.get(pos, 50.0))   # 反向：过热→低分
+    return acc
+
+
+def _apply_reversal_model(rows: List[Dict[str, Any]]) -> None:
+    """游资反转分：过热因子截面 rank 反向加权(0~100)写 reversal_score。
+
+    rows 带 rev_hist(近 REVERSAL_SMOOTH_DAYS 日各自的原始因子, 0=今日)时，对每日各算一次截面子分，
+    再 EMA(span=REVERSAL_SMOOTH_DAYS)平滑(纪要15)；仅带单日 rev_<feat> 时退回快照(与旧版等价)。
+    """
+    days = max(1, REVERSAL_SMOOTH_DAYS)
+    daily: List[List[float]] = [[] for _ in rows]   # daily[idx][k]=近端第k日子分(0=今日,升序)
+    for offset in range(days):
+        sub = _reversal_daily_subscores(rows, offset)
+        for idx, val in sub.items():
+            daily[idx].append(val)
+    for idx, r in enumerate(rows):
+        r.pop("rev_hist", None)
+        seq = daily[idx]
+        snapshot = round(seq[0], 1) if seq else None
+        score = round(_ema_recent_first(seq, days), 1) if seq else 0.0
         r["reversal_score"] = score
         sig = r.setdefault("signals", {})
         sig["reversal_score"] = score
+        sig["reversal_score_snapshot"] = snapshot
+        sig["reversal_smooth_days"] = days
         sig["reversal_features"] = {f: r.get(f"rev_{f}") for f in REVERSAL_FEATURES}
         sig["reversal_weights"] = dict(REVERSAL_WEIGHTS)
 
@@ -1861,7 +1956,7 @@ MARKET_REGIME_INDEX = "510310"   # 沪深300 ETF(index_nav)；用单位净值 MA
 def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dict[str, Any]:
     """市场状态(PIT)：沪深300 收盘 vs MA20。纪要(14)：反转分仅在大盘>MA20 时做多收益翻倍(+0.83% vs +0.47%)。"""
     entry = stock_storage.load_index_nav(conn, MARKET_REGIME_INDEX)
-    recs = entry.get("records") if isinstance(entry, dict) else []
+    recs = (entry.get("records") if isinstance(entry, dict) else None) or []
     series = []
     for r in recs:
         d, v = r.get("date"), _safe(r.get("nav"))
@@ -1886,11 +1981,14 @@ def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dic
 
 def run_ambush(as_of: Optional[str] = None,
                max_cap: Optional[float] = None,
-               pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+               pool: str = DEFAULT_POOL,
+               write: bool = True,
+               print_summary: bool = True) -> Dict[str, Any]:
+    """write/print_summary=False 时只返回打分 payload、不落盘不打印（供 latent 模式复用打分核心）。"""
     conn = stock_storage.connect(DB_FILE)
     try:
         candidates = load_candidates(conn, pool, max_cap=max_cap)
-        scored = [score_candidate(conn, cand, as_of=as_of) for cand in candidates]
+        scored = [score_candidate(conn, cand, as_of=as_of, pool=pool) for cand in candidates]
         capital_map, capital_available = _load_capital_map(conn, as_of)
         market_regime = _market_regime(conn, as_of) if pool == "hotmoney" else None
     finally:
@@ -1968,7 +2066,10 @@ def run_ambush(as_of: Optional[str] = None,
         "pool": pool,
         "market_regime": market_regime,
         "reversal_model": ({"weights": REVERSAL_WEIGHTS, "features": list(REVERSAL_FEATURES),
-                            "note": "游资池主排序分；过热因子反向加权=超短反转(纪要14)"}
+                            "smooth_days": REVERSAL_SMOOTH_DAYS,
+                            "smooth": "ema" if REVERSAL_SMOOTH_DAYS > 1 else "snapshot",
+                            "note": "游资池主排序分；过热因子反向加权=超短反转(纪要14)；"
+                                    "近N日截面子分EMA平滑(纪要15,favorable/近段更稳)"}
                            if pool == "hotmoney" else None),
         "scored_count": len(ranked),
         "skipped_count": skipped,
@@ -1986,8 +2087,10 @@ def run_ambush(as_of: Optional[str] = None,
     })
     if not candidates:
         payload["notes"] = ["候选池为空：先运行 python stock_crawl_segment_leaders.py crawl 选龙头并回写 is_leader。"]
-    write_payload(AMBUSH_RESULT_FILE, payload)
-    _print_ambush_summary(payload)
+    if write:
+        write_payload(AMBUSH_RESULT_FILE, payload)
+    if print_summary:
+        _print_ambush_summary(payload)
     return payload
 
 
@@ -3413,6 +3516,177 @@ def run_watch(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dict
     return payload
 
 
+# ── latent：潜伏妖股观察名单（"太极 2022 式"左侧筛选）─────────────
+
+def _yaogu_genes(conn: sqlite3.Connection, codes: Sequence[str],
+                 as_of: Optional[str] = None) -> Dict[str, Dict[str, Any]]:
+    """妖股基因：全史龙虎榜次数 + 近 N 年最大换手 + 涨停日数 → 池内分位等权 gene(0~1)。PIT 用 as_of 截断。"""
+    end = as_of or datetime.now().strftime("%Y-%m-%d")
+    start3y = (datetime.strptime(end, "%Y-%m-%d")
+               - timedelta(days=int(LATENT_GENE_LOOKBACK_YEARS * 365))).strftime("%Y-%m-%d")
+    raw: Dict[str, Dict[str, float]] = {}
+    for c in codes:
+        lhb = conn.execute("SELECT COUNT(*) FROM lhb_all WHERE code=? AND date<=?", (c, end)).fetchone()[0]
+        r = conn.execute(
+            "SELECT MAX(daily_turnover_rate), "
+            "SUM(CASE WHEN daily_change_pct>=9.5 THEN 1 ELSE 0 END) "
+            "FROM stock_history WHERE code=? AND date BETWEEN ? AND ?", (c, start3y, end)).fetchone()
+        raw[c] = {"lhb_all": float(lhb or 0), "max_turn": float(r[0] or 0.0), "limitups_3y": float(r[1] or 0)}
+
+    def pctile(key: str) -> Dict[str, float]:
+        vals = sorted(v[key] for v in raw.values())
+        n = len(vals) or 1
+        return {c: bisect.bisect_right(vals, raw[c][key]) / n for c in raw}
+
+    p_lhb, p_turn, p_lim = pctile("lhb_all"), pctile("max_turn"), pctile("limitups_3y")
+    return {c: {**raw[c], "gene": (p_lhb[c] + p_turn[c] + p_lim[c]) / 3.0} for c in raw}
+
+
+NEWS_CATALYST_DAYS = 30   # latent 催化剂窗口：近 N 日新闻
+
+
+def _news_catalyst(conn: sqlite3.Connection, code: str, as_of: Optional[str] = None,
+                   days: int = NEWS_CATALYST_DAYS) -> Optional[Dict[str, Any]]:
+    """近 days 日新闻催化剂(stock_crawl_news.py 入库, 缺表则 None)：条数 + 最新日 + Top 题材标签。
+
+    PIT：as_of 给定时只取该日及以前的新闻。⚠️新闻预测力未验证，仅作展示/证据，不进 latent 排序。
+    """
+    end_dt = datetime.strptime(as_of, "%Y-%m-%d") if as_of else datetime.now()
+    since = (end_dt - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
+    until = (as_of + " 23:59:59") if as_of else None
+    rows = stock_storage.load_recent_news(conn, code, since=since, until=until, limit=50)
+    if not rows:
+        return None
+    themes: Counter = Counter()
+    for r in rows:
+        for t in (r.get("themes") or "").split(","):
+            t = t.strip()
+            if t:
+                themes[t] += 1
+    latest = str(rows[0].get("pub_time") or "")[:10]
+    try:
+        age = (end_dt - datetime.strptime(latest, "%Y-%m-%d")).days
+    except ValueError:
+        age = None
+    return {"news_count": len(rows), "latest_date": latest, "latest_age_days": age,
+            "themes": [t for t, _ in themes.most_common(3)]}
+
+
+def run_latent(as_of: Optional[str] = None, max_cap: Optional[float] = None,
+               pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+    """潜伏妖股观察名单：复用 ambush 打分核心，按左侧硬过滤 + 综合潜伏分排名。
+
+    硬过滤：位置<LATENT_MAX_POS ∩ 换手分位<LATENT_MAX_TURN_PCTILE ∩ 近90日未上龙虎榜
+            ∩ 出货分<LATENT_MAX_DIST ∩ 未连板未触发突破。
+    潜伏分：吸筹分位 + 妖股基因 + 低位 + 板块题材热 + (户数降/回购证据)。详见研究报告与纪要。
+    """
+    amb = run_ambush(as_of=as_of, max_cap=max_cap, pool=pool, write=False, print_summary=False)
+    rows = amb.get("stocks", [])
+    survivors: List[Dict[str, Any]] = []
+    conn = stock_storage.connect(DB_FILE)
+    try:
+        genes = _yaogu_genes(conn, [r["code"] for r in rows], as_of=as_of)
+        for r in rows:
+            sig = r.get("signals", {})
+            pos = sig.get("close_pctile")
+            turn = sig.get("turnover_pctile")
+            dist = r.get("distribution_score") or 0.0
+            streak = sig.get("limit_streak") or 0
+            if pos is None or pos > LATENT_MAX_POS:
+                continue
+            if turn is not None and turn > LATENT_MAX_TURN_PCTILE:
+                continue
+            if r.get("lhb_recent") or dist > LATENT_MAX_DIST:
+                continue
+            if streak >= 1 or r.get("triggered"):
+                continue
+            g = genes.get(r["code"], {"gene": 0.0, "lhb_all": 0, "max_turn": 0.0, "limitups_3y": 0})
+            acc = (r.get("accumulation_percentile") or 0.0) / 100.0
+            heat = (r.get("sw2_heat_pctile") or 0.0) / 100.0
+            hc = r.get("holder_change")
+            evid = ((LATENT_HOLDER_BONUS if (hc is not None and hc < 0) else 0.0)
+                    + (LATENT_REPO_BONUS if r.get("repurchase_recent") else 0.0))
+            latent = (LATENT_WEIGHTS["accumulation"] * acc + LATENT_WEIGHTS["gene"] * g["gene"]
+                      + LATENT_WEIGHTS["low_pos"] * (1.0 - pos) + LATENT_WEIGHTS["theme_heat"] * heat + evid)
+            r["yaogu_gene"] = round(g["gene"] * 100.0, 1)
+            r["latent_score"] = round(latent * 100.0, 1)
+            r["latent_signals"] = {"lhb_all": int(g["lhb_all"]), "max_turn_3y": round(g["max_turn"], 1),
+                                   "limitups_3y": int(g["limitups_3y"])}
+            cat = _news_catalyst(conn, r["code"], as_of=as_of)   # ①题材层(新闻):展示/证据,不进排序
+            if cat:
+                r["news_catalyst"] = cat
+            survivors.append(r)
+    finally:
+        conn.close()
+    survivors.sort(key=lambda x: x["latent_score"], reverse=True)
+
+    payload = base_payload("latent", len(rows))
+    payload.update({
+        "status": "ok" if survivors else "empty",
+        "description": "潜伏妖股观察名单：左侧低位+安静+吸筹+妖股基因+真吸筹证据。⚠️观察名单非买点触发器(左侧弱/慢)。",
+        "pool": pool,
+        "as_of": as_of,
+        "market_regime": amb.get("market_regime"),
+        "params": {
+            "max_pos": LATENT_MAX_POS, "max_turn_pctile": LATENT_MAX_TURN_PCTILE,
+            "max_distribution": LATENT_MAX_DIST, "weights": LATENT_WEIGHTS,
+            "holder_bonus": LATENT_HOLDER_BONUS, "repurchase_bonus": LATENT_REPO_BONUS,
+            "gene_lookback_years": LATENT_GENE_LOOKBACK_YEARS,
+            "research": "meta_data_backup/hot_money_latent_hunting_research.md",
+        },
+        "screened_count": len(survivors),
+        "pool_size": len(rows),
+        "stocks": survivors,
+    })
+    write_payload(LATENT_RESULT_FILE, payload)
+    _print_latent_summary(payload)
+    return payload
+
+
+def _print_latent_summary(payload: Dict[str, Any]) -> None:
+    print("=" * 108)
+    print("  主力资金雷达 · 潜伏妖股观察名单 (latent)")
+    print(f"  生成时间: {payload['generated_at']} · 池: {payload.get('pool')}({payload.get('pool_size',0)}) "
+          f"· 入选: {payload.get('screened_count',0)} · 落盘: {display_path(LATENT_RESULT_FILE)}")
+    mr = payload.get("market_regime")
+    if isinstance(mr, dict) and mr.get("available"):
+        print(f"  大盘: {'站上' if mr.get('favorable') else '跌破'}MA20 — {mr.get('note','')}")
+    print("  硬过滤: 位置<{:.0%} ∩ 换手分位<{:.0%} ∩ 近90日未上榜 ∩ 出货<{:.0f} ∩ 未启动 ；⚠️观察名单非买点".format(
+        LATENT_MAX_POS, LATENT_MAX_TURN_PCTILE, LATENT_MAX_DIST))
+    print("-" * 108)
+    stocks = payload.get("stocks", [])
+    if not stocks:
+        print("  （无入选——可能池空或当前无左侧低位安静标的）")
+        print("=" * 108)
+        return
+    header = (_ljust("代码", 8) + _ljust("名称", 11) + _rjust("潜伏", 6) + _rjust("位置", 6)
+              + _rjust("换手", 6) + _rjust("吸筹%", 7) + _rjust("基因", 6) + _rjust("户数Δ", 8)
+              + _rjust("回购", 5) + _rjust("板块热", 7) + "  行业/题材")
+    print("  " + header)
+    for s in stocks[:25]:
+        sig = s.get("signals", {})
+        pos = (sig.get("close_pctile") or 0) * 100
+        turn = (sig.get("turnover_pctile") or 0) * 100
+        hc = s.get("holder_change")
+        hc_s = f"{hc:+.0f}%" if hc is not None else "-"
+        heat = s.get("sw2_heat_pctile")
+        heat_s = f"{heat:.0f}" if heat is not None else "-"
+        cat = s.get("news_catalyst")
+        if cat and cat.get("themes"):
+            seg = f"📰{cat['news_count']} {'/'.join(cat['themes'][:2])}"   # 新闻题材优先
+        elif cat:
+            seg = f"📰{cat['news_count']} " + (s.get("tracking_theme") or s.get("segment_name") or "")
+        else:
+            seg = (s.get("tracking_theme") or s.get("segment_name") or "")
+        row = (_ljust(s["code"], 8) + _ljust(s.get("name", "")[:5], 11)
+               + _rjust(s.get("latent_score", 0), 6) + _rjust(f"{pos:.0f}%", 6) + _rjust(f"{turn:.0f}%", 6)
+               + _rjust(f"{s.get('accumulation_percentile') or 0:.0f}", 7)
+               + _rjust(f"{s.get('yaogu_gene') or 0:.0f}", 6) + _rjust(hc_s, 8)
+               + _rjust("✓" if s.get("repurchase_recent") else "", 5) + _rjust(heat_s, 7) + "  " + seg[:16])
+        print("  " + row)
+    print("=" * 108)
+
+
 # ── CLI ───────────────────────────────────────────────────────
 
 def build_parser() -> argparse.ArgumentParser:
@@ -3421,7 +3695,8 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=MODES, default=DEFAULT_MODE,
         help="运行模式：ambush(默认,吸筹分+形态) / watch(实时监控) / "
              "verify(吸筹分回测) / patterns(形态预测力回测) / "
-             "distribution(出货分权重实验) / accumulation(六原始分吸筹总分权重实验)",
+             "distribution(出货分权重实验) / accumulation(六原始分吸筹总分权重实验) / "
+             "latent(潜伏妖股观察名单:左侧低位+安静+吸筹+妖股基因, 建议配 --pool hotmoney)",
     )
     parser.add_argument(
         "--as-of", default=None, metavar="YYYY-MM-DD",
@@ -3450,6 +3725,8 @@ def run_mode(mode: str, as_of: Optional[str] = None,
         return run_distribution_experiment(max_cap=max_cap, pool=pool)
     if mode == "accumulation":
         return run_accumulation_experiment(max_cap=max_cap, pool=pool)
+    if mode == "latent":
+        return run_latent(as_of=as_of, max_cap=max_cap, pool=pool)
     return run_ambush(as_of=as_of, max_cap=max_cap, pool=pool)
 
 

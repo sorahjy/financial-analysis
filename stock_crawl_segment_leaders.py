@@ -70,6 +70,7 @@ LEGULEGU_HEADERS = {
     "Referer": SW3_OVERVIEW_URL,
     "Upgrade-Insecure-Requests": "1",
 }
+LEGULEGU_RETRY_SLEEP_SEC = 0.5
 SWS_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -90,7 +91,7 @@ EASTMONEY_HEADERS = {
 STOCK_DB_FILE = DATA_DIR.parent / "stock_data.sqlite3"
 
 DEFAULT_TOP_PER_SEGMENT = 3
-FORCED_SEGMENT_LEADER_CODES = ["002741"]  # 光华科技：筛完各 SW3 topN 后仍强制纳入其所属赛道
+FORCED_SEGMENT_LEADER_CODES = ["002741","002507"]  # 筛完各 SW3 topN 后仍强制纳入其所属赛道
 DEFAULT_POOL_MAX_AGE_DAYS = 14
 LOCAL_TAXONOMY_MIN_BACKUP_RATIO = 0.80
 
@@ -166,7 +167,7 @@ def _retry_fetch(func, *args, retries: int = 3, sleep_sec: float = 1.0,
                 # 传了 desc 才报进度(避免 per-segment 重试刷屏)，让长退避不再静默
                 if desc:
                     print(f"  [retry] {desc} 第 {attempt + 1}/{retries} 次失败：{exc}；"
-                          f"{delay:.0f}s 后重试...", flush=True)
+                          f"{delay:g}s 后重试...", flush=True)
                 time.sleep(delay)
     raise last_error
 
@@ -528,7 +529,7 @@ def _fetch_segment_members(segment_code: str, skip_legulegu: bool = False,
     if not skip_legulegu:
         try:
             df = _retry_fetch(fetch_sw3_segment_constituents, segment_code,
-                              retries=2, sleep_sec=1.5, backoff=False,
+                              retries=2, sleep_sec=LEGULEGU_RETRY_SLEEP_SEC, backoff=False,
                               desc=f"{retry_desc} legulegu" if retry_desc else "")
             members = _parse_segment_rows(df, min_market_cap_yi=0.0) if df is not None and not df.empty else []
             if members:
@@ -906,7 +907,8 @@ def crawl_sw3_membership(
     official_members_only = force_official_members or db_needs_recrawl or first_membership_run
     taxonomy_from_fallback = False
     try:
-        sw3 = _retry_fetch(fetch_sw3_segments, retries=3, sleep_sec=2.0, backoff=True, jitter=2.0,
+        sw3 = _retry_fetch(fetch_sw3_segments, retries=3, sleep_sec=LEGULEGU_RETRY_SLEEP_SEC,
+                           backoff=False, jitter=0.0,
                            desc="申万三级行业列表")
     except Exception as exc:
         print(f"  [membership] 三级总表抓取失败：{exc}", flush=True)

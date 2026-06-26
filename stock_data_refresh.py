@@ -401,9 +401,13 @@ def refresh_before_server(
     env = os.environ.copy()
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TQDM_DISABLE", "1")
-    env.setdefault("STOCK_THREAD_COUNT", "48")
-    # 日线源进程池：默认 32 / 腾讯,新浪；用 STOCK_DAILY_PROCESS_WORKERS / _SOURCES 环境变量可覆盖
-    env.setdefault("STOCK_DAILY_PROCESS_WORKERS", "32")
+    # 并发按本机 CPU 核数自适应（旧硬编码 48 线程 + 32 进程在 ~10 核机器上是数倍过订阅，
+    # 把 CPU 烧满/磁盘压垮而不会更快）。stock 线程偏网络+GIL 取 ~2× 核数；日线进程是 CPU 绑定取 ~核数。
+    # 显式设对应环境变量仍优先生效（大机器可上调）。
+    cpu = os.cpu_count() or 8
+    env.setdefault("STOCK_THREAD_COUNT", str(min(32, cpu * 2)))
+    # 日线源进程池：腾讯,新浪；用 STOCK_DAILY_PROCESS_WORKERS / _SOURCES 环境变量可覆盖
+    env.setdefault("STOCK_DAILY_PROCESS_WORKERS", str(min(32, cpu)))
     env.setdefault("STOCK_DAILY_PROCESS_SOURCES", "腾讯,新浪")
     if no_proxy:
         # 数据源均为境内接口，绕过本地代理直连；NO_PROXY=* 同时屏蔽系统代理

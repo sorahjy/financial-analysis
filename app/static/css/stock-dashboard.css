@@ -472,6 +472,10 @@
       background: #fff;
       border: 1px dashed var(--line);
       border-radius: 6px;
+    }.stock-native .chart-modal-status[hidden],
+    .stock-native .chart-modal-body img[hidden],
+    .stock-native .chart-modal-actions a[hidden] {
+      display: none;
     }.stock-native .chart-modal-status.warn {
       color: var(--red);
     }.stock-native .chart-modal-body img {

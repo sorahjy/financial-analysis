@@ -644,18 +644,22 @@ def _env_text(names, default):
     return default
 
 
+# 默认按 CPU 核数封顶：这些是 CPU 绑定(解析 K 线)+ spawn(每进程重导入 akshare/pandas)的进程，
+# 旧默认 32 在多数机器上是 2~3× 过订阅，徒增上下文切换/内存/spawn 开销而不会更快。
+# 显式设 STOCK_DAILY_PROCESS_WORKERS 时仍完全尊重（大机器可上调）。
+_DEFAULT_DAILY_PROCESS_WORKERS = min(32, os.cpu_count() or 8)
 try:
     _DAILY_PROCESS_WORKERS = max(
         0,
         int(
             _env_text(
                 ("STOCK_DAILY_PROCESS_WORKERS", "STOCK_DAILY_FALLBACK_PROCESS_WORKERS"),
-                "32",
+                str(_DEFAULT_DAILY_PROCESS_WORKERS),
             )
         ),
     )
 except ValueError:
-    _DAILY_PROCESS_WORKERS = 32
+    _DAILY_PROCESS_WORKERS = _DEFAULT_DAILY_PROCESS_WORKERS
 
 _DAILY_PROCESS_SOURCES = {
     item.strip()

@@ -1048,6 +1048,31 @@ class StockStrategyOptimizerTest(unittest.TestCase):
 
 
 class HotMoneySegmentPoolTest(unittest.TestCase):
+    def test_retry_fetch_logs_and_sleeps_fractional_retry_delay(self):
+        import stock_crawl_segment_leaders as r
+
+        calls = {"count": 0}
+
+        def flaky():
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise RuntimeError("legulegu failed")
+            return "ok"
+
+        output = io.StringIO()
+        with patch.object(r.time, "sleep") as sleep_mock, patch("sys.stdout", output):
+            result = r._retry_fetch(
+                flaky,
+                retries=2,
+                sleep_sec=r.LEGULEGU_RETRY_SLEEP_SEC,
+                backoff=False,
+                desc="legulegu",
+            )
+
+        self.assertEqual(result, "ok")
+        sleep_mock.assert_called_once_with(0.5)
+        self.assertIn("0.5s 后重试", output.getvalue())
+
     def test_trillion_cap_leader_survives_build_filter(self):
         import pandas as pd
         from stock_crawl_segment_leaders import _parse_segment_rows

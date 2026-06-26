@@ -275,7 +275,7 @@ python industry_cycle_engine.py --write
 | `data/stock_advanced_strategy_results.json` | A 股长线/短线策略结果 |
 | `data/stock_strategy_candidate_cache.json` | A 股长线/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
-| `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数 |
+| `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数；optimizer 会同步备份到 `meta_data_backup/stock_strategy_optimized_config.json`，data 文件缺失时前端自动兜底读取备份 |
 | `data/stock_strategy_best_fold_paths.svg` | 长线默认参数历史折走势小图矩阵 |
 | `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
 | `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member` 存申万三级成分和官方市值占比，`index_nav` / `index_nav_meta` 存基准 ETF NAV |

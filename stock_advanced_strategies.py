@@ -35,11 +35,13 @@ from stock_crawl_common import daily_stats_from_history_records
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
+META_DATA_BACKUP_DIR = ROOT / "meta_data_backup"
 CAPITAL_DIR = DATA_DIR / "capital"
 HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
 LEGACY_HOT_MONEY_SCORED_FILE = CAPITAL_DIR / "scored_stocks.json"
 OUTPUT_FILE = DATA_DIR / "stock_advanced_strategy_results.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
+OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
 LIVE_CANDIDATE_CACHE_VERSION = 2
 LONG_CAPITAL_EVENT_DAYS = 90
@@ -373,6 +375,14 @@ def load_json_optional(path: Path, default: Any) -> Any:
         return load_json_file(str(path))
     except (OSError, json.JSONDecodeError):
         return default
+
+
+def load_optimized_config_payload() -> Tuple[Dict[str, Any], Optional[Path]]:
+    for path in (OPTIMIZED_CONFIG_FILE, OPTIMIZED_CONFIG_BACKUP_FILE):
+        payload = load_json_optional(path, {})
+        if isinstance(payload, dict) and payload.get("config"):
+            return payload, path
+    return {}, None
 
 
 def deep_merge(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2510,11 +2520,11 @@ def run_strategies(
 
 def get_default_config() -> Dict[str, Any]:
     config = copy.deepcopy(DEFAULT_CONFIG)
-    optimized = load_json_optional(OPTIMIZED_CONFIG_FILE, {})
-    if isinstance(optimized, dict) and optimized.get("config"):
+    optimized, optimized_source = load_optimized_config_payload()
+    if optimized.get("config"):
         config = deep_merge(config, optimized["config"])
         config["_optimized_defaults"] = {
-            "source": str(OPTIMIZED_CONFIG_FILE),
+            "source": str(optimized_source),
             "generated_at": optimized.get("generated_at"),
             "iterations_per_strategy": optimized.get("iterations_per_strategy"),
             "seed": optimized.get("seed"),

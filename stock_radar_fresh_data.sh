@@ -8,3 +8,4 @@ python stock_crawl_holders.py --no-proxy
 python stock_crawl_capital.py --no-proxy
 python plate_crawl_history.py --no-proxy
 python stock_theme_candidates.py
+python stock_crawl_hot_money_universe.py --no-proxy

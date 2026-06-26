@@ -710,6 +710,7 @@
         chart.partial_folds ? `${chart.partial_folds} 个未满折` : "",
         chart.full_path_start_date && chart.full_path_end_date ? `${chart.full_path_start_date} ~ ${chart.full_path_end_date}` : "",
       ].filter(Boolean).join(" · ");
+      $("long-chart-status").textContent = "";
       $("long-chart-status").hidden = true;
       $("long-chart-status").classList.remove("warn");
       $("long-chart-image").src = url;
@@ -723,6 +724,7 @@
       $("long-chart-modal").hidden = true;
       $("long-chart-image").removeAttribute("src");
       $("long-chart-image").hidden = false;
+      $("long-chart-status").textContent = "";
       $("long-chart-status").hidden = true;
       $("long-chart-status").classList.remove("warn");
       $("long-chart-open").hidden = false;
@@ -857,12 +859,11 @@
     }
 
     function renderBars(picks) {
-      const top = picks.slice(0, 12);
-      if (!top.length) {
+      if (!picks.length) {
         $("bars").innerHTML = `<div class="empty">当前参数没有选出股票</div>`;
         return;
       }
-      $("bars").innerHTML = top.map((p) => `
+      $("bars").innerHTML = picks.map((p) => `
         <div class="bar-row">
           <div class="bar-label">${esc(p.code)} ${esc(p.name)}</div>
           <div class="bar-track"><div class="bar-fill" style="width:${Math.max(0, Math.min(100, p.score))}%"></div></div>

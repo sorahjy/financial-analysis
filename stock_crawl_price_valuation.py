@@ -48,7 +48,9 @@ from stock_crawl_common import (
 
 MAX_YEARS = 10
 MAX_RETRIES = 3
-DEFAULT_THREAD_COUNT = 32
+# stock 级线程多为网络等待 + GIL 绑定的 Python 规范化/合并：按 ~2× 核数自适应并封顶，
+# 远超核数只会让线程抢 GIL 互拖、CPU 空转（境内行情接口也更易触发限流）。可用 STOCK_THREAD_COUNT 覆盖。
+DEFAULT_THREAD_COUNT = min(32, (os.cpu_count() or 4) * 2)
 VALUATION_FRESH_DAYS = 7   # 最近一条估值在该天数内则跳过重抓（百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略）
 
 
@@ -448,6 +450,12 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         existing_unchanged = len(existing_records) == raw_count
         existing_dates = {r["date"] for r in existing_records}
         new_rows = [r for r in merged if r["date"] not in existing_dates]
+        # 全无变化(估值新、无新交易日、未 prune、非回补、不刷财报)→ 重写会原样落回同样数据，
+        # 直接跳过：免去对「已最新」股票的整段 DELETE+重插（重复跑/周末/停牌股尤其明显）。
+        if (val_period is None and existing_unchanged and not new_rows
+                and not full_daily_backfill and not need_fundamentals):
+            safe_print(f"[{idx}/{total}] {code} {name}: 已最新({end_date})，跳过写库")
+            return
         if val_period is None and existing_unchanged and new_rows and not full_daily_backfill:
             result["history_write_records"] = new_rows
             result["history_replace"] = False

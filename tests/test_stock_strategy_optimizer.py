@@ -1,5 +1,8 @@
+import json
 import random
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 import stock_strategy_optimizer as optimizer
@@ -26,6 +29,23 @@ class RecordingTrial:
 
 
 class StockStrategyOptimizerTest(unittest.TestCase):
+    def test_save_optimized_config_snapshot_writes_primary_and_backup(self):
+        payload = {
+            "generated_at": "2026-06-25 14:00:00",
+            "iterations_per_strategy": 1500,
+            "seed": 42,
+            "config": {"long": {"top_n": 20}, "short": {"top_n": 10}},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "data" / "stock_strategy_optimized_config.json"
+            backup = Path(tmpdir) / "meta_data_backup" / "stock_strategy_optimized_config.json"
+            with patch.object(optimizer, "OPTIMIZED_CONFIG_FILE", primary), \
+                 patch.object(optimizer, "OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                optimizer.save_optimized_config_snapshot(payload)
+
+            self.assertEqual(json.loads(primary.read_text(encoding="utf-8")), payload)
+            self.assertEqual(json.loads(backup.read_text(encoding="utf-8")), payload)
+
     def test_long_optimizer_universe_intersects_segment_leaders(self):
         series = {
             "600000": [{"date": "2020-01-01", "close": 1.0}] * 320,

@@ -214,6 +214,32 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(response.get_json(), payload)
         build_chart.assert_called_once_with({"long": {"top_n": 10}})
 
+    def test_stock_config_endpoint_falls_back_to_backup_optimized_config(self):
+        payload = {
+            "generated_at": "2026-06-25 14:00:00",
+            "iterations_per_strategy": 1500,
+            "seed": 42,
+            "config": {
+                "long": {"top_n": 31},
+                "short": {"top_n": 8},
+            },
+            "caveat": "test",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "data" / "stock_strategy_optimized_config.json"
+            backup = Path(tmpdir) / "meta_data_backup" / "stock_strategy_optimized_config.json"
+            backup.parent.mkdir(parents=True)
+            backup.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with patch("stock_advanced_strategies.OPTIMIZED_CONFIG_FILE", primary), \
+                 patch("stock_advanced_strategies.OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                response = self.client.get("/api/stock/config")
+
+        self.assertEqual(response.status_code, 200)
+        data = response.get_json()
+        self.assertEqual(data["config"]["long"]["top_n"], 31)
+        self.assertEqual(data["config"]["short"]["top_n"], 8)
+        self.assertEqual(data["config"]["_optimized_defaults"]["source"], str(backup))
+
     def test_stock_long_backtest_chart_rebuilds_existing_default_file(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             output = Path(tmp_dir) / "stock_strategy_best_fold_paths.svg"
@@ -254,12 +280,17 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("/api/stock/long-backtest-chart", script)
         self.assertIn("正在回测策略走势，请稍后...", script)
         self.assertIn("function showLongChartStatus", script)
+        self.assertIn(".chart-modal-status[hidden]", css)
+        self.assertIn(".chart-modal-body img[hidden]", css)
+        self.assertIn(".chart-modal-actions a[hidden]", css)
+        self.assertIn('$("long-chart-status").textContent = "";', script)
         self.assertIn("button.hidden = !visible", script)
         self.assertIn('const visible = active === "long"', script)
         self.assertIn("function exportCurrentPicks()", script)
         self.assertIn("text/plain;charset=utf-8", script)
         self.assertIn("anchor.download", script)
         self.assertIn("slice(0, limit", script)
+        self.assertNotIn("picks.slice(0, 12)", script)
         self.assertIn('${cleanField(pick.code)},${cleanField(pick.name)},', script)
         self.assertIn("/api/stock/kline", script)
         self.assertIn("period=week", script)

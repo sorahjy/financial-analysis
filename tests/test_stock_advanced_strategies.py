@@ -1,4 +1,7 @@
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from stock_advanced_strategies import (
@@ -76,6 +79,32 @@ class StockAdvancedStrategyTest(unittest.TestCase):
             self.assertEqual(long_by_key[key]["group"], "资金面")
             self.assertIn(key, defaults)
             self.assertGreater(defaults[key], 0)
+
+    def test_default_config_falls_back_to_backup_optimized_config(self):
+        payload = {
+            "generated_at": "2026-06-25 14:00:00",
+            "iterations_per_strategy": 1500,
+            "seed": 42,
+            "config": {
+                "long": {"top_n": 33},
+                "short": {"top_n": 6},
+            },
+            "caveat": "test",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "data" / "stock_strategy_optimized_config.json"
+            backup = Path(tmpdir) / "meta_data_backup" / "stock_strategy_optimized_config.json"
+            backup.parent.mkdir(parents=True)
+            backup.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            with patch("stock_advanced_strategies.OPTIMIZED_CONFIG_FILE", primary), \
+                 patch("stock_advanced_strategies.OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                config = get_default_config()
+
+        self.assertEqual(config["long"]["top_n"], 33)
+        self.assertEqual(config["short"]["top_n"], 6)
+        self.assertEqual(config["_optimized_defaults"]["source"], str(backup))
+        self.assertEqual(config["_optimized_defaults"]["iterations_per_strategy"], 1500)
 
     def test_csi300_persistence_proxy_rewards_current_member(self):
         current_member = csi300_persistence_proxy(True, True)

@@ -111,6 +111,60 @@ class HotMoneyRadarTest(unittest.TestCase):
             {0: 0.0, 1: 50.0, 2: 50.0, 3: 100.0},
         )
 
+    def test_ema_recent_first(self):
+        # span=3 → alpha=0.5：acc = 0.5*today + 0.25*d-1 + 0.25*d-2（today=seq[0]）
+        self.assertEqual(radar._ema_recent_first([5.0], 3), 5.0)         # 单点=原值
+        self.assertEqual(radar._ema_recent_first([100.0, 100.0, 100.0], 3), 100.0)
+        self.assertAlmostEqual(radar._ema_recent_first([100.0, 0.0, 0.0], 3), 50.0)
+
+    def test_reversal_snapshot_mode_matches_reverse_rank(self):
+        # REVERSAL_SMOOTH_DAYS=1 → 退回单日快照：reversal_score = 过热因子反向 rank 加权，snapshot==score。
+        rows = [
+            {"code": "A", **{f"rev_{f}": 0.0 for f in radar.REVERSAL_FEATURES}},   # 最冷 → 最高分
+            {"code": "B", **{f"rev_{f}": 0.5 for f in radar.REVERSAL_FEATURES}},
+            {"code": "C", **{f"rev_{f}": 1.0 for f in radar.REVERSAL_FEATURES}},   # 最热 → 最低分
+        ]
+        with patch.object(radar, "REVERSAL_SMOOTH_DAYS", 1):
+            radar._apply_reversal_model(rows)
+        self.assertEqual(rows[0]["reversal_score"], 100.0)   # 反向：最冷=100
+        self.assertEqual(rows[2]["reversal_score"], 0.0)     # 最热=0
+        for r in rows:
+            self.assertEqual(r["signals"]["reversal_score_snapshot"], r["reversal_score"])
+            self.assertEqual(r["signals"]["reversal_smooth_days"], 1)
+
+    def test_reversal_ema_identity_when_history_flat(self):
+        # rev_hist 三日因子恒定 → 每日截面子分相同 → EMA 平滑分 == 单日快照分（恒等）。
+        def row(code, val):
+            feats = {f: val for f in radar.REVERSAL_FEATURES}
+            return {"code": code, "rev_hist": [dict(feats) for _ in range(3)],
+                    **{f"rev_{f}": val for f in radar.REVERSAL_FEATURES}}
+        rows = [row("A", 0.0), row("B", 0.5), row("C", 1.0)]
+        with patch.object(radar, "REVERSAL_SMOOTH_DAYS", 3):
+            radar._apply_reversal_model(rows)
+        for r in rows:
+            self.assertEqual(r["reversal_score"], r["signals"]["reversal_score_snapshot"])
+            self.assertEqual(r["signals"]["reversal_smooth_days"], 3)
+            self.assertNotIn("rev_hist", r)   # 用完即清，不进 payload
+
+    def test_reversal_ema_lifts_score_for_fresh_spike(self):
+        # 某票今日才转最热(snapshot 最低)、前两日不热 → EMA 把它的反转分抬到高于纯快照。
+        def hist(code, today, prior):
+            t = {f: today for f in radar.REVERSAL_FEATURES}
+            p = {f: prior for f in radar.REVERSAL_FEATURES}
+            return {"code": code, "rev_hist": [t, dict(p), dict(p)],
+                    **{f"rev_{f}": today for f in radar.REVERSAL_FEATURES}}
+        # 三票今日过热度 A<B<C；C 今日突然最热但前两日最冷。
+        rows = [hist("A", 0.0, 0.0), hist("B", 0.5, 0.5), hist("C", 1.0, 0.0)]
+        snap_rows = [dict(r) for r in rows]
+        with patch.object(radar, "REVERSAL_SMOOTH_DAYS", 1):
+            radar._apply_reversal_model(snap_rows)
+        with patch.object(radar, "REVERSAL_SMOOTH_DAYS", 3):
+            radar._apply_reversal_model(rows)
+        c_snap = snap_rows[2]["reversal_score"]
+        c_ema = rows[2]["reversal_score"]
+        self.assertEqual(c_snap, 0.0)            # 纯快照：今日最热→0
+        self.assertGreater(c_ema, c_snap)        # 平滑：前两日不热把分抬起
+
     def test_empty_pattern_phase_uses_watch_label(self):
         self.assertEqual(radar._pattern_phase([], score=12.3), "观望⚪")
         self.assertIn("观望⚪", radar.PHASE_ORDER)
@@ -497,6 +551,119 @@ class PatternMatchTest(unittest.TestCase):
         for p in payload["patterns"]:
             for h in radar.VERIFY_HORIZONS:
                 self.assertIn(str(h), p["horizons"])
+
+
+class HotMoneyLatentTest(unittest.TestCase):
+    def test_yaogu_genes_ranks_active_higher_and_in_unit_range(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "t.sqlite3"
+            conn = stock_storage.connect(db_file)
+            conn.execute("CREATE TABLE lhb_all (code TEXT, date TEXT, net_buy REAL, net_pct REAL)")
+            base = date(2024, 1, 1)
+
+            def bars(turns, chgs):
+                return [((base + timedelta(days=t)).isoformat(), 10.0, 10.0, 10.0, 1000.0, chg, tn)
+                        for t, (tn, chg) in enumerate(zip(turns, chgs))]
+
+            _seed_history(conn, "600000", bars([15.0] * 30, [10.0] * 5 + [0.0] * 25))  # 高换手+5涨停
+            _seed_history(conn, "600001", bars([1.0] * 30, [0.0] * 30))               # 安静
+            conn.executemany("INSERT INTO lhb_all (code, date) VALUES (?, ?)",
+                             [("600000", f"2024-01-0{i+1}") for i in range(5)] + [("600001", "2024-01-10")])
+            genes = radar._yaogu_genes(conn, ["600000", "600001"], as_of="2024-03-01")
+            conn.close()
+        self.assertGreater(genes["600000"]["gene"], genes["600001"]["gene"])
+        self.assertEqual(genes["600000"]["limitups_3y"], 5.0)
+        for g in genes.values():
+            self.assertGreaterEqual(g["gene"], 0.0)
+            self.assertLessEqual(g["gene"], 1.0)
+
+    def _run_latent(self, seed):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "t.sqlite3"
+            out_file = Path(tmpdir) / "latent.json"
+            conn = stock_storage.connect(db_file)
+            seed(conn)
+            conn.close()
+            with patch.object(radar, "DB_FILE", db_file), \
+                 patch.object(radar, "LATENT_RESULT_FILE", out_file):
+                payload = radar.main(["latent", "--pool", "hotmoney"])
+            self.assertTrue(out_file.exists())
+            return payload
+
+    def test_latent_filters_high_position_keeps_left_side(self):
+        base = date(2024, 1, 1)
+
+        def mk(prices, vols):
+            bars, prev = [], prices[0]
+            for t, (px, v) in enumerate(zip(prices, vols)):
+                chg = (px / prev - 1.0) * 100.0 if t else 0.0
+                bars.append(((base + timedelta(days=t)).isoformat(),
+                             px * 1.01, px * 0.99, px, v, chg, v / 1000.0))
+                prev = px
+            return bars
+
+        def seed(conn):
+            stock_storage.save_sw3_membership(conn, {"segments": [{
+                "segment_code": "850111.SI", "segment_name": "测试", "parent_segment": "测试",
+                "members": [{"code": "600000", "name": "潜伏"}, {"code": "600001", "name": "高位"}]}]})
+            stock_storage._ensure_table_columns(conn, "sw3_member",
+                                                {"is_hot_money": "INTEGER NOT NULL DEFAULT 0"})
+            conn.executemany("UPDATE sw3_member SET is_hot_money=1 WHERE code=?", [("600000",), ("600001",)])
+            conn.execute("CREATE TABLE lhb_all (code TEXT, date TEXT, net_buy REAL, net_pct REAL)")
+            conn.execute("CREATE TABLE shareholder_count (code TEXT, disclose_date TEXT, change_pct REAL)")
+            conn.execute("CREATE TABLE repurchase (code TEXT, disclose_date TEXT)")
+            n = 90
+            dec = [16 - (16 - 8) * t / (n - 1) for t in range(n)]          # 阴跌, 末日=新低(低位)
+            decv = [2000 - (2000 - 700) * t / (n - 1) for t in range(n)]   # 量递减(末日安静)
+            _seed_history(conn, "600000", mk(dec, decv))
+            inc = [8 + (16 - 8) * t / (n - 1) for t in range(n)]           # 单边走高, 末日=新高(高位)
+            _seed_history(conn, "600001", mk(inc, [1500.0] * n))
+            conn.commit()
+
+        payload = self._run_latent(seed)
+        self.assertEqual(payload["mode"], "latent")
+        codes = {s["code"] for s in payload["stocks"]}
+        self.assertIn("600000", codes)        # 左侧低位+安静 → 入选
+        self.assertNotIn("600001", codes)     # 高位 → 被硬过滤
+        for s in payload["stocks"]:
+            self.assertLessEqual(s["signals"]["close_pctile"], radar.LATENT_MAX_POS)
+            self.assertLessEqual(s["distribution_score"], radar.LATENT_MAX_DIST)
+            self.assertFalse(s.get("lhb_recent"))
+            self.assertIn("latent_score", s)
+            self.assertIn("yaogu_gene", s)
+
+
+class NewsCatalystTest(unittest.TestCase):
+    def test_tag_themes(self):
+        import stock_crawl_news as news
+        self.assertIn("存储/HBM", news.tag_themes("", "公司HBM先进封装订单放量"))
+        self.assertIn("机器人", news.tag_themes("人形机器人", "灵巧手量产"))
+        self.assertEqual(news.tag_themes("", "某公司召开股东大会"), "")
+
+    def test_load_recent_news_missing_table_returns_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = stock_storage.connect(Path(tmp) / "t.sqlite3")
+            self.assertEqual(stock_storage.load_recent_news(conn, "600000"), [])  # 无 stock_news 表 → []
+            conn.close()
+
+    def test_news_catalyst_pit_and_themes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = stock_storage.connect(Path(tmp) / "t.sqlite3")
+            conn.execute("CREATE TABLE stock_news (code TEXT, pub_time TEXT, title TEXT, source TEXT, "
+                         "url TEXT, keyword TEXT, themes TEXT, fetched_at TEXT, PRIMARY KEY(code,pub_time,title))")
+            conn.executemany(
+                "INSERT INTO stock_news (code, pub_time, title, themes) VALUES (?,?,?,?)",
+                [("600000", "2026-06-20 09:00:00", "HBM放量", "存储/HBM"),
+                 ("600000", "2026-06-22 09:00:00", "算力订单", "AI算力"),
+                 ("600000", "2026-07-10 09:00:00", "未来新闻", "机器人")])  # as_of 之后 → PIT 排除
+            conn.commit()
+            cat = radar._news_catalyst(conn, "600000", as_of="2026-06-25", days=30)
+            conn.close()
+        self.assertEqual(cat["news_count"], 2)
+        self.assertEqual(cat["latest_date"], "2026-06-22")
+        self.assertEqual(cat["latest_age_days"], 3)
+        self.assertIn("存储/HBM", cat["themes"])
+        self.assertNotIn("机器人", cat["themes"])   # 未来题材不泄漏
 
 
 if __name__ == "__main__":
