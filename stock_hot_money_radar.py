@@ -30,7 +30,7 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P3 缩量阴线打压吸筹  位置<0.45 + 近10日有"大阴跌≥4%却缩量(<0.85×30日均量)、随后收复"：隐性吸货
   P4 量增价稳吸收      位置<0.60 + 量比>1.2 + |漂移|<6% + CMF>0：放量但价稳、资金净流入
   P5 底部形态构筑      位置<0.45 + 近端两摆动低点等高/低点抬高(-4%~+8%) + 中间反弹≥6%(颈线) + 当前价回升未破颈线：双底/W底
-  P23 箱体波动压缩     位置<0.60 + 近20日振幅<0.80×近60日：波动收窄蓄势(借鉴hot_money_patterns，后验各周期≈0、无edge)
+  P23 箱体波动压缩     位置<0.60 + 近20日振幅<0.80×近60日：波动收窄蓄势(沿用早期形态研究，后验各周期≈0、无edge)
   P24 OBV底背离        位置<0.60 + 近30日价未涨但OBV净流入：量价底背离/暗中吸筹(Wyckoff effort-result，后验弱正不显著)
 【试盘 🟡hold】拉升前试探上方抛压
   P6 试盘长上影        近8日有长上影(>3%且>2×实体)创20日新高后收盘缩回：探顶又压回
@@ -103,13 +103,13 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
        +3.35%/60日+3.94%(t1.47 近显著)有正向苗头。拉升类 P11/P12 负超额，追入=接盘。
      · P5 底部形态构筑(双底/W底, 后补)→ 命中2080, 20/40/60日 -0.65%/-0.84%/-0.82%(t-1.46)，
        buy 形态却负超额=又一反转陷阱；同 universe 错配，识别本身没问题但龙头池无预测力。
-     · P21 假跌破收回(Wyckoff spring, 借鉴hot_money_patterns)→ 命中1624, 20/40/60日 +0.35/+1.23/+0.62%
+     · P21 假跌破收回(Wyckoff spring, 沿用早期形态研究)→ 命中1624, 20/40/60日 +0.35/+1.23/+0.62%
        (t1.23)：buy 侧三档全正、t 比 P3 高且样本3×，是龙头池里统计最可靠的正向 buy 形态(虽未达 t1.5)。留用。
      · P22 放量假突破(高位拒绝, 同源)→ 命中517, 20/40/60日 -0.47/-1.11/-1.84%(t-0.83)：sell 看负、方向稳、
        胜率39%，未显著但作辅助风控标签留用。
      · 结论：出货预警层(P19/P20/P22)可当风控；buy 侧正向只有 P3/P21(含P5在内其余失效)——与全文一致。
      · 备注：形态只产出"阶段标签"、不进吸筹分加权(分数=4因子)，故失效形态无需"降权"，留作研究基线。
-  9) 借鉴 hot_money_patterns.py 的「出货分渐变惩罚」（吸筹分 ×(1−DIST_PENALTY_CAP×派发分/100)，
+  9) 沿用早期形态研究的「出货分渐变惩罚」（吸筹分 ×(1−DIST_PENALTY_CAP×派发分/100)，
      派发分=高位×(基础+阶段涨幅+高位放量)）后重跑 verify（cap-filtered 582只）：
      · 吸筹分截面 IC 20/40/60日 +0.021/+0.017/+0.011，t 2.32/2.02/1.27——相比(7)的中性，
        20/40日 t 跳到 >2 显著正：把"高位假吸筹"剔出高分区、排序更干净（borrow 生效）。
@@ -130,7 +130,7 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
      · 结论：可用的只有**风控(P20/P22/P19/追突破P11)** + **超短动量(连板2-5日)**；吸筹买入侧不显著且偏慢(10-40日)，与全文一致。
      · 全市值(956只)个股 sell/风控形态更丰富：P11 追突破**全周期显著负**(40日-2.07%)、P14/P15/P16/P19/P20/P22 多周期✅、
        P3 缩量打压吸筹 40日 +4.21%*显著(全市值唯一达标 buy)、连板 P12 动量增至 2-10日。雷达默认含大盘全市值。
-     · P23 箱体波动压缩(借鉴hot_money_patterns 的 compression, 后补)：命中众多但**各周期超额≈0、无edge**
+     · P23 箱体波动压缩(沿用早期形态研究的 compression, 后补)：命中众多但**各周期超额≈0、无edge**
        (剔大盘仅2日+0.18%*巨样本噪声)——又一买入侧失效形态，留作"酝酿"evidence标签/研究基线，不入有效集。
      · evidence 升级为结构化 {label,kind}(利好/中性/风险)，前端按 kind 上色(替原关键字正则)。
  11) 因子拆解 + 背离/CMF 反向计入（剔大盘，子分截面 IC）：
@@ -260,7 +260,7 @@ MA_BREAKDOWN_PENALTY = 0.20  # P20 均线放量破位命中 → 吸筹分打掉 
 TURNOVER_COVERAGE = 0.7  # 近端窗口换手率覆盖率达标才用换手率，否则退回成交量
 WEIGHTS = {"position": 0.20, "divergence": 0.25, "cmf": 0.25, "chip": 0.30}
 SUSPECT_ACCUM_SCORE = 65  # 无形态命中但吸筹分≥此值 → 疑似吸筹(待确认)；低于则观望
-COMPRESS_AMP_RATIO = 0.80  # 近20日振幅 < 此倍×近60日振幅 → 波动压缩(酝酿)；借鉴 hot_money_patterns.py
+COMPRESS_AMP_RATIO = 0.80  # 近20日振幅 < 此倍×近60日振幅 → 波动压缩(酝酿)；沿用早期形态研究
 OBV_DIV_MIN = 0.10         # P24 OBV底背离：OBV净流入(量纲化)−价格涨幅 > 此值 才算显著背离
 
 # 资金面维度（数据由 stock_crawl_holders.py / stock_crawl_capital.py 入库，见纪要(13)）：
@@ -284,7 +284,7 @@ ACCUM_EXPERIMENT_GRID_STEP = 0.1
 ACCUM_EXPERIMENT_MIN_WEIGHT = 0.1
 ACCUM_EXPERIMENT_SPREAD_W = 3.0
 
-# 出货风险分（连续 0~100）：高位 + 阶段涨幅大 + 高位放量 = 派发特征。借鉴 stock_hot_money_patterns.py
+# 出货风险分（连续 0~100）：高位 + 阶段涨幅大 + 高位放量 = 派发特征。沿用早期形态研究
 # 的「出货分渐变惩罚」——不再只靠形态硬覆盖标签，而是连续地给吸筹分打折，让"既像吸筹又带派发味"的票排名下沉。
 DIST_POS_START = 0.70    # 收盘价分位 ≥ 此值才进入派发风险区（高位门控）
 DIST_POS_FULL = 0.92     # 分位 ≥ 此值 → 高位满格
@@ -926,7 +926,7 @@ def _pat_bottom_formation(bars, ctx):            # P5 底部形态构筑(双底/
 
 
 def _pat_compression(bars, ctx):                 # P23 箱体波动压缩(酝酿)
-    """中低位 + 近20日振幅 < 0.80×近60日振幅：波动收窄、蓄势待发。借鉴 hot_money_patterns.py 的 compression。"""
+    """中低位 + 近20日振幅 < 0.80×近60日振幅：波动收窄、蓄势待发。沿用早期形态研究的 compression。"""
     pos = ctx["pos"]
     if pos is None or pos >= 0.60:
         return False
@@ -1124,7 +1124,7 @@ def _pat_ma_breakdown(bars, ctx):                # P20 均线放量破位
 
 
 def _pat_spring_reclaim(bars, ctx):              # P21 假跌破收回(Wyckoff spring·挖坑收回)
-    """近5日最低跌穿前40日箱体下沿×0.985(假摔)，但当前收盘又站回箱体下沿之上。借鉴 hot_money_patterns.py。"""
+    """近5日最低跌穿前40日箱体下沿×0.985(假摔)，但当前收盘又站回箱体下沿之上。沿用早期形态研究。"""
     if len(bars) < 45:
         return False
     lows = [b["low"] for b in bars if b["low"] is not None]
@@ -1139,7 +1139,7 @@ def _pat_spring_reclaim(bars, ctx):              # P21 假跌破收回(Wyckoff s
 
 
 def _pat_failed_breakout(bars, ctx):             # P22 放量假突破(高位拒绝)
-    """今日盘中高点刺破前40日高点、但收盘没站上 + 当日放量(>1.8×前20日均量)。借鉴 hot_money_patterns.py。"""
+    """今日盘中高点刺破前40日高点、但收盘没站上 + 当日放量(>1.8×前20日均量)。沿用早期形态研究。"""
     if len(bars) < 42:
         return False
     highs = [b["high"] for b in bars if b["high"] is not None]
@@ -1178,9 +1178,9 @@ PATTERNS: List[Tuple[str, str, str, str, Any]] = [
     ("P18", "顶部大阴包阳", "出货", "sell", _pat_bearish_engulf),
     ("P19", "灌压巨量大阴", "出货", "sell", _pat_dump_bigbear),
     ("P20", "均线放量破位", "出货", "sell", _pat_ma_breakdown),
-    ("P21", "假跌破收回", "洗盘", "buy", _pat_spring_reclaim),       # 借鉴hot_money_patterns；各周期均不显著(40日+1.15%弱)
-    ("P22", "放量假突破", "出货", "sell", _pat_failed_breakout),     # 借鉴hot_money_patterns；有效@5/10/40日(sell, 40日-1.99%)
-    ("P23", "箱体波动压缩", "吸筹", "buy", _pat_compression),        # 借鉴hot_money_patterns；后验各周期≈0无edge，留作酝酿标签
+    ("P21", "假跌破收回", "洗盘", "buy", _pat_spring_reclaim),       # 早期形态研究；各周期均不显著(40日+1.15%弱)
+    ("P22", "放量假突破", "出货", "sell", _pat_failed_breakout),     # 早期形态研究；有效@5/10/40日(sell, 40日-1.99%)
+    ("P23", "箱体波动压缩", "吸筹", "buy", _pat_compression),        # 早期形态研究；后验各周期≈0无edge，留作酝酿标签
     ("P24", "OBV底背离", "吸筹", "buy", _pat_obv_divergence),        # Wyckoff effort-result；后验弱正不显著(10-60日IC~+0.012/t1.4)
 ]
 
@@ -1331,7 +1331,7 @@ def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     """对一段日线窗口算吸筹分（位置 + 努力结果背离 + 收盘买压 + 低位筹码集中）。数据不足返回 None。
 
     吸筹分 = 4 因子加权 × (1 − 一字板惩罚) × (1 − 出货风险折扣)。出货风险折扣 = 连续派发分
-    渐变压制买入侧（借鉴 hot_money_patterns.py），让带派发味的票排名下沉。
+    渐变压制买入侧（沿用早期形态研究），让带派发味的票排名下沉。
     """
     if len(bars) < MIN_BARS:
         return None
@@ -1475,7 +1475,7 @@ def _phase_confidence(phase: str, fired: List[Dict[str, str]],
 
 
 def _phase_invalidations(phase: str) -> List[str]:
-    """每个阶段的证伪/止损条件（借鉴 hot_money_patterns.py 的 invalidations，让标签可执行）。"""
+    """每个阶段的证伪/止损条件（沿用早期形态研究的 invalidations，让标签可执行）。"""
     if "出货" in phase:
         return ["缩量回踩后重新放量突破前高才解除风险", "跌破高位平台下沿=派发确认"]
     if "突破" in phase:

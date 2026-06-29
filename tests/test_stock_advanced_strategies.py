@@ -57,7 +57,13 @@ PIT_SYNTH_STOCK = {
     "dividends": {"records": [], "yearly_dividends": {}, "consecutive_3y_dividend": False},
     "daily": {"stats": {"history_window_annualized_volatility": 0.3,
                         "history_window_avg_daily_amount": 1e8,
+                        "history_window_avg_daily_turnover_rate": 2.5,
                         "latest_daily_close": 15}},
+    "history": {"records": [
+        {"date": "2025-05-28", "close": 10.0, "turnover_rate": 1.0},
+        {"date": "2025-05-29", "close": 10.2, "turnover_rate": 3.0},
+        {"date": "2025-06-02", "close": 10.4, "turnover_rate": 9.0},
+    ]},
 }
 
 
@@ -358,6 +364,8 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertAlmostEqual(live["roe_mean"], 20.0)
         self.assertAlmostEqual(pit["roe_mean"], 10.0)
         self.assertNotAlmostEqual(live["net_margin"], pit["net_margin"])
+        self.assertAlmostEqual(live["liquidity"], 2.5)
+        self.assertAlmostEqual(pit["liquidity"], 2.0)
 
     def test_compute_long_factors_maps_capital_signals(self):
         raw = compute_long_raw_factors(

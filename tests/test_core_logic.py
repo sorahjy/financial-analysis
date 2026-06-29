@@ -20,6 +20,7 @@ from fund_storage import (
 )
 from stock_crawl_common import (
     _normalize_volume_to_hands,
+    daily_stats_from_history_records,
     history_payload_from_records,
     merge_records_by_date,
 )
@@ -672,6 +673,14 @@ class StockHistorySchemaTest(unittest.TestCase):
         )
 
         self.assertEqual([row["date"] for row in payload["records"]], ["2026-06-11"])
+
+    def test_daily_stats_include_average_turnover_rate(self):
+        stats = daily_stats_from_history_records([
+            self.complete_row("2026-06-11"),
+            {**self.complete_row("2026-06-12"), "daily_turnover_rate": 3.7},
+        ])
+
+        self.assertAlmostEqual(stats["history_window_avg_daily_turnover_rate"], 3.0)
 
     def test_single_snapshot_row_does_not_trigger_full_ohlcv_backfill(self):
         records = [

@@ -44,6 +44,7 @@ OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
 OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
 LIVE_CANDIDATE_CACHE_VERSION = 2
+LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
 LONG_CAPITAL_EVENT_DAYS = 90
 HOLDER_TABLE = "shareholder_count"
 REPURCHASE_TABLE = "repurchase"
@@ -90,7 +91,7 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("csi300_persistence", "沪深300稳定代理", "long", "指数约束", "用当前沪深300、中证大盘池近似长期稳定成分。", 0.0, "direct"),
     FactorSpec("market_cap", "总市值", "long", "规模流动性", "偏好大盘股。", 0.0, "percentile"),
     FactorSpec("size_reversal", "小市值因子", "long", "规模流动性", "SMB代理：总市值越小得分越高，给中小盘优质股入场机会。", 0.0, "percentile", "low", missing_score=40),
-    FactorSpec("liquidity", "日均成交额", "long", "规模流动性", "偏好交易容量更高的股票。", 0.6, "percentile"),
+    FactorSpec("liquidity", "日均换手率", "long", "规模流动性", "偏好换手更活跃、且不直接偏向大市值的股票。", 0.6, "percentile"),
     FactorSpec("low_volatility", "低波动", "long", "风险", "年化波动率越低越好。", 0.8, "percentile", "low", missing_score=40),
     FactorSpec("roe_mean", "ROE均值", "long", "质量", "近年ROE均值。", 1.2, "percentile", missing_score=20),
     FactorSpec("roe_stability", "ROE稳定性", "long", "质量", "ROE均值减标准差。", 1.1, "percentile", missing_score=20),
@@ -278,7 +279,7 @@ def price_arrays(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         c = r.get("close")
         cv = c if type(c) is float else safe_float(c)
         close[i] = np.nan if cv is None else cv
-        t = r.get("turnover_rate")
+        t = first_not_none(r.get("turnover_rate"), r.get("daily_turnover_rate"))
         tv = t if type(t) is float else safe_float(t)
         turn[i] = np.nan if tv is None else tv
     cached = {"close": close, "turnover_rate": turn}
@@ -572,8 +573,13 @@ def stock_history_records(stock: Dict[str, Any]) -> List[Dict[str, Any]]:
 
 
 def derived_daily_stats(stock: Dict[str, Any]) -> Dict[str, Any]:
-    stats = (stock.get("daily") or {}).get("stats") or {}
+    stats = dict((stock.get("daily") or {}).get("stats") or {})
     if stats.get("latest_daily_close") is not None or stats.get("latest_close") is not None:
+        if stats.get("history_window_avg_daily_turnover_rate") is None:
+            computed = daily_stats_from_history_records(stock_history_records(stock))
+            turnover = computed.get("history_window_avg_daily_turnover_rate")
+            if turnover is not None:
+                stats["history_window_avg_daily_turnover_rate"] = turnover
         return stats
     return daily_stats_from_history_records(stock_history_records(stock))
 
@@ -725,17 +731,18 @@ def annualized_vol_from_rows(
     return stdev_or_zero(rets) * math.sqrt(252)
 
 
-def pit_liquidity(
-        rows: List[Dict[str, Any]], market_cap_cny: Optional[float], window: int = 60
+def avg_turnover_rate_from_rows(
+        rows: List[Dict[str, Any]], window: int = 60
 ) -> Optional[float]:
-    """PIT 日均成交额(元)代理 = 近窗平均换手率% × 总市值。长历史通常无成交额字段，故近似。"""
-    if not market_cap_cny:
-        return None
-    tos = [safe_float(r.get("turnover_rate")) for r in (rows or [])[-window:]]
+    """PIT 日均换手率(%) = 近窗平均换手率，不再乘总市值。"""
+    tos = [
+        safe_float(first_not_none(r.get("turnover_rate"), r.get("daily_turnover_rate")))
+        for r in (rows or [])[-window:]
+    ]
     tos = [t for t in tos if t is not None and t > 0]
     if not tos:
         return None
-    return (sum(tos) / len(tos)) / 100.0 * market_cap_cny
+    return sum(tos) / len(tos)
 
 
 # ── numpy 向量化版（与上面 rows 版逐字等价，供 optimizer 走缓存数组路径，释放 GIL）──
@@ -761,16 +768,13 @@ def _vol_np(close_full: "np.ndarray", asof_len: int, window: int = 250) -> Optio
     return stdev_or_zero(rets.tolist()) * math.sqrt(252)   # 复用原 std 函数保证口径一致
 
 
-def _liquidity_np(turn_full: "np.ndarray", asof_len: int,
-                  market_cap_cny: Optional[float], window: int = 60) -> Optional[float]:
-    """= pit_liquidity：近 window 换手率(先切窗再过滤>0)均值/100 × 总市值。"""
-    if not market_cap_cny:
-        return None
+def _avg_turnover_rate_np(turn_full: "np.ndarray", asof_len: int, window: int = 60) -> Optional[float]:
+    """= avg_turnover_rate_from_rows：近 window 换手率(先切窗再过滤>0)均值。"""
     w = turn_full[:asof_len][-window:]
     w = w[~np.isnan(w) & (w > 0.0)]
     if w.size == 0:
         return None
-    return float(w.mean()) / 100.0 * market_cap_cny
+    return float(w.mean())
 
 
 def safe_ratio(numerator: Any, denominator: Any) -> Optional[float]:
@@ -1630,8 +1634,12 @@ def compute_long_raw_factors(
     else:
         _hc = [safe_float(row.get("close")) for row in hist_rows]
         ca = np.array([c for c in _hc if c is not None and c > 0], dtype=np.float64)
-        ta = np.array([safe_float(row.get("turnover_rate")) if row.get("turnover_rate") is not None
-                       else np.nan for row in hist_rows], dtype=np.float64) if hist_rows else np.empty(0)
+        turn_values = []
+        for row in hist_rows:
+            turn = first_not_none(row.get("turnover_rate"), row.get("daily_turnover_rate"))
+            turn = safe_float(turn)
+            turn_values.append(np.nan if turn is None else turn)
+        ta = np.array(turn_values, dtype=np.float64) if turn_values else np.empty(0)
     n_close = ca.size
 
     if high_drawdown_pct is None and n_close >= 2:
@@ -1719,20 +1727,18 @@ def compute_long_raw_factors(
             daily_stats.get("volatility_annual"),
         )
         liquidity = first_not_none(
-            daily_stats.get("history_window_avg_daily_amount"),
-            daily_stats.get("avg_daily_turnover_approx"),
-            daily_stats.get("avg_daily_turnover"),
-            snapshot.get("turnover"),
+            daily_stats.get("history_window_avg_daily_turnover_rate"),
+            avg_turnover_rate_from_rows(hist_rows),
         )
         dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
         dividend_consistency = 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0
     else:
         if price_arr is not None and asof_len is not None:
             low_volatility = _vol_np(price_arr["close"], asof_len)
-            liquidity = _liquidity_np(price_arr["turnover_rate"], asof_len, market_cap_cny)
+            liquidity = _avg_turnover_rate_np(price_arr["turnover_rate"], asof_len)
         else:
             low_volatility = annualized_vol_from_rows(hist_rows)
-            liquidity = pit_liquidity(hist_rows, market_cap_cny)
+            liquidity = avg_turnover_rate_from_rows(hist_rows)
         price_asof = float(ca[-1]) if n_close else None
         dividend_yield_5y = scale_ratio_to_pct(
             dividend_yield(stock, years=5, as_of=as_of, price=price_asof)
@@ -2296,6 +2302,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     capital_signature = long_capital_signal_signature()
     meta = {
         "config_key": key,
+        "long_liquidity_factor": LONG_LIQUIDITY_FACTOR_VERSION,
         "stock_data": stock_data_signature,
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
@@ -2312,6 +2319,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         _signature_key(stock_data_signature),
         _signature_key(leader_signature),
         _signature_key(capital_signature),
+        LONG_LIQUIDITY_FACTOR_VERSION,
         key,
     )
     write_live_candidate_cache("long", meta, candidates, notes)
@@ -2325,11 +2333,15 @@ def _build_live_long_candidates_cached(
         stock_data_signature: Tuple[Tuple[str, Any], ...],
         leader_signature: Tuple[Tuple[str, Any], ...],
         capital_signature: Tuple[Tuple[str, Any], ...],
+        liquidity_factor_version: str,
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
     # 磁盘候选缓存另用 db_signature()(内容指纹) 校验，无需易变的文件指纹做 key。
-    _ = (universe_signature, snapshot_signature, stock_data_signature, leader_signature, capital_signature)
+    _ = (
+        universe_signature, snapshot_signature, stock_data_signature,
+        leader_signature, capital_signature, liquidity_factor_version,
+    )
     return build_long_candidates(config_from_key(config_key))
 
 

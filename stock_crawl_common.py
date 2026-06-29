@@ -375,11 +375,19 @@ def daily_stats_from_history_records(records):
         for row in rows
         if safe_float(row.get("daily_amount")) is not None
     ]
+    turnover_rates = []
+    for row in rows:
+        turnover = safe_float(row.get("daily_turnover_rate"))
+        if turnover is not None and turnover > 0:
+            turnover_rates.append(turnover)
 
     return {
         "history_window_trading_days": len(rows),
         "history_window_avg_daily_volume": safe_float(statistics.fmean(volumes)) if volumes else None,
         "history_window_avg_daily_amount": safe_float(statistics.fmean(amounts)) if amounts else None,
+        "history_window_avg_daily_turnover_rate": (
+            safe_float(statistics.fmean(turnover_rates)) if turnover_rates else None
+        ),
         "history_window_annualized_volatility": safe_float(daily_std * math.sqrt(252)) if daily_std is not None else None,
         "history_window_daily_return_std": safe_float(daily_std),
         "latest_daily_close": safe_float(closes[-1]) if closes else None,

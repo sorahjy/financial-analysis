@@ -10,3 +10,4 @@ Flask
 optuna
 tqdm
 rich
+numpy
