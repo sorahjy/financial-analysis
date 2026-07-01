@@ -1950,28 +1950,43 @@ def _apply_reversal_model(rows: List[Dict[str, Any]]) -> None:
         sig["reversal_weights"] = dict(REVERSAL_WEIGHTS)
 
 
-MARKET_REGIME_INDEX = "510310"   # 沪深300 ETF(index_nav)；用单位净值 MA20 判趋势(纪要14择时)
+MARKET_REGIME_INDEX = "510310"   # 沪深300 ETF(index_nav)；优先用累计净值 MA20 判趋势(纪要14择时)
 
 
 def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dict[str, Any]:
-    """市场状态(PIT)：沪深300 收盘 vs MA20。纪要(14)：反转分仅在大盘>MA20 时做多收益翻倍(+0.83% vs +0.47%)。"""
+    """市场状态(PIT)：沪深300 收盘 vs MA20。纪要(14)：反转分仅在大盘>MA20 时做多收益翻倍(+0.83% vs +0.47%)。
+
+    ETF 单位净值(nav)会受分红/折算影响出现跳变；择时只需要连续价格代理，因此优先用累计净值(nav_acc)。
+    """
     entry = stock_storage.load_index_nav(conn, MARKET_REGIME_INDEX)
     recs = (entry.get("records") if isinstance(entry, dict) else None) or []
     series = []
+    fallback_count = 0
     for r in recs:
-        d, v = r.get("date"), _safe(r.get("nav"))
-        if d and v is not None and (as_of is None or d <= as_of):
-            series.append((d, v))
+        d = r.get("date")
+        nav_acc = _safe(r.get("nav_acc"))
+        nav = _safe(r.get("nav"))
+        value = nav_acc if nav_acc is not None and nav_acc > 0 else None
+        field = "nav_acc"
+        if value is None and nav is not None and nav > 0:
+            value = nav
+            field = "nav"
+        if d and value is not None and (as_of is None or d <= as_of):
+            if field == "nav":
+                fallback_count += 1
+            series.append((d, value, field))
     if len(series) < 21:
         return {"available": False}
     series.sort()
-    closes = [v for _, v in series]
-    last_date, last = series[-1][0], closes[-1]
+    closes = [v for _, v, _ in series]
+    last_date, last, last_field = series[-1]
     ma20 = sum(closes[-20:]) / 20.0
     above = last > ma20
     ret5 = (closes[-1] / closes[-6] - 1.0) if len(closes) > 5 else None
     return {
         "available": True, "index": MARKET_REGIME_INDEX, "date": last_date,
+        "value_field": last_field, "value": round(last, 4), "ma20": round(ma20, 4),
+        "fallback_count": fallback_count,
         "above_ma20": above, "ret5": round(ret5, 4) if ret5 is not None else None,
         "favorable": bool(above),
         "note": ("大盘站上MA20：适合做多反转分(top档3日≈+0.83%)"

@@ -165,6 +165,30 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(c_snap, 0.0)            # 纯快照：今日最热→0
         self.assertGreater(c_ema, c_snap)        # 平滑：前两日不热把分抬起
 
+    def test_market_regime_prefers_accumulated_nav_to_avoid_split_break(self):
+        conn = stock_storage.connect(":memory:")
+        records = []
+        base = date(2026, 1, 1)
+        for i in range(25):
+            nav_acc = 1.24 - i * 0.01
+            records.append({
+                "date": (base + timedelta(days=i)).isoformat(),
+                "nav": f"{(2.0 if i == 24 else nav_acc):.4f}",
+                "nav_acc": f"{nav_acc:.4f}",
+            })
+        stock_storage.save_index_nav(conn, {"code": radar.MARKET_REGIME_INDEX, "records": records})
+
+        regime = radar._market_regime(conn)
+
+        self.assertTrue(regime["available"])
+        self.assertEqual(regime["value_field"], "nav_acc")
+        self.assertEqual(regime["fallback_count"], 0)
+        self.assertAlmostEqual(regime["value"], 1.0)
+        self.assertFalse(regime["above_ma20"])
+        self.assertFalse(regime["favorable"])
+        self.assertAlmostEqual(regime["ret5"], -0.0476)
+        conn.close()
+
     def test_empty_pattern_phase_uses_watch_label(self):
         self.assertEqual(radar._pattern_phase([], score=12.3), "观望⚪")
         self.assertIn("观望⚪", radar.PHASE_ORDER)

@@ -1,3 +1,4 @@
+
 """短线雷达（super-short swing）。
 
 目标：捕捉「未来 2-5 天能涨」的标的，持有不超过 10 个交易日——和 stock_hot_money_radar.py
@@ -56,6 +57,7 @@ DEFAULT_MODE = "screen"
 BENCHMARK_INDEX = "510580"      # 中证500ETF(index_nav)，做多超额基准
 BACKTEST_HORIZONS = (2, 5, 10)  # 用户关注的持有期（交易日）
 BUY_TOP_FRAC = 0.2              # 买入组=按买入信号取截面前20%(top quintile)
+BACKTEST_BUCKETS = 5            # Q1~Q5 分层：Q1=最低买入信号/最热，Q5=最高买入信号/最冷
 BACKTEST_MIN_GROUP = 5          # 单截面买入组至少多少只才计入
 
 # ── 短线后验参数（贴 2-5日目标 / 持有≤10日；口径与 hmr.verify 一致，结论可比）──
@@ -334,8 +336,11 @@ CANDIDATE_FACTORS: List[tuple] = [
 def _collect_factor_samples(conn, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
     """PIT 滑窗：对每只票每个 as-of 截面算齐候选因子原始值 + 未来前向收益。
 
-    samples 每项 = {date, code, factors:{name:val}, rets:{h:ret}}。
-    PIT：因子只用截止 as-of 当日的 LOOKBACK 根 bar；收益用其后第 h 根收盘价。
+    samples 每项 = {date, code, factors:{name:val}, rets:{h:ret}, rets_t1:{h:ret}}。
+    PIT：因子只用截止 as-of 当日的 LOOKBACK 根 bar。两套前向收益口径：
+      · rets    收盘→收盘：close[i+h]/close[i] —— 信号日收盘价买入（理想价，封板/涨停时买不进）。
+      · rets_t1 次日开盘→收盘：close[i+h]/open[i+1] —— T+1 开盘真实买入（剥离隔夜跳空/封板幻觉，
+        口径同 momentum_buypoint）。open[i+1] 缺失/≤0 时不填该样本 t1，聚合时独立过滤。
     """
     max_h = max(SHORT_HORIZONS)
     series: Dict[str, tuple] = {}
@@ -369,8 +374,16 @@ def _collect_factor_samples(conn, candidates: List[Dict[str, Any]]) -> Dict[str,
                 rets[h] = cf / close_i - 1.0
             if not ok:
                 continue
+            # T+1 开盘买入口径：信号日(i)收盘出信号、次日(i+1)开盘才买得进，出场仍是第 i+h 日收盘。
+            # open[i+1] 缺失/停牌时该样本无 t1（rets_t1 留空，聚合独立过滤）。
+            open_t1 = bars[i + 1]["open"]
+            rets_t1: Dict[int, float] = {}
+            if open_t1 and open_t1 > 0:
+                for h in SHORT_HORIZONS:
+                    rets_t1[h] = bars[i + h]["close"] / open_t1 - 1.0
             feats = _candidate_factor_values(code, bars[i - LOOKBACK + 1:i + 1])
-            samples.append({"date": d, "code": code, "factors": feats, "rets": rets})
+            samples.append({"date": d, "code": code, "factors": feats,
+                            "rets": rets, "rets_t1": rets_t1})
             used.add(d)
     return {"samples": samples, "dates": sorted(used), "codes": list(series.keys())}
 
@@ -507,20 +520,29 @@ def _print_verify_summary(payload: Dict[str, Any]) -> None:
 # 买入组，算其后 h 日均涨幅；中证500(510580)同期 h 个交易日涨幅为基准；超额=买入组−中证500。
 # 跨日平均 + t（剔大盘 beta 的另一种口径：直接减指数收益），胜率=跑赢中证500的截面占比。
 
-BENCH_JUMP_THRESHOLD = 0.20    # 相邻日 |涨跌|>此值视为数据断裂（index_nav 拼接错误），其窗口作废
+BENCH_JUMP_THRESHOLD = 0.20    # 相邻日 |涨跌|>此值视为异常跳变，其窗口作废
 
 
 def _load_benchmark(conn) -> Dict[str, Any]:
-    """加载基准指数 nav → {dates(升序), navs(并列数组), name, bad(断裂位的右端索引集合)}。
+    """加载基准指数累计净值 → {dates, navs, name, bad, nav_field}。
 
-    ⚠️ index_nav 的 510580/510310 存在跨标的拼接断裂（|日收益|>20% 的假跳变），
-    前向窗口一旦跨越断裂日，比值就是假的——故标记断裂位、_benchmark_forward 跨越即作废。
+    优先使用 nav_acc，避免单位净值 nav 的分红/复权断裂污染超额收益；仅在 nav_acc 缺失时回退 nav。
+    前向窗口一旦跨越异常跳变日，比值不可信——故标记断裂位、_benchmark_forward 跨越即作废。
     """
     entry = stock_storage.load_index_nav(conn, BENCHMARK_INDEX)
     recs = (entry.get("records") if isinstance(entry, dict) else None) or []
     series = []
+    used_acc = 0
+    used_nav = 0
     for r in recs:
-        d, v = r.get("date"), hmr._safe(r.get("nav"))
+        d = r.get("date")
+        v = hmr._safe(r.get("nav_acc"))
+        if v is not None:
+            used_acc += 1
+        else:
+            v = hmr._safe(r.get("nav"))
+            if v is not None:
+                used_nav += 1
         if d and v is not None and v > 0:
             series.append((d, v))
     series.sort()
@@ -528,7 +550,9 @@ def _load_benchmark(conn) -> Dict[str, Any]:
     navs = [v for _, v in series]
     bad = {i for i in range(1, len(navs)) if abs(navs[i] / navs[i - 1] - 1.0) > BENCH_JUMP_THRESHOLD}
     name = (entry.get("name") if isinstance(entry, dict) else None) or BENCHMARK_INDEX
-    return {"dates": dates, "navs": navs, "bad": bad, "name": name, "n_jumps": len(bad)}
+    nav_field = "nav_acc" if used_acc and not used_nav else "nav_acc_fallback_nav" if used_acc else "nav"
+    return {"dates": dates, "navs": navs, "bad": bad, "name": name,
+            "n_jumps": len(bad), "nav_field": nav_field}
 
 
 def _benchmark_forward(bench: Dict[str, Any], d: str, h: int) -> Optional[float]:
@@ -543,21 +567,15 @@ def _benchmark_forward(bench: Dict[str, Any], d: str, h: int) -> Optional[float]
     return (navs[pos + h] / base - 1.0) if base else None
 
 
-def _buygroup_raw(grp: List[Dict[str, Any]], name: str, direction: int,
-                  top_frac: float) -> List[Dict[str, Any]]:
-    """单因子买入组：direction<0 取原始值最低的前 top_frac（不过热），>0 取最高的。"""
+def _raw_signal_scores(grp: List[Dict[str, Any]], name: str, direction: int) -> List[tuple]:
+    """单因子的买入信号分：越高越偏买；反转因子(direction<0)会把低原始值排到高分。"""
     vals = [(s, s["factors"].get(name)) for s in grp]
     vals = [(s, v) for s, v in vals if v is not None]
-    if not vals:
-        return []
-    vals.sort(key=lambda x: x[1])
-    k = max(BACKTEST_MIN_GROUP, round(len(vals) * top_frac))
-    chosen = vals[:k] if direction < 0 else vals[-k:]
-    return [s for s, _ in chosen]
+    return [(s, direction * v) for s, v in vals]
 
 
-def _buygroup_short_score(grp: List[Dict[str, Any]], top_frac: float) -> List[Dict[str, Any]]:
-    """合成分买入组：截面 reverse-rank 等权合成 short_score，取最高的前 top_frac。"""
+def _short_score_signal_scores(grp: List[Dict[str, Any]]) -> List[tuple]:
+    """合成分买入信号：截面 reverse-rank 等权合成，越高越偏买。"""
     pcts = {name: hmr._percentiles_from_values([s["factors"].get(name) for s in grp])
             for name, _ in SHORT_SCORE_FACTORS}
     w = 1.0 / len(SHORT_SCORE_FACTORS)
@@ -568,34 +586,45 @@ def _buygroup_short_score(grp: List[Dict[str, Any]], top_frac: float) -> List[Di
             pct = pcts[name].get(idx, 50.0)
             acc += w * ((100.0 - pct) if direction < 0 else pct)
         scored.append((s, acc))
+    return scored
+
+
+def _top_signal_group(scored: List[tuple], top_frac: float) -> List[Dict[str, Any]]:
+    """按买入信号取最高 top_frac 作为买入组。"""
+    if not scored:
+        return []
     scored.sort(key=lambda x: x[1])
     k = max(BACKTEST_MIN_GROUP, round(len(scored) * top_frac))
     return [s for s, _ in scored[-k:]]
 
 
-def _backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
-                  selector, h: int) -> Dict[str, Any]:
-    """跨 as-of 日：买入组均涨幅 / 中证500同期 / 超额(+t/胜率) / 全池均涨(参考)。"""
-    by_date: Dict[str, List[Dict[str, Any]]] = {}
-    for s in samples:
-        if h in s["rets"]:
-            by_date.setdefault(s["date"], []).append(s)
-    grp_rets, bench_rets, excesses, pool_rets = [], [], [], []
-    for d, grp in by_date.items():
-        bret = _benchmark_forward(bench, d, h)
-        if bret is None:
-            continue
-        buy = selector(grp)
-        rets = [s["rets"][h] for s in buy]
-        if len(rets) < BACKTEST_MIN_GROUP:
-            continue
-        g = hmr._mean(rets)
-        grp_rets.append(g)
-        bench_rets.append(bret)
-        excesses.append(g - bret)
-        pool_rets.append(hmr._mean([s["rets"][h] for s in grp]))
-    if not excesses:
+def _buygroup_raw(grp: List[Dict[str, Any]], name: str, direction: int,
+                  top_frac: float) -> List[Dict[str, Any]]:
+    """单因子买入组：direction<0 取原始值最低的前 top_frac（不过热），>0 取最高的。"""
+    return _top_signal_group(_raw_signal_scores(grp, name, direction), top_frac)
+
+
+def _buygroup_short_score(grp: List[Dict[str, Any]], top_frac: float) -> List[Dict[str, Any]]:
+    """合成分买入组：截面 reverse-rank 等权合成 short_score，取最高的前 top_frac。"""
+    return _top_signal_group(_short_score_signal_scores(grp), top_frac)
+
+
+def _rank_buckets(scored: List[tuple], buckets: int = BACKTEST_BUCKETS) -> List[List[Dict[str, Any]]]:
+    """把买入信号从低到高切成 Q1~Q5；Q1=最热/最不该买，Q5=最冷/最高买入信号。"""
+    if not scored:
+        return [[] for _ in range(buckets)]
+    ordered = sorted(scored, key=lambda x: x[1])
+    n = len(ordered)
+    return [[s for s, _ in ordered[i * n // buckets:(i + 1) * n // buckets]]
+            for i in range(buckets)]
+
+
+def _agg_excess(grp_rets: List[float], bench_rets: List[float],
+                pool_rets: List[float]) -> Dict[str, Any]:
+    """把跨截面的买入组涨幅/基准/全池涨幅聚成 {买入涨幅, 基准, 全池, 超额均值, t, 胜率}。"""
+    if not grp_rets:
         return {"n_sections": 0}
+    excesses = [g - b for g, b in zip(grp_rets, bench_rets)]
     em = hmr._mean(excesses)
     es = (sum((x - em) ** 2 for x in excesses) / len(excesses)) ** 0.5 if len(excesses) > 1 else None
     t = (em / es * math.sqrt(len(excesses))) if es else None
@@ -603,10 +632,123 @@ def _backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
         "n_sections": len(excesses),
         "buy_ret": round(hmr._mean(grp_rets), 4),
         "benchmark_ret": round(hmr._mean(bench_rets), 4),
-        "pool_ret": round(hmr._mean(pool_rets), 4),
+        "pool_ret": round(hmr._mean(pool_rets), 4) if pool_rets else None,
         "excess_mean": round(em, 4),
         "excess_t_stat": round(t, 2) if t is not None else None,
         "win_rate": round(sum(1 for x in excesses if x > 0) / len(excesses), 3),
+    }
+
+
+def _agg_spread(spreads: List[float]) -> Dict[str, Any]:
+    """聚合 Q5-Q1 分层价差；正值表示最高买入信号档跑赢最低买入信号档。"""
+    if not spreads:
+        return {"n_sections": 0}
+    sm = hmr._mean(spreads)
+    ss = (sum((x - sm) ** 2 for x in spreads) / len(spreads)) ** 0.5 if len(spreads) > 1 else None
+    t = (sm / ss * math.sqrt(len(spreads))) if ss else None
+    return {
+        "n_sections": len(spreads),
+        "spread_mean": round(sm, 4),
+        "spread_t_stat": round(t, 2) if t is not None else None,
+        "win_rate": round(sum(1 for x in spreads if x > 0) / len(spreads), 3),
+    }
+
+
+def _backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
+                  selector, h: int) -> Dict[str, Any]:
+    """跨 as-of 日，同一买入组算两套口径的买入组涨幅 / 中证500同期 / 超额(+t/胜率)。
+
+    close：信号日收盘价买入（理想，封板买不进时偏乐观）。
+    t1open：次日开盘买入（剥离隔夜跳空/封板幻觉，口径同 momentum_buypoint）。
+    两套各自独立过 BACKTEST_MIN_GROUP（T+1 组剔掉次日停牌/无开盘价的样本，可能更小）。
+    """
+    by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for s in samples:
+        if h in s["rets"]:
+            by_date.setdefault(s["date"], []).append(s)
+    cc_grp, cc_bench, cc_pool = [], [], []      # close-to-close
+    t1_grp, t1_bench = [], []                    # T+1 open-to-close
+    for d, grp in by_date.items():
+        bret = _benchmark_forward(bench, d, h)
+        if bret is None:
+            continue
+        buy = selector(grp)
+        rets = [s["rets"][h] for s in buy]
+        if len(rets) >= BACKTEST_MIN_GROUP:
+            cc_grp.append(hmr._mean(rets))
+            cc_bench.append(bret)
+            cc_pool.append(hmr._mean([s["rets"][h] for s in grp]))
+        rets_t1 = [s["rets_t1"][h] for s in buy if h in s.get("rets_t1", {})]
+        if len(rets_t1) >= BACKTEST_MIN_GROUP:
+            t1_grp.append(hmr._mean(rets_t1))
+            t1_bench.append(bret)
+    return {
+        "n_sections": len(cc_grp),
+        "close": _agg_excess(cc_grp, cc_bench, cc_pool),
+        "t1open": _agg_excess(t1_grp, t1_bench, []),
+    }
+
+
+def _quintile_backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
+                           scorer: Callable[[List[Dict[str, Any]]], List[tuple]],
+                           h: int) -> Dict[str, Any]:
+    """Q1~Q5 分层回测；Q1=最低买入信号/最热，Q5=最高买入信号/最冷。"""
+    by_date: Dict[str, List[Dict[str, Any]]] = {}
+    for s in samples:
+        if h in s["rets"]:
+            by_date.setdefault(s["date"], []).append(s)
+
+    cc_grp = [[] for _ in range(BACKTEST_BUCKETS)]
+    cc_bench = [[] for _ in range(BACKTEST_BUCKETS)]
+    t1_grp = [[] for _ in range(BACKTEST_BUCKETS)]
+    t1_bench = [[] for _ in range(BACKTEST_BUCKETS)]
+    cc_spreads: List[float] = []
+    t1_spreads: List[float] = []
+
+    for d, grp in by_date.items():
+        bret = _benchmark_forward(bench, d, h)
+        if bret is None:
+            continue
+        buckets = _rank_buckets(scorer(grp), BACKTEST_BUCKETS)
+        cc_means: List[Optional[float]] = [None] * BACKTEST_BUCKETS
+        t1_means: List[Optional[float]] = [None] * BACKTEST_BUCKETS
+        for idx, bucket in enumerate(buckets):
+            rets = [s["rets"][h] for s in bucket]
+            if len(rets) >= BACKTEST_MIN_GROUP:
+                m = hmr._mean(rets)
+                cc_means[idx] = m
+                cc_grp[idx].append(m)
+                cc_bench[idx].append(bret)
+            rets_t1 = [s["rets_t1"][h] for s in bucket if h in s.get("rets_t1", {})]
+            if len(rets_t1) >= BACKTEST_MIN_GROUP:
+                m = hmr._mean(rets_t1)
+                t1_means[idx] = m
+                t1_grp[idx].append(m)
+                t1_bench[idx].append(bret)
+        if cc_means[0] is not None and cc_means[-1] is not None:
+            cc_spreads.append(cc_means[-1] - cc_means[0])
+        if t1_means[0] is not None and t1_means[-1] is not None:
+            t1_spreads.append(t1_means[-1] - t1_means[0])
+
+    buckets_out = []
+    for idx in range(BACKTEST_BUCKETS):
+        label = f"Q{idx + 1}"
+        buckets_out.append({
+            "bucket": label,
+            "rank": idx + 1,
+            "role": "hottest_lowest_signal" if idx == 0
+                    else "coldest_highest_signal" if idx == BACKTEST_BUCKETS - 1
+                    else "middle_signal",
+            "close": _agg_excess(cc_grp[idx], cc_bench[idx], []),
+            "t1open": _agg_excess(t1_grp[idx], t1_bench[idx], []),
+        })
+    return {
+        "bucket_order": "Q1=最低买入信号/最热；Q5=最高买入信号/最冷",
+        "buckets": buckets_out,
+        "q5_minus_q1": {
+            "close": _agg_spread(cc_spreads),
+            "t1open": _agg_spread(t1_spreads),
+        },
     }
 
 
@@ -626,21 +768,30 @@ def run_backtest(as_of: Optional[str] = None, max_cap: Optional[float] = None,
     if samples:
         for name, direction in SHORT_SCORE_FACTORS:               # 三个买入因子分别
             sel = (lambda grp, nm=name, dr=direction: _buygroup_raw(grp, nm, dr, BUY_TOP_FRAC))
+            scorer = (lambda grp, nm=name, dr=direction: _raw_signal_scores(grp, nm, dr))
             entries.append({"factor": name, "role": role_of.get(name, ""),
-                            "horizons": {str(h): _backtest_one(samples, bench, sel, h) for h in BACKTEST_HORIZONS}})
+                            "horizons": {str(h): _backtest_one(samples, bench, sel, h) for h in BACKTEST_HORIZONS},
+                            "quintiles": {str(h): _quintile_backtest_one(samples, bench, scorer, h)
+                                          for h in BACKTEST_HORIZONS}})
         sel_c = (lambda grp: _buygroup_short_score(grp, BUY_TOP_FRAC))   # 合成分
+        scorer_c = (lambda grp: _short_score_signal_scores(grp))
         entries.append({"factor": "short_score(合成)", "role": "三因子等权",
-                        "horizons": {str(h): _backtest_one(samples, bench, sel_c, h) for h in BACKTEST_HORIZONS}})
+                        "horizons": {str(h): _backtest_one(samples, bench, sel_c, h) for h in BACKTEST_HORIZONS},
+                        "quintiles": {str(h): _quintile_backtest_one(samples, bench, scorer_c, h)
+                                      for h in BACKTEST_HORIZONS}})
 
     payload = base_payload("backtest", len(candidates), pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "买入组(截面前20%)绝对收益 + 对中证500超额，持有 2/5/10 日；跨as-of日平均+t+胜率。",
+        "description": "买入组(截面前20%)绝对收益 + 对中证500超额，持有 2/5/10 日；跨as-of日平均+t+胜率。"
+                       "两套买入口径：close=信号日收盘价买入(理想)、t1open=次日开盘买入(剥离封板/跳空幻觉,真实可执行)。",
         "params": {
             "horizons": list(BACKTEST_HORIZONS), "buy_top_frac": BUY_TOP_FRAC,
+            "buckets": BACKTEST_BUCKETS, "bucket_order": "Q1=最低买入信号/最热；Q5=最高买入信号/最冷",
             "step": VERIFY_STEP, "window_days": VERIFY_WINDOW_DAYS, "min_group": BACKTEST_MIN_GROUP,
-            "benchmark": {"index": BENCHMARK_INDEX, "name": bench["name"], "n_jumps": bench["n_jumps"],
-                          "caveat": "index_nav 数据有拼接断裂，跨断裂日的前向窗口已剔除(h越大剔越多)；建议重爬指数净值。"},
+            "benchmark": {"index": BENCHMARK_INDEX, "name": bench["name"], "nav_field": bench["nav_field"],
+                          "n_jumps": bench["n_jumps"],
+                          "caveat": "基准优先使用累计净值 nav_acc；若检测到异常跳变，跨跳变日的前向窗口会剔除。"},
         },
         "pool": pool,
         "section_count": len(collected["dates"]),
@@ -663,10 +814,10 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
     print(f"  生成时间: {payload['generated_at']} · 池: {payload.get('pool')}({payload['candidate_count']})"
           f" · 截面: {payload.get('section_count', 0)} · 样本: {payload.get('sample_count', 0)}"
           + (f" · 区间: {rng[0]}~{rng[1]}" if rng else ""))
-    print(f"  买入组=截面前{payload.get('params', {}).get('buy_top_frac', 0) * 100:.0f}% · 基准: 中证500({bm.get('index')})"
+    print(f"  买入组=截面前{payload.get('params', {}).get('buy_top_frac', 0) * 100:.0f}% · 基准: 中证500({bm.get('index')},{bm.get('nav_field')})"
           f" · 落盘: {hmr.display_path(hmr.CAPITAL_DIR / 'short_term_backtest.json')}")
     if bm.get("n_jumps"):
-        print(f"  ⚠️基准 index_nav 有 {bm.get('n_jumps')} 处数据断裂(跨标的拼接)，跨断裂窗口已剔除(h越大剔越多)；数字偏代理，建议重爬指数净值")
+        print(f"  ⚠️基准 {bm.get('nav_field')} 有 {bm.get('n_jumps')} 处异常跳变，跨跳变窗口已剔除(h越大剔越多)")
     print("-" * 104)
     entries = payload.get("entries", [])
     if not entries:
@@ -674,22 +825,45 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
             print(f"  {note}")
         print("=" * 104)
         return
-    print(f"  {'因子':<14}{'持有':>5}{'买入组涨幅':>11}{'中证500':>10}{'超额':>9}{'超额t':>7}{'胜率':>7}{'(全池均涨)':>11}")
+    print(f"  {'因子':<14}{'持有':>5}{'收盘买入':>9}{'T1开盘买':>9}{'中证500':>9}"
+          f"{'收盘超额':>9}{'T1超额':>9}{'T1超额t':>8}{'T1胜率':>7}")
     for e in entries:
         first = True
         for h in BACKTEST_HORIZONS:
             hz = e["horizons"].get(str(h), {})
+            cc = hz.get("close", {})
+            t1 = hz.get("t1open", {})
             label = e["factor"] if first else ""
-            win = hz.get("win_rate")
+            win = t1.get("win_rate")
             win_s = f"{win * 100:.0f}%" if win is not None else "-"
-            print(f"  {label:<14}{str(h) + '日':>5}{hmr._pct(hz.get('buy_ret')):>11}{hmr._pct(hz.get('benchmark_ret')):>10}"
-                  f"{hmr._pct(hz.get('excess_mean')):>9}{hmr._fmt(hz.get('excess_t_stat')):>7}{win_s:>7}"
-                  f"{hmr._pct(hz.get('pool_ret')):>11}")
+            print(f"  {label:<14}{str(h) + '日':>5}{hmr._pct(cc.get('buy_ret')):>9}{hmr._pct(t1.get('buy_ret')):>9}"
+                  f"{hmr._pct(cc.get('benchmark_ret')):>9}{hmr._pct(cc.get('excess_mean')):>9}"
+                  f"{hmr._pct(t1.get('excess_mean')):>9}{hmr._fmt(t1.get('excess_t_stat')):>8}{win_s:>7}")
             first = False
         print(f"  {e.get('role', '')}")
     print("-" * 104)
-    print("  说明: 买入组涨幅=能涨多少(含大盘beta)；超额=买入组−中证500同期=能跑赢多少(剔beta)；"
-          "胜率=跑赢中证500的截面占比；持有期到点即平。")
+    print("  ▼ Q1-Q5 分层（T1开盘买入超额；Q1=最低买入信号/最热，Q5=最高买入信号/最冷）")
+    print(f"  {'因子':<14}{'持有':>5}{'Q1热':>8}{'Q2':>8}{'Q3':>8}{'Q4':>8}{'Q5冷':>8}"
+          f"{'Q5-Q1':>9}{'价差t':>7}{'胜率':>7}")
+    for e in entries:
+        first = True
+        for h in BACKTEST_HORIZONS:
+            qh = e.get("quintiles", {}).get(str(h), {})
+            buckets = qh.get("buckets", [])
+            vals = [hmr._pct(b.get("t1open", {}).get("excess_mean")) for b in buckets]
+            vals += ["-"] * max(0, BACKTEST_BUCKETS - len(vals))
+            spread = qh.get("q5_minus_q1", {}).get("t1open", {})
+            win = spread.get("win_rate")
+            win_s = f"{win * 100:.0f}%" if win is not None else "-"
+            label = e["factor"] if first else ""
+            print(f"  {label:<14}{str(h) + '日':>5}{vals[0]:>8}{vals[1]:>8}{vals[2]:>8}{vals[3]:>8}{vals[4]:>8}"
+                  f"{hmr._pct(spread.get('spread_mean')):>9}{hmr._fmt(spread.get('spread_t_stat')):>7}{win_s:>7}")
+            first = False
+        print(f"  {e.get('role', '')}")
+    print("-" * 104)
+    print("  说明: 收盘买入=信号日收盘价买(理想,封板买不进时偏乐观)；T1开盘买=次日开盘真实买入(剥离跳空/封板幻觉)；")
+    print("       超额=买入组−中证500同期(剔beta)；T1胜率=T1口径下跑赢中证500的截面占比；持有期到点(收盘)即平。")
+    print("       Q5-Q1=最高买入信号档相对最低买入信号档的组间价差；若 Q1 很差但 Q5 不强，反转因子更像避雷滤网。")
     print("=" * 104)
 
 

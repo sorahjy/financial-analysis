@@ -91,7 +91,27 @@ EASTMONEY_HEADERS = {
 STOCK_DB_FILE = DATA_DIR.parent / "stock_data.sqlite3"
 
 DEFAULT_TOP_PER_SEGMENT = 3
-FORCED_SEGMENT_LEADER_CODES = ["002741","002507"]  # 筛完各 SW3 topN 后仍强制纳入其所属赛道
+FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属赛道
+    # 消费
+    "002507",  # 涪陵榨菜
+    "002956", # 西麦视频
+    # 机器人
+    "300124",  # 汇川技术
+    "002050",  # 三花智控
+    "601689",  # 拓普集团
+    "002472",  # 双环传动
+    "688017",  # 绿的谐波
+    # 晶圆厂
+    "002371",  # 北方华创
+    # 先进封装
+    "600584",  # 长电科技
+    "002156",  # 通富微电
+    "002185",  # 华天科技
+    # CPO
+    "600703",  # 三安光电
+    "603228",  # 景旺电子
+]
+
 DEFAULT_POOL_MAX_AGE_DAYS = 14
 LOCAL_TAXONOMY_MIN_BACKUP_RATIO = 0.80
 

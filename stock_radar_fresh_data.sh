@@ -9,3 +9,4 @@ python stock_crawl_capital.py --no-proxy
 python plate_crawl_history.py --no-proxy
 python stock_theme_candidates.py
 python stock_crawl_hot_money_universe.py
+python stock_hot_money_radar.py ambush --no-exclude-large-cap --pool leader
