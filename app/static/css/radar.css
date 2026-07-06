@@ -97,6 +97,185 @@
   min-width: 58px;
 }
 
+.industry-filter {
+  position: relative;
+  display: inline-flex;
+  z-index: 5;
+}
+.industry-filter-trigger {
+  max-width: 280px;
+  min-height: 32px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 5px 9px;
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--panel);
+  color: var(--ink);
+  cursor: pointer;
+}
+.industry-filter-trigger:hover,
+.industry-filter-trigger[aria-expanded="true"] {
+  border-color: var(--blue);
+}
+.industry-filter-trigger.is-filtered {
+  background: #eef5ff;
+  border-color: #9ebcff;
+}
+.industry-filter-trigger:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+.industry-filter-label {
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.industry-filter-summary {
+  min-width: 44px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  text-align: left;
+}
+.industry-filter-panel {
+  position: absolute;
+  left: 0;
+  top: calc(100% + 8px);
+  width: 420px;
+  max-width: min(420px, calc(100vw - 48px));
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel);
+  box-shadow: 0 16px 36px rgba(25, 32, 50, .18);
+  padding: 10px;
+}
+.industry-filter-search {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+.industry-filter-search input[type="search"] {
+  width: 100%;
+  min-width: 0;
+}
+.industry-heat-filter {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
+.industry-heat-filter input[type="number"] {
+  width: 58px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 6px 8px;
+  background: var(--panel);
+  color: var(--ink);
+}
+.industry-selected {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-height: 28px;
+  max-height: 68px;
+  overflow: auto;
+  padding: 8px 0 4px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.industry-chip {
+  border: 1px solid #c7d7ff;
+  border-radius: 999px;
+  background: #eef5ff;
+  color: #315cbb;
+  padding: 3px 8px;
+  cursor: pointer;
+  font-size: 12px;
+}
+.industry-chip:hover { border-color: var(--blue); }
+.industry-chip small { color: #6a7aa0; font-size: 11px; }
+.industry-filter-tools {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 4px 0 8px;
+  border-bottom: 1px solid var(--panel-soft);
+}
+.mini-link {
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  background: var(--panel-soft);
+  color: var(--muted);
+  padding: 4px 9px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.mini-link:hover { color: var(--blue); border-color: var(--blue); }
+.mini-link:disabled { opacity: .45; cursor: not-allowed; }
+.industry-options {
+  max-height: 300px;
+  overflow: auto;
+  padding-top: 6px;
+}
+.industry-option {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 8px;
+  min-height: 34px;
+  padding: 5px 6px;
+  border-radius: 7px;
+  cursor: pointer;
+}
+.industry-option:hover { background: #f1f6ff; }
+.industry-option input { margin: 0; }
+.industry-option-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--ink);
+}
+.industry-option-heat,
+.industry-option-count {
+  border-radius: 999px;
+  padding: 1px 7px;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.industry-option-heat {
+  background: #fff6da;
+  color: #9a6b00;
+}
+.industry-option-count {
+  background: var(--panel-soft);
+  color: var(--muted);
+}
+.industry-empty {
+  padding: 18px 8px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 12px;
+}
+
+@media (max-width: 720px) {
+  .industry-filter-panel {
+    position: fixed;
+    left: 14px;
+    right: 14px;
+    top: 132px;
+    width: auto;
+    max-width: none;
+  }
+  .industry-options { max-height: 46vh; }
+}
+
 .radar-split { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(320px, 1fr); gap: 16px; align-items: start; }
 @media (max-width: 1100px) { .radar-split { grid-template-columns: 1fr; } }
 

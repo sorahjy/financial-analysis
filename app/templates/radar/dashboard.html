@@ -36,6 +36,27 @@
     <select id="radar-phase-filter" aria-label="按阶段筛选">
       <option value="">全部阶段</option>
     </select>
+    <div id="radar-sw2-filter" class="industry-filter">
+      <button id="radar-sw2-trigger" class="industry-filter-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+        <span class="industry-filter-label">二级行业</span>
+        <span id="radar-sw2-summary" class="industry-filter-summary">全部</span>
+      </button>
+      <div id="radar-sw2-panel" class="industry-filter-panel" hidden>
+        <div class="industry-filter-search">
+          <input id="radar-sw2-search" type="search" placeholder="搜索二级行业">
+          <label class="industry-heat-filter">热度 &gt;
+            <input id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="50">
+          </label>
+        </div>
+        <div id="radar-sw2-selected" class="industry-selected"></div>
+        <div class="industry-filter-tools">
+          <button id="radar-sw2-hot" class="mini-link" type="button">热度Top10</button>
+          <button id="radar-sw2-select-all" class="mini-link" type="button">全选</button>
+          <button id="radar-sw2-clear" class="mini-link" type="button">清空</button>
+        </div>
+        <div id="radar-sw2-options" class="industry-options" role="listbox" aria-label="二级行业多选"></div>
+      </div>
+    </div>
     <label class="filter-num">吸筹分 ≥
       <input id="radar-min-score" type="number" min="0" max="100" step="1" value="0">
     </label>

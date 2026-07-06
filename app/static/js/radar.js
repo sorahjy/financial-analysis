@@ -71,6 +71,8 @@
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
     let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
+    let sw2Options = [];
+    let selectedSw2Industries = new Set();
     const $ = (id) => document.getElementById(id);
 
     function normalizePayload(raw) {
@@ -102,6 +104,133 @@
       } catch (err) { /* 解释模块降级为只显示编号 */ }
     }
 
+    function stockSw2Name(s) {
+      return String((s && s.parent_segment) || "").trim();
+    }
+
+    function sw2HeatValue(s) {
+      const v = s && s.sw2_heat_pctile;
+      if (v === null || v === undefined || v === "" || Number.isNaN(Number(v))) return null;
+      return Number(v);
+    }
+
+    function heatText(v) {
+      return v === null || v === undefined ? "热-" : `热${Math.round(v)}`;
+    }
+
+    function buildSw2Options() {
+      const byName = new Map();
+      stocks.forEach((s) => {
+        const name = stockSw2Name(s);
+        if (!name) return;
+        const heat = sw2HeatValue(s);
+        const row = byName.get(name) || { name, heat: null, count: 0 };
+        row.count += 1;
+        if (heat !== null && (row.heat === null || heat > row.heat)) row.heat = heat;
+        byName.set(name, row);
+      });
+      return Array.from(byName.values()).sort((a, b) => {
+        const ah = a.heat === null ? -1 : a.heat;
+        const bh = b.heat === null ? -1 : b.heat;
+        if (bh !== ah) return bh - ah;
+        if (b.count !== a.count) return b.count - a.count;
+        return a.name.localeCompare(b.name, "zh-Hans-CN");
+      });
+    }
+
+    function pickedSw2Options() {
+      return sw2Options.filter((o) => selectedSw2Industries.has(o.name));
+    }
+
+    function syncSw2Filter() {
+      sw2Options = buildSw2Options();
+      const validNames = new Set(sw2Options.map((o) => o.name));
+      selectedSw2Industries = new Set(Array.from(selectedSw2Industries).filter((name) => validNames.has(name)));
+      renderSw2Filter();
+    }
+
+    function visibleSw2Options() {
+      const q = (($("radar-sw2-search") && $("radar-sw2-search").value) || "").trim().toLowerCase();
+      const minHeatValue = Number(($("radar-sw2-min-heat") && $("radar-sw2-min-heat").value) || 0);
+      const minHeat = Number.isNaN(minHeatValue) ? 0 : minHeatValue;
+      return sw2Options.filter((o) => {
+        if (o.heat === null || o.heat <= minHeat) return false;
+        if (!q) return true;
+        return o.name.toLowerCase().includes(q);
+      });
+    }
+
+    function renderSw2Filter() {
+      const trigger = $("radar-sw2-trigger");
+      const summary = $("radar-sw2-summary");
+      const selectedBox = $("radar-sw2-selected");
+      const optionsBox = $("radar-sw2-options");
+      if (!trigger || !summary || !selectedBox || !optionsBox) return;
+
+      const picked = pickedSw2Options();
+      if (!picked.length) summary.textContent = sw2Options.length ? "全部" : "无行业";
+      else if (picked.length === 1) summary.textContent = `${picked[0].name} ${heatText(picked[0].heat)}`;
+      else summary.textContent = `已选 ${picked.length} 个`;
+      trigger.disabled = !sw2Options.length;
+      trigger.classList.toggle("is-filtered", picked.length > 0);
+
+      selectedBox.innerHTML = picked.length
+        ? picked.map((o) => `<button type="button" class="industry-chip" data-name="${esc(o.name)}">${esc(o.name)} <small>${heatText(o.heat)}</small></button>`).join("")
+        : "<span>全部二级行业</span>";
+      selectedBox.querySelectorAll("button").forEach((btn) => {
+        btn.onclick = () => {
+          selectedSw2Industries.delete(btn.dataset.name);
+          renderSw2Filter();
+          applyFilters();
+        };
+      });
+
+      const shown = visibleSw2Options();
+      optionsBox.innerHTML = shown.length ? shown.map((o) => {
+        const checked = selectedSw2Industries.has(o.name) ? " checked" : "";
+        return `<label class="industry-option" title="${esc(o.name)} ${heatText(o.heat)} · ${o.count}只">
+          <input type="checkbox" value="${esc(o.name)}"${checked}>
+          <span class="industry-option-name">${esc(o.name)}</span>
+          <span class="industry-option-heat">${heatText(o.heat)}</span>
+          <span class="industry-option-count">${o.count}只</span>
+        </label>`;
+      }).join("") : "<div class='industry-empty'>无匹配行业</div>";
+      optionsBox.querySelectorAll("input[type='checkbox']").forEach((input) => {
+        input.onchange = () => {
+          if (input.checked) selectedSw2Industries.add(input.value);
+          else selectedSw2Industries.delete(input.value);
+          renderSw2Filter();
+          applyFilters();
+        };
+      });
+      const clear = $("radar-sw2-clear");
+      if (clear) clear.disabled = picked.length === 0;
+      const selectAll = $("radar-sw2-select-all");
+      if (selectAll) selectAll.disabled = shown.length === 0;
+    }
+
+    function setSw2PanelOpen(open) {
+      const panel = $("radar-sw2-panel");
+      const trigger = $("radar-sw2-trigger");
+      if (!panel || !trigger) return;
+      panel.hidden = !open;
+      trigger.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) {
+        renderSw2Filter();
+        const search = $("radar-sw2-search");
+        if (search) search.focus({ preventScroll: true });
+      }
+    }
+
+    function onDocumentClick(ev) {
+      const box = $("radar-sw2-filter");
+      if (box && !box.contains(ev.target)) setSw2PanelOpen(false);
+    }
+
+    function onDocumentKeyDown(ev) {
+      if (ev.key === "Escape") setSw2PanelOpen(false);
+    }
+
     // ---------- 数据加载 ----------
     async function fetchData() {
       try {
@@ -110,6 +239,7 @@
         if (disposed) return null;
         payload = normalizePayload(data.payload || {});
         stocks = payload.stocks;
+        syncSw2Filter();
         renderMeta();
         renderPhaseFilter();
         renderPhaseChips();
@@ -194,6 +324,7 @@
         phase: $("radar-phase-filter").value || "",
         minScore: Number($("radar-min-score").value || 0),
         hideDist: $("radar-hide-dist").checked,
+        sw2: new Set(selectedSw2Industries),
       };
     }
 
@@ -202,7 +333,8 @@
       const list = stocks.filter((s) => {
         if (f.phase && s.pattern_phase !== f.phase) return false;
         if (f.hideDist && String(s.pattern_phase || "").includes("出货")) return false;
-      if ((Number(s.ambush_score) || 0) < f.minScore) return false;
+        if ((Number(s.ambush_score) || 0) < f.minScore) return false;
+        if (f.sw2.size && !f.sw2.has(stockSw2Name(s))) return false;
         if (f.q) {
           const hay = `${s.code} ${s.name || ""} ${s.tracking_theme || ""} ${s.parent_segment || ""} ${s.segment_name || ""}`.toLowerCase();
           if (!hay.includes(f.q)) return false;
@@ -778,6 +910,24 @@
         if (!window.confirm("刷新数据将重爬全市场行情 + 板块 + 题材，大约需要 10–30 分钟，期间请勿关闭页面。\n\n确认现在开始吗？")) return;
         startJob("/api/radar/refresh-data", "数据刷新", null);
       };
+      $("radar-sw2-trigger").onclick = () => setSw2PanelOpen($("radar-sw2-panel").hidden);
+      $("radar-sw2-search").addEventListener("input", renderSw2Filter);
+      $("radar-sw2-min-heat").addEventListener("input", renderSw2Filter);
+      $("radar-sw2-clear").onclick = () => {
+        selectedSw2Industries.clear();
+        renderSw2Filter();
+        applyFilters();
+      };
+      $("radar-sw2-hot").onclick = () => {
+        selectedSw2Industries = new Set(sw2Options.filter((o) => o.heat !== null).slice(0, 10).map((o) => o.name));
+        renderSw2Filter();
+        applyFilters();
+      };
+      $("radar-sw2-select-all").onclick = () => {
+        selectedSw2Industries = new Set(visibleSw2Options().map((o) => o.name));
+        renderSw2Filter();
+        applyFilters();
+      };
       ["radar-search", "radar-phase-filter", "radar-min-score", "radar-hide-dist"].forEach((id) => {
         const el = $(id);
         el.addEventListener(el.tagName === "SELECT" || el.type === "checkbox" ? "change" : "input", applyFilters);
@@ -799,6 +949,8 @@
         updateKlineDetail(klineBars.length ? klineBars.length - 1 : null);
       });
       window.addEventListener("resize", onResize);
+      document.addEventListener("click", onDocumentClick);
+      document.addEventListener("keydown", onDocumentKeyDown);
       fetchPatternCatalog();
       fetchData();
     }
@@ -810,6 +962,8 @@
       disposed = true;
       if (pollTimer) clearInterval(pollTimer);
       window.removeEventListener("resize", onResize);
+      document.removeEventListener("click", onDocumentClick);
+      document.removeEventListener("keydown", onDocumentKeyDown);
     };
     boot();
   }
