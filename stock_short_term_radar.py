@@ -53,16 +53,20 @@ POOLS = hmr.POOLS
 MODES = ("screen", "verify", "backtest")
 DEFAULT_MODE = "screen"
 
-# ── backtest 参数：买入组绝对收益 + 对中证500超额 ──
-BENCHMARK_INDEX = "510580"      # 中证500ETF(index_nav)，做多超额基准
-BACKTEST_HORIZONS = (2, 5, 10)  # 用户关注的持有期（交易日）
+# ── backtest 参数：买入组绝对收益 + 对沪深300/中证500等权混合基准超额 ──
+BENCHMARK_NAME = "沪深300+中证500等权"
+BENCHMARK_COMPONENTS = [
+    ("510310", "沪深300ETF"),   # index_nav，按日 50/50 再平衡
+    ("510580", "中证500ETF"),
+]
+BACKTEST_HORIZONS = (2, 5, 10, 20)  # 用户关注的持有期（交易日）
 BUY_TOP_FRAC = 0.2              # 买入组=按买入信号取截面前20%(top quintile)
-BACKTEST_BUCKETS = 5            # Q1~Q5 分层：Q1=最低买入信号/最热，Q5=最高买入信号/最冷
+BACKTEST_BUCKETS = 5            # Q1~Q5 分层：Q1=最低买入信号，Q5=最高买入信号
 BACKTEST_MIN_GROUP = 5          # 单截面买入组至少多少只才计入
 
 # ── 短线后验参数（贴 2-5日目标 / 持有≤10日；口径与 hmr.verify 一致，结论可比）──
 LOOKBACK = hmr.LOOKBACK                 # 每只票 PIT 窗口长度（够算量比/换手分位/MA20）
-SHORT_HORIZONS = (2, 3, 5, 10)          # 前向收益周期（交易日）：2-5日博反弹 + 10日持有上限
+SHORT_HORIZONS = (2, 3, 5, 10, 20)      # 前向收益周期（交易日）：verify 保留3日，backtest 增加20日
 VERIFY_STEP = hmr.VERIFY_STEP           # 每隔多少个交易日取一个 as-of 截面
 VERIFY_WINDOW_DAYS = hmr.VERIFY_WINDOW_DAYS   # 回测窗口（交易日，约3年）
 VERIFY_MIN_NAMES = hmr.VERIFY_MIN_NAMES       # 单截面至少多少只票才计 IC/多空
@@ -82,6 +86,16 @@ SHORT_SCORE_FACTORS = [
     ("amp_today",   -1),
     ("dist_ma20",   -1),
 ]
+
+# 文档《抓主升浪战法》三大战法：作为独立候选/回测因子，不直接混入已验证 short_score。
+MAIN_WAVE_FACTORS = [
+    ("main_wave_triple_cross", +1),
+    ("main_wave_bullish_pierce", +1),
+    ("main_wave_2560", +1),
+]
+
+# backtest 同时覆盖文档三因子与原已验证短线反转因子；打印时文档因子排在前面。
+BACKTEST_SIGNAL_FACTORS = MAIN_WAVE_FACTORS + SHORT_SCORE_FACTORS
 
 
 # ── 风控层：搬自 stock_hot_money_radar 的高位派发风控因子（P17/P19/P22）──
@@ -308,21 +322,254 @@ def _print_screen_summary(payload: Dict[str, Any]) -> None:
 #   +1 = 动量（预期 IC 为正：值越高未来越强）。
 # 有效 = sign(IC)==direction 且 |t|≥EFFECTIVE_T。
 
+def _clip01(value: float) -> float:
+    return max(0.0, min(1.0, float(value)))
+
+
+def _scale_between(value: Optional[float], lo: float, hi: float) -> float:
+    """把 value 在线性区间 lo~hi 映射到 0~1，自动裁边。"""
+    if value is None or hi == lo:
+        return 0.0
+    return _clip01((value - lo) / (hi - lo))
+
+
+def _mean_present(values: Sequence[Optional[float]], positive_only: bool = False) -> Optional[float]:
+    vals = [v for v in values if v is not None and (not positive_only or v > 0)]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _ma_at(values: Sequence[Optional[float]], n: int, end: Optional[int] = None) -> Optional[float]:
+    """滚动均值，end 为 Python 切片右边界；至少 60% 样本存在才返回。"""
+    end = len(values) if end is None else end
+    if end <= 0:
+        return None
+    seg = values[max(0, end - n):end]
+    vals = [v for v in seg if v is not None]
+    return sum(vals) / len(vals) if len(vals) >= max(2, int(n * 0.6)) else None
+
+
+def _rolling_ma_series(values: Sequence[Optional[float]], n: int) -> List[Optional[float]]:
+    return [_ma_at(values, n, i + 1) for i in range(len(values))]
+
+
+def _crossed_up_recent(a: Sequence[Optional[float]], b: Sequence[Optional[float]],
+                       lookback: int = 3) -> bool:
+    """最近 lookback 根内 a 从下向上穿 b。"""
+    n = min(len(a), len(b))
+    start = max(1, n - lookback)
+    for i in range(start, n):
+        if None in (a[i - 1], b[i - 1], a[i], b[i]):
+            continue
+        if a[i - 1] <= b[i - 1] and a[i] > b[i]:
+            return True
+    return False
+
+
+def _ema_series(values: Sequence[Optional[float]], span: int) -> List[Optional[float]]:
+    alpha = 2.0 / (span + 1.0)
+    ema: Optional[float] = None
+    out: List[Optional[float]] = []
+    for v in values:
+        if v is None:
+            out.append(None)
+            continue
+        ema = v if ema is None else alpha * v + (1.0 - alpha) * ema
+        out.append(ema)
+    return out
+
+
+def _macd_lines(closes: Sequence[Optional[float]]) -> Optional[tuple]:
+    """返回 DIF/DEA/MACD histogram 序列；不足以稳定 EMA 时返回 None。"""
+    if len(closes) < 35:
+        return None
+    ema12 = _ema_series(closes, 12)
+    ema26 = _ema_series(closes, 26)
+    dif = [
+        (a - b) if a is not None and b is not None else None
+        for a, b in zip(ema12, ema26)
+    ]
+    dea = _ema_series(dif, 9)
+    hist = [
+        (d - e) if d is not None and e is not None else None
+        for d, e in zip(dif, dea)
+    ]
+    return dif, dea, hist
+
+
+def _ma_convergence_score(values: Sequence[Optional[float]], periods: Sequence[int],
+                          end: Optional[int] = None) -> float:
+    mas = [_ma_at(values, n, end=end) for n in periods]
+    if any(v is None or v <= 0 for v in mas):
+        return 0.0
+    spread = max(mas) / min(mas) - 1.0
+    return 1.0 - _scale_between(spread, 0.02, 0.10)
+
+
+def _current_volume_ratio(vol: Sequence[Optional[float]], base_win: int = 10) -> Optional[float]:
+    if len(vol) < base_win + 1:
+        return None
+    base = _mean_present(vol[-(base_win + 1):-1], positive_only=True)
+    cur = vol[-1]
+    return (cur / base) if cur is not None and base and base > 0 else None
+
+
+def _main_wave_triple_cross_score(code: str, bars: List[Dict[str, Any]]) -> Optional[float]:
+    """三线金叉：5/10均线、5/10均量线、MACD DIF/DEA 近端同步金叉。"""
+    if len(bars) < 60:
+        return None
+    closes = [b["close"] for b in bars]
+    vol, _ = hmr._volume_series(bars)
+    ma5, ma10 = _rolling_ma_series(closes, 5), _rolling_ma_series(closes, 10)
+    vma5, vma10 = _rolling_ma_series(vol, 5), _rolling_ma_series(vol, 10)
+    macd = _macd_lines(closes)
+    if macd is None:
+        return None
+    dif, dea, hist = macd
+    close = closes[-1]
+    if close is None or close <= 0:
+        return None
+
+    ma_cross = _crossed_up_recent(ma5, ma10, lookback=3)
+    vol_cross = _crossed_up_recent(vma5, vma10, lookback=3)
+    macd_cross = _crossed_up_recent(dif, dea, lookback=3)
+    ma_now = None not in (ma5[-1], ma10[-1]) and close > ma5[-1] > ma10[-1]
+    vol_now = None not in (vma5[-1], vma10[-1]) and vma5[-1] > vma10[-1]
+    macd_now = None not in (dif[-1], dea[-1], hist[-1]) and dif[-1] > dea[-1] and hist[-1] > 0
+    dif_ratio = abs(dif[-1] / close) if dif[-1] is not None else None
+    zero_score = 1.0 - _scale_between(dif_ratio, 0.005, 0.04)
+    converge = _ma_convergence_score(closes, (5, 10, 20), end=len(closes) - 1)
+
+    score = 0.0
+    score += 28.0 if ma_cross else (16.0 if ma_now else 0.0)
+    score += 26.0 if vol_cross else (14.0 if vol_now else 0.0)
+    score += 28.0 if macd_cross else (16.0 if macd_now else 0.0)
+    score += 10.0 * converge
+    score += 8.0 * zero_score
+    if ma_cross and vol_cross and macd_cross:
+        score += 8.0
+    return round(min(100.0, score), 2)
+
+
+def _main_wave_bullish_pierce_score(code: str, bars: List[Dict[str, Any]]) -> Optional[float]:
+    """一阳穿三线：放量阳线从下向上穿 5/10/20 日线，兼顾均线粘合和前期调整。"""
+    if len(bars) < 60:
+        return None
+    closes = [b["close"] for b in bars]
+    vol, _ = hmr._volume_series(bars)
+    ma5, ma10, ma20 = (_ma_at(closes, n) for n in (5, 10, 20))
+    if None in (ma5, ma10, ma20):
+        return None
+    last = bars[-1]
+    prev_close = closes[-2] if len(closes) > 1 else None
+    o, h, l, c = last["open"], last["high"], last["low"], last["close"]
+    if None in (o, h, l, c, prev_close) or prev_close <= 0:
+        return None
+
+    mas = [ma5, ma10, ma20]
+    floor = min(o, l)
+    pierce_count = sum(1 for ma in mas if floor <= ma <= c)
+    above_count = sum(1 for ma in mas if c > ma)
+    bullish = c > o and c > prev_close
+    trigger = bullish and pierce_count >= 3 and c > max(mas)
+    ret_1d = c / prev_close - 1.0
+    vol_ratio = _current_volume_ratio(vol, base_win=10)
+    peak60 = max([x for x in closes[-61:-1] if x is not None], default=None)
+    drawdown = (c / peak60 - 1.0) if peak60 and peak60 > 0 else None
+    ma20_series = _rolling_ma_series(closes, 20)
+    below_days = sum(
+        1 for i in range(max(0, len(closes) - 61), len(closes) - 1)
+        if closes[i] is not None and ma20_series[i] is not None and closes[i] < ma20_series[i]
+    )
+
+    score = 0.0
+    score += 30.0 * (pierce_count / 3.0)
+    score += 15.0 * (above_count / 3.0)
+    score += 14.0 * _scale_between(vol_ratio, 1.0, 2.0)
+    score += 12.0 * _scale_between(ret_1d, 0.03, 0.08)
+    score += 10.0 * _ma_convergence_score(closes, (5, 10, 20))
+    score += 10.0 * _scale_between(abs(drawdown) if drawdown is not None and drawdown < 0 else 0.0, 0.10, 0.30)
+    score += 5.0 * _scale_between(float(below_days), 20.0, 45.0)
+    if trigger:
+        score = max(score, 72.0)
+    return round(min(100.0, score), 2)
+
+
+def _main_wave_2560_score(code: str, bars: List[Dict[str, Any]]) -> Optional[float]:
+    """2560战法：25日线 + 5/60均量线，覆盖突破与缩量回踩两类买点。"""
+    if len(bars) < 80:
+        return None
+    closes = [b["close"] for b in bars]
+    vol, _ = hmr._volume_series(bars)
+    ma25 = _ma_at(closes, 25)
+    ma25_prev = _ma_at(closes, 25, end=len(closes) - 1)
+    vma5 = _rolling_ma_series(vol, 5)
+    vma60 = _rolling_ma_series(vol, 60)
+    last = bars[-1]
+    prev_close = closes[-2] if len(closes) > 1 else None
+    o, l, c = last["open"], last["low"], last["close"]
+    if None in (ma25, ma25_prev, vma5[-1], vma60[-1], vma5[-2], vma60[-2], o, l, c, prev_close):
+        return None
+    if ma25 <= 0 or ma25_prev <= 0 or prev_close <= 0:
+        return None
+
+    price_break = (prev_close <= ma25_prev and c > ma25) or (l <= ma25 <= c and c > o)
+    vol_cross = vma5[-2] <= vma60[-2] and vma5[-1] > vma60[-1]
+    vol_above = vma5[-1] > vma60[-1]
+    near_ma25 = l <= ma25 * 1.03 and c >= ma25 * 0.995
+    body_small = abs(c - o) / prev_close <= 0.035
+    current_vol = vol[-1]
+    shrink_current = current_vol is not None and vma60[-1] and current_vol < vma60[-1]
+    retest_vol = vma60[-1] * 0.85 <= vma5[-1] <= vma60[-1] * 1.25
+    above_days = sum(
+        1 for i in range(max(0, len(vma5) - 10), len(vma5))
+        if vma5[i] is not None and vma60[i] is not None and vma5[i] > vma60[i]
+    )
+    setup_breakout = price_break and vol_cross
+    setup_pullback = near_ma25 and body_small and vol_above
+    setup_long_entry = near_ma25 and body_small and above_days >= 5 and shrink_current
+
+    score = 0.0
+    score += 32.0 if price_break else (24.0 if c > ma25 else (16.0 if near_ma25 else 0.0))
+    score += 32.0 if vol_cross else (24.0 if vol_above else (16.0 if retest_vol else 0.0))
+    score += 14.0 if (near_ma25 and body_small) else (8.0 if near_ma25 else 0.0)
+    score += 10.0 if shrink_current else 0.0
+    score += 8.0 * _scale_between(float(above_days), 3.0, 8.0)
+    if setup_breakout:
+        score = max(score, 84.0)
+    if setup_pullback:
+        score = max(score, 76.0)
+    if setup_long_entry:
+        score = max(score, 72.0)
+    return round(min(100.0, score), 2)
+
+
+def _main_wave_factor_values(code: str, window: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
+    return {
+        "main_wave_triple_cross": _main_wave_triple_cross_score(code, window),
+        "main_wave_bullish_pierce": _main_wave_bullish_pierce_score(code, window),
+        "main_wave_2560": _main_wave_2560_score(code, window),
+    }
+
+
 def _candidate_factor_values(code: str, window: List[Dict[str, Any]]) -> Dict[str, Optional[float]]:
     """PIT 计算所有候选因子原始值（window 末根 = as-of 当日）。
 
-    复用 hmr._reversal_raw_features（5 个过热因子，已 PIT 验证）再补两个均值回归候选。
+    复用 hmr._reversal_raw_features（5 个过热因子，已 PIT 验证）再补均值回归与主升浪三战法。
     """
     feats: Dict[str, Optional[float]] = dict(hmr._reversal_raw_features(code, window))
     closes = [b["close"] for b in window]
     feats["ret_1d"] = (closes[-1] / closes[-2] - 1.0) if len(closes) > 1 and closes[-1] and closes[-2] else None
     ma20 = hmr._ma_last(closes, 20)
     feats["dist_ma20"] = (closes[-1] / ma20 - 1.0) if ma20 and closes[-1] else None
+    feats.update(_main_wave_factor_values(code, window))
     return feats
 
 
 # (因子名, 预期方向, 角色说明)。新增候选因子在此登记，跑 verify 看是否够格并入买入侧分。
 CANDIDATE_FACTORS: List[tuple] = [
+    ("main_wave_triple_cross", +1, "三线金叉(均线/均量线/MACD同步转强)"),
+    ("main_wave_bullish_pierce", +1, "一阳穿三线(放量阳线突破5/10/20日线)"),
+    ("main_wave_2560", +1, "2560战法(25日线+5/60均量线突破/回踩)"),
     ("mom_5d",      -1, "近5日涨幅(过热→短反转)"),
     ("ret_1d",      -1, "昨日涨幅(隔日反转)"),
     ("turn_pctile", -1, "换手拥挤度(过热)"),
@@ -514,24 +761,20 @@ def _print_verify_summary(payload: Dict[str, Any]) -> None:
     print("=" * 100)
 
 
-# ── backtest：买入组绝对收益 + 对中证500超额（持有 2/5/10 日）──
+# ── backtest：买入组绝对收益 + 对沪深300/中证500等权基准超额（持有 2/5/10/20 日）──
 #
-# 回答「三个买入因子分别能涨多少 / 跑赢中证500多少」：每个 as-of 日按买入信号取截面前 20%
-# 买入组，算其后 h 日均涨幅；中证500(510580)同期 h 个交易日涨幅为基准；超额=买入组−中证500。
-# 跨日平均 + t（剔大盘 beta 的另一种口径：直接减指数收益），胜率=跑赢中证500的截面占比。
+# 回答「买入因子分别能涨多少 / 跑赢混合基准多少」：每个 as-of 日按买入信号取截面前 20%
+# 买入组，算其后 h 日均涨幅；沪深300/中证500各50%按日再平衡混合净值为基准；超额=买入组−基准。
+# 跨日平均 + t（剔大盘 beta 的另一种口径：直接减指数收益），胜率=跑赢混合基准的截面占比。
 
 BENCH_JUMP_THRESHOLD = 0.20    # 相邻日 |涨跌|>此值视为异常跳变，其窗口作废
 
 
-def _load_benchmark(conn) -> Dict[str, Any]:
-    """加载基准指数累计净值 → {dates, navs, name, bad, nav_field}。
-
-    优先使用 nav_acc，避免单位净值 nav 的分红/复权断裂污染超额收益；仅在 nav_acc 缺失时回退 nav。
-    前向窗口一旦跨越异常跳变日，比值不可信——故标记断裂位、_benchmark_forward 跨越即作废。
-    """
-    entry = stock_storage.load_index_nav(conn, BENCHMARK_INDEX)
+def _load_benchmark_component(conn, code: str, label: str) -> Dict[str, Any]:
+    """加载单个 ETF 累计净值成分。"""
+    entry = stock_storage.load_index_nav(conn, code)
     recs = (entry.get("records") if isinstance(entry, dict) else None) or []
-    series = []
+    levels: Dict[str, float] = {}
     used_acc = 0
     used_nav = 0
     for r in recs:
@@ -544,15 +787,64 @@ def _load_benchmark(conn) -> Dict[str, Any]:
             if v is not None:
                 used_nav += 1
         if d and v is not None and v > 0:
-            series.append((d, v))
-    series.sort()
-    dates = [d for d, _ in series]
-    navs = [v for _, v in series]
-    bad = {i for i in range(1, len(navs)) if abs(navs[i] / navs[i - 1] - 1.0) > BENCH_JUMP_THRESHOLD}
-    name = (entry.get("name") if isinstance(entry, dict) else None) or BENCHMARK_INDEX
+            levels[d] = v
+    dates = sorted(levels)
+    bad_dates = set()
+    for prev, cur in zip(dates, dates[1:]):
+        p, c = levels[prev], levels[cur]
+        if p and abs(c / p - 1.0) > BENCH_JUMP_THRESHOLD:
+            bad_dates.add(cur)
     nav_field = "nav_acc" if used_acc and not used_nav else "nav_acc_fallback_nav" if used_acc else "nav"
-    return {"dates": dates, "navs": navs, "bad": bad, "name": name,
-            "n_jumps": len(bad), "nav_field": nav_field}
+    name = (entry.get("name") if isinstance(entry, dict) else None) or label or code
+    return {"code": code, "name": name, "levels": levels, "dates": dates,
+            "bad_dates": bad_dates, "n_jumps": len(bad_dates), "nav_field": nav_field}
+
+
+def _load_benchmark(conn) -> Dict[str, Any]:
+    """加载沪深300/中证500 50/50 日再平衡混合累计净值 → {dates, navs, name, bad}。
+
+    优先使用 nav_acc，避免单位净值 nav 的分红/复权断裂污染超额收益；仅在 nav_acc 缺失时回退 nav。
+    前向窗口一旦跨越异常跳变日，比值不可信——故标记断裂位、_benchmark_forward 跨越即作废。
+    """
+    comps = [_load_benchmark_component(conn, code, label) for code, label in BENCHMARK_COMPONENTS]
+    if any(not c["dates"] for c in comps):
+        return {"dates": [], "navs": [], "bad": set(), "name": BENCHMARK_NAME,
+                "n_jumps": 0, "nav_field": None, "components": comps}
+    common = sorted(set.intersection(*[set(c["dates"]) for c in comps]))
+    if len(common) < 2:
+        return {"dates": [], "navs": [], "bad": set(), "name": BENCHMARK_NAME,
+                "n_jumps": 0, "nav_field": None, "components": comps}
+
+    weight = 1.0 / len(comps)
+    navs = [1.0]
+    bad = set()
+    for idx, (prev_date, date) in enumerate(zip(common, common[1:]), start=1):
+        gross_parts = []
+        day_bad = False
+        for comp in comps:
+            levels = comp["levels"]
+            prev, cur = levels[prev_date], levels[date]
+            if prev <= 0:
+                day_bad = True
+                gross_parts.append(1.0)
+                continue
+            gross = cur / prev
+            gross_parts.append(gross)
+            if abs(gross - 1.0) > BENCH_JUMP_THRESHOLD or date in comp["bad_dates"]:
+                day_bad = True
+        mixed_gross = sum(weight * g for g in gross_parts)
+        navs.append(navs[-1] * mixed_gross)
+        if day_bad or abs(mixed_gross - 1.0) > BENCH_JUMP_THRESHOLD:
+            bad.add(idx)
+    return {
+        "dates": common,
+        "navs": navs,
+        "bad": bad,
+        "name": BENCHMARK_NAME,
+        "n_jumps": len(bad),
+        "nav_field": "+".join(c["nav_field"] or "-" for c in comps),
+        "components": comps,
+    }
 
 
 def _benchmark_forward(bench: Dict[str, Any], d: str, h: int) -> Optional[float]:
@@ -574,19 +866,29 @@ def _raw_signal_scores(grp: List[Dict[str, Any]], name: str, direction: int) -> 
     return [(s, direction * v) for s, v in vals]
 
 
-def _short_score_signal_scores(grp: List[Dict[str, Any]]) -> List[tuple]:
-    """合成分买入信号：截面 reverse-rank 等权合成，越高越偏买。"""
+def _composite_signal_scores(grp: List[Dict[str, Any]], factors: List[tuple]) -> List[tuple]:
+    """多个因子截面 rank 等权合成；direction<0 时低原始值=高买入信号。"""
     pcts = {name: hmr._percentiles_from_values([s["factors"].get(name) for s in grp])
-            for name, _ in SHORT_SCORE_FACTORS}
-    w = 1.0 / len(SHORT_SCORE_FACTORS)
+            for name, _ in factors}
+    w = 1.0 / len(factors) if factors else 0.0
     scored = []
     for idx, s in enumerate(grp):
         acc = 0.0
-        for name, direction in SHORT_SCORE_FACTORS:
+        for name, direction in factors:
             pct = pcts[name].get(idx, 50.0)
             acc += w * ((100.0 - pct) if direction < 0 else pct)
         scored.append((s, acc))
     return scored
+
+
+def _short_score_signal_scores(grp: List[Dict[str, Any]]) -> List[tuple]:
+    """原短线反转合成分买入信号：截面 reverse-rank 等权合成，越高越偏买。"""
+    return _composite_signal_scores(grp, SHORT_SCORE_FACTORS)
+
+
+def _main_wave_signal_scores(grp: List[Dict[str, Any]]) -> List[tuple]:
+    """文档主升浪三战法合成信号：三线金叉 / 一阳穿三线 / 2560 等权。"""
+    return _composite_signal_scores(grp, MAIN_WAVE_FACTORS)
 
 
 def _top_signal_group(scored: List[tuple], top_frac: float) -> List[Dict[str, Any]]:
@@ -610,7 +912,7 @@ def _buygroup_short_score(grp: List[Dict[str, Any]], top_frac: float) -> List[Di
 
 
 def _rank_buckets(scored: List[tuple], buckets: int = BACKTEST_BUCKETS) -> List[List[Dict[str, Any]]]:
-    """把买入信号从低到高切成 Q1~Q5；Q1=最热/最不该买，Q5=最冷/最高买入信号。"""
+    """把买入信号从低到高切成 Q1~Q5；Q5=最高买入信号。"""
     if not scored:
         return [[] for _ in range(buckets)]
     ordered = sorted(scored, key=lambda x: x[1])
@@ -656,7 +958,7 @@ def _agg_spread(spreads: List[float]) -> Dict[str, Any]:
 
 def _backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
                   selector, h: int) -> Dict[str, Any]:
-    """跨 as-of 日，同一买入组算两套口径的买入组涨幅 / 中证500同期 / 超额(+t/胜率)。
+    """跨 as-of 日，同一买入组算两套口径的买入组涨幅 / 混合基准同期 / 超额(+t/胜率)。
 
     close：信号日收盘价买入（理想，封板买不进时偏乐观）。
     t1open：次日开盘买入（剥离隔夜跳空/封板幻觉，口径同 momentum_buypoint）。
@@ -692,7 +994,7 @@ def _backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
 def _quintile_backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
                            scorer: Callable[[List[Dict[str, Any]]], List[tuple]],
                            h: int) -> Dict[str, Any]:
-    """Q1~Q5 分层回测；Q1=最低买入信号/最热，Q5=最高买入信号/最冷。"""
+    """Q1~Q5 分层回测；Q1=最低买入信号，Q5=最高买入信号。"""
     by_date: Dict[str, List[Dict[str, Any]]] = {}
     for s in samples:
         if h in s["rets"]:
@@ -736,14 +1038,14 @@ def _quintile_backtest_one(samples: List[Dict[str, Any]], bench: Dict[str, Any],
         buckets_out.append({
             "bucket": label,
             "rank": idx + 1,
-            "role": "hottest_lowest_signal" if idx == 0
-                    else "coldest_highest_signal" if idx == BACKTEST_BUCKETS - 1
+            "role": "lowest_signal" if idx == 0
+                    else "highest_signal" if idx == BACKTEST_BUCKETS - 1
                     else "middle_signal",
             "close": _agg_excess(cc_grp[idx], cc_bench[idx], []),
             "t1open": _agg_excess(t1_grp[idx], t1_bench[idx], []),
         })
     return {
-        "bucket_order": "Q1=最低买入信号/最热；Q5=最高买入信号/最冷",
+        "bucket_order": "Q1=最低买入信号；Q5=最高买入信号",
         "buckets": buckets_out,
         "q5_minus_q1": {
             "close": _agg_spread(cc_spreads),
@@ -766,13 +1068,19 @@ def run_backtest(as_of: Optional[str] = None, max_cap: Optional[float] = None,
 
     entries: List[Dict[str, Any]] = []
     if samples:
-        for name, direction in SHORT_SCORE_FACTORS:               # 三个买入因子分别
+        for name, direction in BACKTEST_SIGNAL_FACTORS:
             sel = (lambda grp, nm=name, dr=direction: _buygroup_raw(grp, nm, dr, BUY_TOP_FRAC))
             scorer = (lambda grp, nm=name, dr=direction: _raw_signal_scores(grp, nm, dr))
             entries.append({"factor": name, "role": role_of.get(name, ""),
                             "horizons": {str(h): _backtest_one(samples, bench, sel, h) for h in BACKTEST_HORIZONS},
                             "quintiles": {str(h): _quintile_backtest_one(samples, bench, scorer, h)
                                           for h in BACKTEST_HORIZONS}})
+        sel_m = (lambda grp: _top_signal_group(_main_wave_signal_scores(grp), BUY_TOP_FRAC))
+        scorer_m = (lambda grp: _main_wave_signal_scores(grp))
+        entries.append({"factor": "main_wave_score(合成)", "role": "文档三战法等权",
+                        "horizons": {str(h): _backtest_one(samples, bench, sel_m, h) for h in BACKTEST_HORIZONS},
+                        "quintiles": {str(h): _quintile_backtest_one(samples, bench, scorer_m, h)
+                                      for h in BACKTEST_HORIZONS}})
         sel_c = (lambda grp: _buygroup_short_score(grp, BUY_TOP_FRAC))   # 合成分
         scorer_c = (lambda grp: _short_score_signal_scores(grp))
         entries.append({"factor": "short_score(合成)", "role": "三因子等权",
@@ -783,15 +1091,21 @@ def run_backtest(as_of: Optional[str] = None, max_cap: Optional[float] = None,
     payload = base_payload("backtest", len(candidates), pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "买入组(截面前20%)绝对收益 + 对中证500超额，持有 2/5/10 日；跨as-of日平均+t+胜率。"
+        "description": "买入组(截面前20%)绝对收益 + 对沪深300/中证500等权混合基准超额，持有 2/5/10/20 日；跨as-of日平均+t+胜率。"
                        "两套买入口径：close=信号日收盘价买入(理想)、t1open=次日开盘买入(剥离封板/跳空幻觉,真实可执行)。",
         "params": {
             "horizons": list(BACKTEST_HORIZONS), "buy_top_frac": BUY_TOP_FRAC,
-            "buckets": BACKTEST_BUCKETS, "bucket_order": "Q1=最低买入信号/最热；Q5=最高买入信号/最冷",
+            "buckets": BACKTEST_BUCKETS, "bucket_order": "Q1=最低买入信号；Q5=最高买入信号",
             "step": VERIFY_STEP, "window_days": VERIFY_WINDOW_DAYS, "min_group": BACKTEST_MIN_GROUP,
-            "benchmark": {"index": BENCHMARK_INDEX, "name": bench["name"], "nav_field": bench["nav_field"],
+            "benchmark": {"index": "+".join(code for code, _ in BENCHMARK_COMPONENTS),
+                          "name": bench["name"], "nav_field": bench["nav_field"],
                           "n_jumps": bench["n_jumps"],
-                          "caveat": "基准优先使用累计净值 nav_acc；若检测到异常跳变，跨跳变日的前向窗口会剔除。"},
+                          "components": [
+                              {"code": c["code"], "name": c["name"], "nav_field": c["nav_field"],
+                               "records": len(c["dates"]), "n_jumps": c["n_jumps"]}
+                              for c in bench.get("components", [])
+                          ],
+                          "caveat": "基准=沪深300ETF与中证500ETF按日50/50再平衡；成分优先使用累计净值 nav_acc，若检测到异常跳变，跨跳变日的前向窗口会剔除。"},
         },
         "pool": pool,
         "section_count": len(collected["dates"]),
@@ -814,7 +1128,7 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
     print(f"  生成时间: {payload['generated_at']} · 池: {payload.get('pool')}({payload['candidate_count']})"
           f" · 截面: {payload.get('section_count', 0)} · 样本: {payload.get('sample_count', 0)}"
           + (f" · 区间: {rng[0]}~{rng[1]}" if rng else ""))
-    print(f"  买入组=截面前{payload.get('params', {}).get('buy_top_frac', 0) * 100:.0f}% · 基准: 中证500({bm.get('index')},{bm.get('nav_field')})"
+    print(f"  买入组=截面前{payload.get('params', {}).get('buy_top_frac', 0) * 100:.0f}% · 基准: {bm.get('name')}({bm.get('index')},{bm.get('nav_field')})"
           f" · 落盘: {hmr.display_path(hmr.CAPITAL_DIR / 'short_term_backtest.json')}")
     if bm.get("n_jumps"):
         print(f"  ⚠️基准 {bm.get('nav_field')} 有 {bm.get('n_jumps')} 处异常跳变，跨跳变窗口已剔除(h越大剔越多)")
@@ -825,7 +1139,7 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
             print(f"  {note}")
         print("=" * 104)
         return
-    print(f"  {'因子':<14}{'持有':>5}{'收盘买入':>9}{'T1开盘买':>9}{'中证500':>9}"
+    print(f"  {'因子':<14}{'持有':>5}{'收盘买入':>9}{'T1开盘买':>9}{'混合基准':>9}"
           f"{'收盘超额':>9}{'T1超额':>9}{'T1超额t':>8}{'T1胜率':>7}")
     for e in entries:
         first = True
@@ -842,8 +1156,8 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
             first = False
         print(f"  {e.get('role', '')}")
     print("-" * 104)
-    print("  ▼ Q1-Q5 分层（T1开盘买入超额；Q1=最低买入信号/最热，Q5=最高买入信号/最冷）")
-    print(f"  {'因子':<14}{'持有':>5}{'Q1热':>8}{'Q2':>8}{'Q3':>8}{'Q4':>8}{'Q5冷':>8}"
+    print("  ▼ Q1-Q5 分层（T1开盘买入超额；Q1=最低买入信号，Q5=最高买入信号）")
+    print(f"  {'因子':<14}{'持有':>5}{'Q1低':>8}{'Q2':>8}{'Q3':>8}{'Q4':>8}{'Q5高':>8}"
           f"{'Q5-Q1':>9}{'价差t':>7}{'胜率':>7}")
     for e in entries:
         first = True
@@ -862,8 +1176,8 @@ def _print_backtest_summary(payload: Dict[str, Any]) -> None:
         print(f"  {e.get('role', '')}")
     print("-" * 104)
     print("  说明: 收盘买入=信号日收盘价买(理想,封板买不进时偏乐观)；T1开盘买=次日开盘真实买入(剥离跳空/封板幻觉)；")
-    print("       超额=买入组−中证500同期(剔beta)；T1胜率=T1口径下跑赢中证500的截面占比；持有期到点(收盘)即平。")
-    print("       Q5-Q1=最高买入信号档相对最低买入信号档的组间价差；若 Q1 很差但 Q5 不强，反转因子更像避雷滤网。")
+    print("       超额=买入组−沪深300/中证500等权混合基准同期；T1胜率=T1口径下跑赢混合基准的截面占比；持有期到点(收盘)即平。")
+    print("       Q5-Q1=最高买入信号档相对最低买入信号档的组间价差；若 Q5-Q1 为负，说明该截面排序方向在该池子里不占优。")
     print("=" * 104)
 
 
@@ -874,7 +1188,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "mode", nargs="?", choices=MODES, default=DEFAULT_MODE,
         help="运行模式：screen(默认,风控避雷+买入分排序) / verify(候选因子有效性后验,逐因子裁KEEP/DROP) / "
-             "backtest(买入因子在2/5/10日的绝对收益与对中证500超额)。",
+             "backtest(买入因子在2/5/10/20日的绝对收益与对沪深300/中证500等权基准超额)。",
     )
     parser.add_argument(
         "--as-of", default=None, metavar="YYYY-MM-DD",
