@@ -11,7 +11,7 @@ The optimizer deliberately separates two layers:
    excess return on the available recent window with risk, hit rate, and for
    short-term Dragon Tiger List picks, event-quality statistics.
 
-Run 1500 iterations per strategy:
+Run 1500 Optuna/TPE trials per strategy (long and short run in separate worker processes):
     python3 -B stock_strategy_optimizer.py --iterations 1500
 """
 
@@ -21,9 +21,11 @@ import argparse
 import copy
 import json
 import math
+import multiprocessing
 import os
 import random
 import threading
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from contextlib import nullcontext
 from html import escape as html_escape
 from datetime import datetime
@@ -876,30 +878,56 @@ def select_best_long_trace(trace: List[Dict[str, Any]]) -> Dict[str, Any]:
     return max(valid, key=lambda r: r["objective"])
 
 
-_prepared_matrix_cache: Dict[int, Any] = {}
+_prepared_matrix_cache: Dict[Tuple[int, Tuple[str, ...]], Any] = {}
+_prepared_short_arrays_cache: Dict[int, Any] = {}
 _prepared_matrix_lock = threading.Lock()
 
 
-def _prepared_matrix(prepared: List[Dict[str, Any]]):
-    """把 prepared 的因子分预转成 (score_matrix[n股×n因子], items) numpy 矩阵，按 id 缓存。
+def _prepared_matrix(prepared: List[Dict[str, Any]], specs: List[Any] = LONG_FACTORS):
+    """把 prepared 的因子分预转成 (score_matrix[n股×n因子], items) numpy 矩阵，按 id+因子集缓存。
 
     供 score_prepared 向量化加权(矩阵×权重向量,释放 GIL)，各 trial 复用同一 pit 的矩阵。
     预热阶段构建一次后只读;n_jobs 多线程下 setdefault 幂等(CPython dict 原子)。"""
-    key = id(prepared)
+    factor_keys = tuple(spec.key for spec in specs)
+    key = (id(prepared), factor_keys)
     cached = _prepared_matrix_cache.get(key)
     if cached is not None:
         return cached
     n = len(prepared)
-    nf = len(LONG_FACTORS)
+    nf = len(specs)
     matrix = np.empty((n, nf), dtype=np.float64)
     items = []
     for i, row in enumerate(prepared):
         s = row["scores"]
-        for j, spec in enumerate(LONG_FACTORS):
+        for j, spec in enumerate(specs):
             matrix[i, j] = s.get(spec.key, spec.missing_score)
         items.append(row["item"])
     cached = (matrix, items)
     _prepared_matrix_cache[key] = cached
+    return cached
+
+
+def _prepared_short_filter_arrays(prepared: List[Dict[str, Any]]):
+    """短线硬过滤所需 raw factor 数组，trial 期复用，避免每轮逐股解析。"""
+    key = id(prepared)
+    cached = _prepared_short_arrays_cache.get(key)
+    if cached is not None:
+        return cached
+    _, items = _prepared_matrix(prepared, SHORT_FACTORS)
+
+    def raw_array(name: str) -> np.ndarray:
+        out = np.empty(len(items), dtype=np.float64)
+        for i, item in enumerate(items):
+            value = safe_float((item.get("raw_factors") or {}).get(name))
+            out[i] = value if value is not None else 0.0
+        return out
+
+    cached = {
+        "lhb_recent_count": raw_array("lhb_recent_count"),
+        "hot_money_concurrent": raw_array("hot_money_concurrent"),
+        "limit_up_control": raw_array("limit_up_control"),
+    }
+    _prepared_short_arrays_cache[key] = cached
     return cached
 
 
@@ -1035,6 +1063,58 @@ def score_short_candidates(
     min_score = safe_float(config.get("min_score")) or 0.0
     top_n = max(0, int(first_not_none(config.get("top_n"), 30)))
     return [row for row in scored if row["score"] >= min_score][:top_n]
+
+
+def score_prepared_short_candidates(
+    prepared: List[Dict[str, Any]],
+    config: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    """短线 optimizer 主路径：预计算因子分后用 NumPy 向量化打分、过滤、取 topN。"""
+    weights = config.get("weights", {})
+    min_score = safe_float(config.get("min_score")) or 0.0
+    min_lhb = safe_float(config.get("min_lhb_count")) or 0.0
+    min_concurrent = safe_float(config.get("min_hot_money_concurrent")) or 0.0
+    max_consec = first_not_none(config.get("max_consecutive_limit_up"), 999.0)
+    max_consec = safe_float(max_consec)
+    max_consec = max_consec if max_consec is not None else 999.0
+    top_n = max(0, int(first_not_none(config.get("top_n"), 30)))
+    if top_n <= 0 or not prepared:
+        return []
+
+    matrix, items = _prepared_matrix(prepared, SHORT_FACTORS)
+    filters = _prepared_short_filter_arrays(prepared)
+    w = np.empty(len(SHORT_FACTORS), dtype=np.float64)
+    for j, spec in enumerate(SHORT_FACTORS):
+        value = safe_float(weights.get(spec.key))
+        w[j] = max(0.0, value if value is not None else spec.default_weight)
+    weight_sum = float(w.sum())
+    positive_weight_count = int((w > 0.0).sum())
+    with np.errstate(all="ignore"):
+        totals = (matrix @ w) / weight_sum if weight_sum > 0 else np.zeros(len(items))
+    rounded_totals = np.round(totals, 2)
+
+    mask = (
+        (filters["lhb_recent_count"] >= min_lhb)
+        & (filters["hot_money_concurrent"] >= min_concurrent)
+        & (filters["limit_up_control"] <= max_consec)
+        & (rounded_totals >= min_score)
+    )
+    idxs = np.flatnonzero(mask)
+    if idxs.size == 0:
+        return []
+    order = np.lexsort((idxs, -rounded_totals[idxs]))
+    selected = idxs[order[:top_n]]
+
+    result = []
+    for rank, idx in enumerate(selected, 1):
+        item = items[int(idx)]
+        row = dict(item)
+        row["score"] = round(float(rounded_totals[int(idx)]), 2)
+        row["factor_count"] = positive_weight_count
+        row["data_quality"] = round(item.get("data_quality", 0.0), 3)
+        row["rank"] = rank
+        result.append(row)
+    return result
 
 
 def summarize_returns(returns: List[float], benchmark: List[float]) -> Dict[str, Any]:
@@ -1325,10 +1405,10 @@ def optuna_startup_trials(iterations: int) -> int:
     return min(iterations, warmup)
 
 
-def make_progress_bar(total: int, desc: str):
+def make_progress_bar(total: int, desc: str, position: int = 0):
     if tqdm is None:
         return nullcontext()
-    return tqdm(total=total, desc=desc, unit="trial", dynamic_ncols=True, disable=None)
+    return tqdm(total=total, desc=desc, unit="trial", dynamic_ncols=True, disable=None, position=position)
 
 
 def advance_progress(progress) -> None:
@@ -1336,10 +1416,11 @@ def advance_progress(progress) -> None:
         progress.update(1)
 
 
-# trial 并行度默认 1。实测多线程在本场景是负收益，故只向量化(单核提速)、默认不并行：
+# 单个 Optuna study 内部 trial 并行度默认 1。外层长线/短线用独立子进程并行；
+# study 内部实测多线程是负收益，故只向量化(单核提速)、默认不再拆 trial：
 #   ① 预热以财报计算(纯 python)为主=GIL-bound，ThreadPool 并行因 GIL 争用反而更慢(53.7s vs 串行23.2s)，故预热串行；
 #   ② optuna n_jobs>1 多线程并发退化 TPE 序贯采样、降搜索质量(实测 8 trials best -7.69→-13.6)。
-# 真正吃满多核需多进程重写(绕 GIL + 异步 ask/tell + series 跨进程)，ROI 存疑。要试可 env OPTUNA_TRIAL_JOBS=N。
+# 要试单 study 内部 trial 并行可 env OPTUNA_TRIAL_JOBS=N，但默认保持 1 以保护 TPE 搜索质量。
 OPTUNA_TRIAL_JOBS = max(1, int(os.environ.get("OPTUNA_TRIAL_JOBS", "1")))
 
 
@@ -1353,6 +1434,7 @@ def _run_config_search(
     record,
     progress_label: str,
     n_jobs: int = 1,
+    progress_position: int = 0,
 ) -> str:
     """跑 iterations 次配置搜索。有 optuna → TPE 贝叶斯（第1次试默认基线 + 随机预热后后验采样）；
     否则回退随机搜索。suggest(trial)->(cfg,extra)；random_config(i)->(cfg,extra)；
@@ -1369,7 +1451,7 @@ def _run_config_search(
         study = optuna.create_study(direction="maximize", sampler=sampler)
         if default_params:
             study.enqueue_trial(default_params)  # 第1次评估默认配置作基线
-        with make_progress_bar(iterations, progress_label) as progress:
+        with make_progress_bar(iterations, progress_label, progress_position) as progress:
             def objective(trial) -> float:
                 try:
                     return record(*suggest(trial))
@@ -1381,7 +1463,7 @@ def _run_config_search(
                 f"前 {startup_trials} 次保留随机/默认预热，之后按代理目标的后验采样选下一组参数；"
                 "代理目标本身存在过拟合/前视风险，"
                 "更强的搜索会更彻底地拟合该目标，best 仍需样本外复核）。")
-    with make_progress_bar(iterations, progress_label) as progress:
+    with make_progress_bar(iterations, progress_label, progress_position) as progress:
         for i in range(iterations):
             try:
                 record(*random_config(i))
@@ -1390,7 +1472,7 @@ def _run_config_search(
     return f"参数搜索：随机搜索回退（{iterations} 次，未检测到 optuna）。"
 
 
-def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
+def optimize_long(iterations: int, rng: random.Random, progress_position: int = 0) -> Dict[str, Any]:
     broad_cfg = broad_long_candidate_config()
     series = full_series_map()
     price_health = ensure_long_price_history(series)
@@ -1486,11 +1568,13 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         return objective, row
 
     trace: List[Dict[str, Any]] = []
+    trace_lock = threading.Lock()
 
     def _record(cfg: Dict[str, Any], hold_td: int) -> float:
         objective, row = evaluate_long(cfg, hold_td)
-        row["iteration"] = len(trace) + 1
-        trace.append(row)
+        with trace_lock:
+            row["iteration"] = len(trace) + 1
+            trace.append(row)
         return objective
 
     search_note = _run_config_search(
@@ -1504,6 +1588,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
         record=_record,
         progress_label="长线参数搜索",
         n_jobs=OPTUNA_TRIAL_JOBS,
+        progress_position=progress_position,
     )
     best = select_best_long_trace(trace)
     return {
@@ -1527,7 +1612,7 @@ def optimize_long(iterations: int, rng: random.Random) -> Dict[str, Any]:
     }
 
 
-def optimize_short(iterations: int, rng: random.Random) -> Dict[str, Any]:
+def optimize_short(iterations: int, rng: random.Random, progress_position: int = 1) -> Dict[str, Any]:
     broad_cfg = copy.deepcopy(DEFAULT_CONFIG["short"])
     broad_cfg.update({
         "min_lhb_count": 0,
@@ -1537,47 +1622,66 @@ def optimize_short(iterations: int, rng: random.Random) -> Dict[str, Any]:
         "top_n": 80,
     })
     broad, notes = build_short_candidates(broad_cfg)
+    prepared = prepare_candidate_factor_scores(broad, SHORT_FACTORS)
+    _prepared_matrix(prepared, SHORT_FACTORS)
+    _prepared_short_filter_arrays(prepared)
     series = recent_series_map()
-    best = None
-    trace = []
-    with make_progress_bar(iterations, "短线参数搜索") as progress:
-        for i in range(iterations):
-            try:
-                cfg = random_short_config(rng, i)
-                picks = score_short_candidates(broad, cfg)
-                hold_days = rng.choice([1, 2, 3, 4, 5]) if i else 1
-                actual = short_actual_backtest(picks, series, hold_days=hold_days)
-                proxy = short_proxy_backtest(picks)
-                actual_objective = objective_from_summary(actual, fallback_quality=-999.0)
-                proxy_objective = objective_from_summary(proxy, fallback_quality=0.0)
-                if actual.get("samples"):
-                    objective = actual_objective * 0.7 + proxy_objective * 0.3
-                    objective_mode = "actual_plus_proxy"
-                else:
-                    objective = proxy_objective
-                    objective_mode = "proxy_only_no_forward_prices"
-                row = {
-                    "iteration": i + 1,
-                    "objective": round(objective, 5),
-                    "objective_mode": objective_mode,
-                    "hold_days": hold_days,
-                    "selected_count": len(picks),
-                    "actual_backtest": actual,
-                    "proxy_backtest": proxy,
-                    "top_codes": [p["code"] for p in picks[:5]],
-                    "config": cfg,
-                }
-                trace.append(row)
-                if best is None or row["objective"] > best["objective"]:
-                    best = row
-            finally:
-                advance_progress(progress)
-    assert best is not None
+    trace: List[Dict[str, Any]] = []
+    trace_lock = threading.Lock()
+
+    def evaluate_short(cfg: Dict[str, Any], hold_days: int) -> Tuple[float, Dict[str, Any]]:
+        picks = score_prepared_short_candidates(prepared, cfg)
+        actual = short_actual_backtest(picks, series, hold_days=hold_days)
+        proxy = short_proxy_backtest(picks)
+        actual_objective = objective_from_summary(actual, fallback_quality=-999.0)
+        proxy_objective = objective_from_summary(proxy, fallback_quality=0.0)
+        if actual.get("samples"):
+            objective = actual_objective * 0.7 + proxy_objective * 0.3
+            objective_mode = "actual_plus_proxy"
+        else:
+            objective = proxy_objective
+            objective_mode = "proxy_only_no_forward_prices"
+        row = {
+            "objective": round(objective, 5),
+            "objective_mode": objective_mode,
+            "hold_days": hold_days,
+            "selected_count": len(picks),
+            "actual_backtest": actual,
+            "proxy_backtest": proxy,
+            "top_codes": [p["code"] for p in picks[:5]],
+            "config": cfg,
+        }
+        return objective, row
+
+    def _record(cfg: Dict[str, Any], hold_days: int) -> float:
+        objective, row = evaluate_short(cfg, hold_days)
+        with trace_lock:
+            row["iteration"] = len(trace) + 1
+            trace.append(row)
+        return objective
+
+    search_note = _run_config_search(
+        iterations, rng,
+        suggest=_suggest_short_config,
+        default_params=_default_short_params(),
+        random_config=lambda i: (
+            random_short_config(rng, i),
+            rng.choice(SHORT_HOLD_DAYS_CHOICES) if i else 1,
+        ),
+        record=_record,
+        progress_label="短线参数搜索",
+        n_jobs=OPTUNA_TRIAL_JOBS,
+        progress_position=progress_position,
+    )
+    if not trace:
+        raise RuntimeError("短线优化没有产生任何 trial。")
+    best = max(trace, key=lambda x: x["objective"])
     return {
         "strategy": "short",
         "iterations": iterations,
         "candidate_count": len(broad),
-        "notes": notes + [
+        "notes": [search_note] + notes + [
+            "短线候选池因子分在 trial 前预转为 NumPy 矩阵，trial 阶段向量化完成硬过滤、打分和 topN 选择。",
             "短线真实前推收益回测仅在事件日之后存在本地价格数据时使用。",
             "当前本地快照中，龙虎榜事件多数晚于缓存价格行，因此大多需要使用代理评分。",
         ],
@@ -2152,20 +2256,74 @@ def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, A
     )
 
 
+def _init_process_progress_lock(lock) -> None:
+    """让两个子进程共享 tqdm 写锁，避免双进度条互相插入输出。"""
+    if tqdm is not None and lock is not None:
+        tqdm.set_lock(lock)
+
+
+def _process_pool_kwargs() -> Dict[str, Any]:
+    if tqdm is None:
+        return {}
+    try:
+        return {
+            "initializer": _init_process_progress_lock,
+            "initargs": (multiprocessing.RLock(),),
+        }
+    except Exception:
+        return {}
+
+
+def _run_strategy_optimizer(
+    strategy: str,
+    iterations: int,
+    seed: int,
+    progress_position: int,
+) -> Dict[str, Any]:
+    rng = random.Random(seed)
+    if strategy == "long":
+        return optimize_long(iterations, rng, progress_position)
+    if strategy == "short":
+        return optimize_short(iterations, rng, progress_position)
+    raise ValueError(f"unknown strategy: {strategy}")
+
+
 def run_optimization(
     iterations: int = DEFAULT_OPTIMIZATION_ITERATIONS,
     seed: int = 20260611,
     persist: bool = True,
 ) -> Dict[str, Any]:
-    rng = random.Random(seed)
+    master_rng = random.Random(seed)
+    strategy_seeds = {
+        "long": master_rng.randrange(2 ** 31),
+        "short": master_rng.randrange(2 ** 31),
+    }
     started = datetime.now()
+    strategy_results: Dict[str, Dict[str, Any]] = {}
+    jobs = {
+        "long": (strategy_seeds["long"], 0),
+        "short": (strategy_seeds["short"], 1),
+    }
+    with ProcessPoolExecutor(max_workers=2, **_process_pool_kwargs()) as executor:
+        futures = {
+            executor.submit(_run_strategy_optimizer, key, iterations, child_seed, position): key
+            for key, (child_seed, position) in jobs.items()
+        }
+        for future in as_completed(futures):
+            key = futures[future]
+            try:
+                strategy_results[key] = future.result()
+            except Exception as exc:
+                raise RuntimeError(f"{key} 策略参数搜索失败：{exc}") from exc
+
     result = {
         "generated_at": started.strftime("%Y-%m-%d %H:%M:%S"),
         "iterations_per_strategy": iterations,
         "seed": seed,
+        "strategy_seeds": strategy_seeds,
         "research_basis": RESEARCH_BASIS,
-        "long": optimize_long(iterations, rng),
-        "short": optimize_short(iterations, rng),
+        "long": strategy_results["long"],
+        "short": strategy_results["short"],
     }
     if persist:
         try:
@@ -2187,6 +2345,7 @@ def run_optimization(
             "generated_at": result["generated_at"],
             "iterations_per_strategy": iterations,
             "seed": seed,
+            "strategy_seeds": result.get("strategy_seeds", {}),
             "config": {
                 "long": result["long"]["best"]["config"],
                 "short": result["short"]["best"]["config"],

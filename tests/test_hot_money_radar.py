@@ -354,6 +354,136 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(row["theme_heat_pctile"], 0.0)
         self.assertEqual(row["sw2_heat_pctile"], 100.0)
 
+    def test_realtime_quote_parsers_support_tencent_and_sina(self):
+        tencent = (
+            'v_sh600000="1~浦发银行~600000~9.00~8.89~8.85~544687~323481~221557~'
+            '9.00~1384~8.99~2223~8.98~911~8.97~602~8.96~374~9.01~655~9.02~17648~'
+            '9.03~10161~9.04~6039~9.05~10338~~20260708161454~0.11~1.24~9.03~8.79~'
+            '9.00/544687/488055514~544687~48806~0.16~5.96~~9.03~8.79~2.70~2997.53~2997.53";'
+        )
+        tq = radar._parse_tencent_quote_text(tencent)["600000"]
+        self.assertEqual(tq["source"], "tencent_batch")
+        self.assertEqual(tq["price"], 9.0)
+        self.assertEqual(tq["quote_date"], "2026-07-08")
+        self.assertEqual(tq["amount"], 488055514.0)
+        self.assertEqual(tq["turnover"], 0.16)
+
+        sina = (
+            'var hq_str_sh600000="浦发银行,8.850,8.890,9.000,9.030,8.790,9.000,'
+            '9.010,54468742,488055514.000,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,'
+            '2026-07-08,15:34:59,00";'
+        )
+        sq = radar._parse_sina_quote_text(sina)["600000"]
+        self.assertEqual(sq["source"], "sina_batch")
+        self.assertEqual(sq["price"], 9.0)
+        self.assertEqual(sq["volume"], 544687.42)
+        self.assertAlmostEqual(sq["change_pct"], 1.2373, places=3)
+
+    def test_realtime_bar_projects_raw_quote_to_qfq_basis(self):
+        bars = [
+            {"date": "2026-07-07", "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "volume": 1000.0, "amount": 10000.0, "chg": 0.0, "turnover": 1.0},
+            {"date": "2026-07-08", "open": 10.1, "high": 10.5, "low": 10.0, "close": 10.2, "volume": 1200.0, "amount": 12000.0, "chg": 2.0, "turnover": 1.2},
+        ]
+        bar = radar._quote_to_realtime_bar(bars, {
+            "price": 110.0,
+            "pre_close": 100.0,
+            "change_pct": 10.0,
+            "open": 101.0,
+            "high": 112.0,
+            "low": 98.0,
+            "volume": 2000.0,
+            "amount": 220000.0,
+            "turnover": 2.0,
+            "quote_date": "2026-07-08",
+        })
+
+        self.assertEqual(bar["price_adjust"], "qfq_intraday_from_change_pct")
+        self.assertAlmostEqual(bar["close"], 11.0)
+        self.assertAlmostEqual(bar["open"], 10.1)
+        self.assertAlmostEqual(bar["high"], 11.2)
+        self.assertAlmostEqual(bar["low"], 9.8)
+        self.assertEqual(bar["raw_close"], 110.0)
+        self.assertEqual(bar["volume"], 2000.0)
+        self.assertFalse(bar["volume_projected"])
+        self.assertEqual(bar["volume_projection_factor"], 1.0)
+        self.assertEqual(bar["volume_projection_method"], "none")
+
+    def test_realtime_bar_projects_intraday_volume_with_u_shape_curve_for_factors(self):
+        self.assertAlmostEqual(radar._u_shape_volume_cumulative_share(60.0), 0.33)
+        self.assertAlmostEqual(radar._u_shape_volume_cumulative_share(180.0), 0.68)
+        bars = [
+            {"date": "2026-07-07", "open": 10.0, "high": 10.2, "low": 9.8, "close": 10.0, "volume": 1000.0, "amount": 10000.0, "chg": 0.0, "turnover": 1.0},
+        ]
+        bar = radar._quote_to_realtime_bar(bars, {
+            "price": 11.0,
+            "pre_close": 10.0,
+            "change_pct": 10.0,
+            "open": 10.1,
+            "high": 11.2,
+            "low": 9.8,
+            "volume": 2000.0,
+            "amount": 220000.0,
+            "turnover": 2.0,
+            "quote_time": "2026-07-08 10:30:00",
+            "quote_date": "2026-07-08",
+        })
+
+        self.assertTrue(bar["volume_projected"])
+        self.assertEqual(bar["volume_elapsed_minutes"], 60.0)
+        self.assertEqual(bar["volume_projection_method"], "u_shape_intraday")
+        self.assertAlmostEqual(bar["volume_projection_factor"], 3.0303, places=4)
+        self.assertEqual(bar["raw_volume"], 2000.0)
+        self.assertAlmostEqual(bar["volume"], 6060.606, places=3)
+        self.assertEqual(bar["raw_turnover"], 2.0)
+        self.assertAlmostEqual(bar["turnover"], 6.0606, places=4)
+        self.assertEqual(bar["raw_amount"], 220000.0)
+        self.assertAlmostEqual(bar["amount"], 666666.667, places=3)
+
+    def test_realtime_rescore_uses_eastmoney_quote_without_persisting(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "t.sqlite3"
+            out_file = Path(tmpdir) / "ambush.json"
+            conn = stock_storage.connect(db_file)
+            stock_storage.save_sw3_membership(conn, {"segments": [{
+                "segment_code": "850111.SI", "segment_name": "细分测试", "parent_segment": "测试",
+                "members": [{"code": "600000", "name": "样本"}],
+            }]})
+            stock_storage.mark_sw3_leaders(conn, ["600000"])
+            _seed_history(conn, "600000", _flat_bars(90, 10.0, 1000.0, 1.0))
+            conn.close()
+
+            with patch.object(radar, "DB_FILE", db_file), \
+                 patch.object(radar, "AMBUSH_RESULT_FILE", out_file):
+                payload = radar.main(["ambush"])
+                latest = payload["stocks"][0]["last_date"]
+                live = radar.realtime_rescore_payload(payload, {
+                    "600000": {
+                        "code": "600000",
+                        "price": 10.8,
+                        "change_pct": 8.0,
+                        "open": 10.1,
+                        "high": 10.9,
+                        "low": 10.0,
+                        "volume": 2000.0,
+                        "amount": 21600000.0,
+                        "turnover": 2.2,
+                        "market_cap_yi": 88.0,
+                        "quote_time": f"{latest} 14:58:00",
+                        "quote_date": latest,
+                    },
+                }, fetched_at="2026-07-08 14:58:00")
+
+        self.assertEqual(live["realtime_quote"]["matched_count"], 1)
+        self.assertEqual(live["realtime_quote"]["used_count"], 1)
+        row = live["stocks"][0]
+        self.assertEqual(row["realtime_status"], "UPDATED")
+        self.assertEqual(row["realtime_price"], 10.8)
+        self.assertEqual(row["realtime_change_pct"], 8.0)
+        self.assertEqual(row["realtime_price_adjust"], "qfq_intraday_from_change_pct")
+        self.assertAlmostEqual(row["realtime_adjusted_close"], 10.8)
+        self.assertEqual(row["market_cap_yi"], 88.0)
+        self.assertEqual(row["last_date"], latest)
+
     def test_realtime_lhb_recent_uses_latest_trade_date_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_file = Path(tmpdir) / "t.sqlite3"

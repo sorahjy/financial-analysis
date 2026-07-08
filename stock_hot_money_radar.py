@@ -199,6 +199,7 @@ import argparse
 import bisect
 import json
 import math
+import re
 import sqlite3
 import unicodedata
 from collections import Counter
@@ -207,6 +208,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
+import requests
 
 import stock_storage
 
@@ -405,6 +407,330 @@ def _safe(value: Any) -> Optional[float]:
     return f if math.isfinite(f) else None
 
 
+def _clean_stock_code(value: Any) -> str:
+    digits = "".join(ch for ch in str(value or "") if ch.isdigit())
+    return digits[-6:] if len(digits) >= 6 else ""
+
+
+def _eastmoney_number(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "").replace("%", "")
+    if not text or text in {"-", "--", "—", "None", "nan", "加载中..."}:
+        return None
+    return _safe(text)
+
+
+def _eastmoney_quote_time(value: Any) -> Optional[str]:
+    ts = _eastmoney_number(value)
+    if not ts or ts <= 0:
+        return None
+    if ts > 100000000000:
+        ts = ts / 1000.0
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def _market_symbol(code: str) -> str:
+    code = _clean_stock_code(code)
+    if code.startswith(("6", "9")):
+        return f"sh{code}"
+    if code.startswith(("4", "8")):
+        return f"bj{code}"
+    return f"sz{code}"
+
+
+def _parse_compact_time(value: Any) -> Optional[str]:
+    text = str(value or "").strip()
+    if len(text) < 14 or not text[:14].isdigit():
+        return None
+    return f"{text[:4]}-{text[4:6]}-{text[6:8]} {text[8:10]}:{text[10:12]}:{text[12:14]}"
+
+
+def _quote_chunks(codes: Sequence[str], size: int = 180) -> List[List[str]]:
+    clean = [_clean_stock_code(code) for code in codes]
+    clean = [code for code in dict.fromkeys(clean) if code]
+    return [clean[i:i + size] for i in range(0, len(clean), size)]
+
+
+TRADING_MINUTES_PER_DAY = 240.0
+INTRADAY_VOLUME_MIN_ELAPSED = 20.0
+INTRADAY_VOLUME_FACTOR_CAP = 6.0
+INTRADAY_U_SHAPE_VOLUME_CURVE: Tuple[Tuple[float, float], ...] = (
+    (0.0, 0.0),
+    (5.0, 0.045),
+    (15.0, 0.12),
+    (30.0, 0.20),
+    (60.0, 0.33),
+    (90.0, 0.43),
+    (120.0, 0.50),
+    (150.0, 0.58),
+    (180.0, 0.68),
+    (210.0, 0.82),
+    (230.0, 0.94),
+    (240.0, 1.0),
+)
+
+
+def _parse_quote_datetime(value: Any) -> Optional[datetime]:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt, size in (
+        ("%Y-%m-%d %H:%M:%S", 19),
+        ("%Y-%m-%d %H:%M", 16),
+        ("%Y%m%d%H%M%S", 14),
+    ):
+        try:
+            return datetime.strptime(text[:size], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _a_share_elapsed_minutes(ts: datetime) -> float:
+    minute = ts.hour * 60.0 + ts.minute + ts.second / 60.0
+    morning_start = 9 * 60 + 30
+    morning_end = 11 * 60 + 30
+    afternoon_start = 13 * 60
+    afternoon_end = 15 * 60
+    if minute <= morning_start:
+        return 0.0
+    if minute <= morning_end:
+        return max(0.0, minute - morning_start)
+    if minute <= afternoon_start:
+        return 120.0
+    if minute <= afternoon_end:
+        return 120.0 + minute - afternoon_start
+    return TRADING_MINUTES_PER_DAY
+
+
+def _u_shape_volume_cumulative_share(elapsed_minutes: float) -> float:
+    elapsed = max(0.0, min(TRADING_MINUTES_PER_DAY, elapsed_minutes))
+    points = INTRADAY_U_SHAPE_VOLUME_CURVE
+    if elapsed <= points[0][0]:
+        return points[0][1]
+    for (left_min, left_share), (right_min, right_share) in zip(points, points[1:]):
+        if elapsed <= right_min:
+            span = right_min - left_min
+            if span <= 0:
+                return right_share
+            weight = (elapsed - left_min) / span
+            return left_share + (right_share - left_share) * weight
+    return points[-1][1]
+
+
+def _intraday_volume_projection(quote: Dict[str, Any]) -> Tuple[float, Optional[float], bool]:
+    """盘中累计量不是全天量：按内置 U 型日内成交曲线折算，收盘后保持原值。"""
+    quote_dt = _parse_quote_datetime(quote.get("quote_time"))
+    if quote_dt is None:
+        quote_date = str(quote.get("quote_date") or "")[:10]
+        if quote_date == datetime.now().strftime("%Y-%m-%d"):
+            now = datetime.now()
+            quote_dt = datetime.strptime(f"{quote_date} {now:%H:%M:%S}", "%Y-%m-%d %H:%M:%S")
+    if quote_dt is None:
+        return 1.0, None, False
+    elapsed = _a_share_elapsed_minutes(quote_dt)
+    if elapsed <= 0.0 or elapsed >= TRADING_MINUTES_PER_DAY:
+        return 1.0, elapsed, False
+    effective_elapsed = max(elapsed, INTRADAY_VOLUME_MIN_ELAPSED)
+    cumulative_share = _u_shape_volume_cumulative_share(effective_elapsed)
+    if cumulative_share <= 0.0:
+        return 1.0, elapsed, False
+    factor = min(INTRADAY_VOLUME_FACTOR_CAP, 1.0 / cumulative_share)
+    return factor, elapsed, factor > 1.0001
+
+
+def _parse_tencent_quote_text(text: str) -> Dict[str, Dict[str, Any]]:
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for symbol, body in re.findall(r'v_([a-z]{2}\d{6})="([^"]*)"', text or ""):
+        parts = body.split("~")
+        if len(parts) < 35:
+            continue
+        code = _clean_stock_code(parts[2] if len(parts) > 2 else symbol)
+        if not code:
+            continue
+        quote_time = _parse_compact_time(parts[30] if len(parts) > 30 else None)
+        volume = None
+        amount = None
+        if len(parts) > 35 and "/" in parts[35]:
+            deal = parts[35].split("/")
+            if len(deal) >= 3:
+                volume = _eastmoney_number(deal[1])
+                amount = _eastmoney_number(deal[2])
+        if volume is None and len(parts) > 36:
+            volume = _eastmoney_number(parts[36])
+        if amount is None and len(parts) > 37:
+            amount_wan = _eastmoney_number(parts[37])
+            amount = amount_wan * 10000.0 if amount_wan is not None else None
+        market_cap_yi = None
+        if len(parts) > 45:
+            market_cap_yi = _eastmoney_number(parts[45])
+        if market_cap_yi is None and len(parts) > 44:
+            market_cap_yi = _eastmoney_number(parts[44])
+        quotes[code] = {
+            "code": code,
+            "name": parts[1] if len(parts) > 1 else "",
+            "price": _eastmoney_number(parts[3] if len(parts) > 3 else None),
+            "pre_close": _eastmoney_number(parts[4] if len(parts) > 4 else None),
+            "open": _eastmoney_number(parts[5] if len(parts) > 5 else None),
+            "volume": volume,
+            "amount": amount,
+            "change_pct": _eastmoney_number(parts[32] if len(parts) > 32 else None),
+            "high": _eastmoney_number(parts[33] if len(parts) > 33 else None),
+            "low": _eastmoney_number(parts[34] if len(parts) > 34 else None),
+            "turnover": _eastmoney_number(parts[38] if len(parts) > 38 else None),
+            "market_cap_yi": market_cap_yi,
+            "quote_time": quote_time,
+            "quote_date": quote_time[:10] if quote_time else datetime.now().strftime("%Y-%m-%d"),
+            "source": "tencent_batch",
+        }
+    return quotes
+
+
+def fetch_tencent_a_quotes(codes: Sequence[str], timeout: int = 8) -> Dict[str, Dict[str, Any]]:
+    """腾讯批量实时行情。按当前雷达股票池分块请求，避免逐股访问。"""
+    quotes: Dict[str, Dict[str, Any]] = {}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://gu.qq.com/"}
+    for chunk in _quote_chunks(codes):
+        symbols = ",".join(_market_symbol(code) for code in chunk)
+        response = requests.get("https://qt.gtimg.cn/q=" + symbols, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        response.encoding = response.encoding or "GBK"
+        quotes.update(_parse_tencent_quote_text(response.text))
+    return quotes
+
+
+def _parse_sina_quote_text(text: str) -> Dict[str, Dict[str, Any]]:
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for symbol, body in re.findall(r'var hq_str_([a-z]{2}\d{6})="([^"]*)"', text or ""):
+        parts = body.split(",")
+        code = _clean_stock_code(symbol)
+        if len(parts) < 32 or not code or not parts[0]:
+            continue
+        price = _eastmoney_number(parts[3])
+        pre_close = _eastmoney_number(parts[2])
+        change_pct = ((price / pre_close - 1.0) * 100.0) if price is not None and pre_close else None
+        volume_shares = _eastmoney_number(parts[8])
+        quote_date = str(parts[30] or "").strip()
+        quote_time = f"{quote_date} {str(parts[31] or '').strip()}" if quote_date and len(parts) > 31 else None
+        quotes[code] = {
+            "code": code,
+            "name": parts[0],
+            "price": price,
+            "pre_close": pre_close,
+            "open": _eastmoney_number(parts[1]),
+            "high": _eastmoney_number(parts[4]),
+            "low": _eastmoney_number(parts[5]),
+            "volume": round(volume_shares / 100.0, 2) if volume_shares is not None else None,
+            "amount": _eastmoney_number(parts[9]),
+            "change_pct": change_pct,
+            "turnover": None,
+            "market_cap_yi": None,
+            "quote_time": quote_time,
+            "quote_date": quote_date or datetime.now().strftime("%Y-%m-%d"),
+            "source": "sina_batch",
+        }
+    return quotes
+
+
+def fetch_sina_a_quotes(codes: Sequence[str], timeout: int = 8) -> Dict[str, Dict[str, Any]]:
+    """新浪批量实时行情。字段少于腾讯，但可作为低成本备用源。"""
+    quotes: Dict[str, Dict[str, Any]] = {}
+    headers = {"User-Agent": "Mozilla/5.0", "Referer": "https://finance.sina.com.cn/"}
+    for chunk in _quote_chunks(codes):
+        symbols = ",".join(_market_symbol(code) for code in chunk)
+        response = requests.get("https://hq.sinajs.cn/list=" + symbols, headers=headers, timeout=timeout)
+        response.raise_for_status()
+        response.encoding = response.encoding or "GB18030"
+        quotes.update(_parse_sina_quote_text(response.text))
+    return quotes
+
+
+def fetch_eastmoney_a_spot_quotes(timeout: int = 8) -> Dict[str, Dict[str, Any]]:
+    """东方财富全 A 快照。一次请求全市场，供雷达实时刷新本地过滤。"""
+    from stock_crawl_segment_leaders import EASTMONEY_A_SPOT_URL, EASTMONEY_HEADERS
+
+    response = requests.get(
+        EASTMONEY_A_SPOT_URL,
+        params={
+            "pn": "1",
+            "pz": "10000",
+            "po": "1",
+            "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281",
+            "fltt": "2",
+            "invt": "2",
+            "fid": "f12",
+            "fs": "m:0 t:6,m:0 t:80,m:1 t:2,m:1 t:23,m:0 t:81 s:2048",
+            "fields": "f2,f3,f5,f6,f8,f12,f14,f15,f16,f17,f18,f20,f124",
+        },
+        headers=EASTMONEY_HEADERS,
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = ((response.json().get("data") or {}).get("diff") or [])
+    if not isinstance(rows, list):
+        raise RuntimeError("东方财富全A实时行情返回结构异常")
+
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = _clean_stock_code(row.get("f12"))
+        if not code:
+            continue
+        quote_time = _eastmoney_quote_time(row.get("f124"))
+        market_cap_yuan = _eastmoney_number(row.get("f20"))
+        quotes[code] = {
+            "code": code,
+            "name": str(row.get("f14") or "").strip(),
+            "price": _eastmoney_number(row.get("f2")),
+            "change_pct": _eastmoney_number(row.get("f3")),
+            "volume": _eastmoney_number(row.get("f5")),
+            "amount": _eastmoney_number(row.get("f6")),
+            "turnover": _eastmoney_number(row.get("f8")),
+            "high": _eastmoney_number(row.get("f15")),
+            "low": _eastmoney_number(row.get("f16")),
+            "open": _eastmoney_number(row.get("f17")),
+            "pre_close": _eastmoney_number(row.get("f18")),
+            "market_cap_yi": round(market_cap_yuan / 1e8, 4) if market_cap_yuan else None,
+            "quote_time": quote_time,
+            "quote_date": quote_time[:10] if quote_time else datetime.now().strftime("%Y-%m-%d"),
+            "source": "eastmoney_a_spot",
+        }
+    return quotes
+
+
+def fetch_realtime_a_quotes(codes: Sequence[str], timeout: int = 8) -> Dict[str, Dict[str, Any]]:
+    """当前雷达实时行情入口：腾讯批量优先，新浪备用，东财全 A 兜底。"""
+    clean_codes = [_clean_stock_code(code) for code in codes]
+    clean_codes = [code for code in dict.fromkeys(clean_codes) if code]
+    errors = []
+    for label, fetcher in (
+        ("tencent_batch", fetch_tencent_a_quotes),
+        ("sina_batch", fetch_sina_a_quotes),
+    ):
+        try:
+            quotes = fetcher(clean_codes, timeout=timeout)
+            if quotes:
+                return quotes
+            errors.append(f"{label}: empty")
+        except Exception as exc:
+            errors.append(f"{label}: {exc}")
+    try:
+        all_quotes = fetch_eastmoney_a_spot_quotes(timeout=timeout)
+        quotes = {code: all_quotes[code] for code in clean_codes if code in all_quotes}
+        if quotes:
+            return quotes
+        errors.append("eastmoney_a_spot: empty")
+    except Exception as exc:
+        errors.append(f"eastmoney_a_spot: {exc}")
+    raise RuntimeError("实时行情源均失败：" + " | ".join(errors))
+
+
 def display_path(path: Path) -> str:
     try:
         return str(path.relative_to(ROOT))
@@ -485,6 +811,39 @@ def _recent_bars(conn: sqlite3.Connection, code: str, limit: int = LOOKBACK,
     else:
         rows = conn.execute(_BAR_SQL + "ORDER BY date DESC LIMIT ?", (code, limit)).fetchall()
     return [_bar(r) for r in reversed(rows)]
+
+
+def _bulk_recent_bars(conn: sqlite3.Connection, codes: Sequence[str],
+                      limit: int = LOOKBACK) -> Dict[str, List[Dict[str, Any]]]:
+    """批量取多只股票近端有效日线，避免实时刷新时对 1000 只股票逐只查库。"""
+    clean_codes = [str(c).zfill(6) for c in dict.fromkeys(codes) if c]
+    out: Dict[str, List[Dict[str, Any]]] = {code: [] for code in clean_codes}
+    if not clean_codes:
+        return out
+    select_cols = (
+        "code, date, daily_open, daily_high, daily_low, daily_close, daily_volume, "
+        "daily_amount, daily_change_pct, daily_turnover_rate"
+    )
+    try:
+        for i in range(0, len(clean_codes), 800):
+            chunk = clean_codes[i:i + 800]
+            placeholders = ",".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT {select_cols} FROM ("
+                f"SELECT {select_cols}, "
+                "ROW_NUMBER() OVER (PARTITION BY code ORDER BY date DESC) AS rn "
+                "FROM stock_history "
+                f"WHERE code IN ({placeholders}) "
+                "AND daily_close IS NOT NULL AND daily_volume IS NOT NULL"
+                ") WHERE rn <= ? ORDER BY code, date",
+                (*chunk, limit),
+            ).fetchall()
+            for row in rows:
+                out.setdefault(row["code"], []).append(_bar(row))
+    except sqlite3.OperationalError:
+        # 极旧 SQLite 无 window function 时降级，仍保持功能可用。
+        return {code: _recent_bars(conn, code, limit=limit) for code in clean_codes}
+    return out
 
 
 def _all_bars(conn: sqlite3.Connection, code: str) -> List[Dict[str, Any]]:
@@ -1534,14 +1893,9 @@ def _evidence(res: Dict[str, Any], fired: List[Dict[str, str]],
     return tags
 
 
-def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
-                    as_of: Optional[str] = None, pool: str = DEFAULT_POOL) -> Dict[str, Any]:
-    """给单只龙头算当下潜伏分 + 游资形态匹配，返回带子分/原始信号/形态的明细行。
-
-    as_of 给定时只用该日期及以前的 bar（PIT 防泄漏，供历史复盘）。
-    pool='hotmoney' 且开启平滑(REVERSAL_SMOOTH_DAYS>1)时附 rev_hist(近 N 日原始过热因子,供 EMA 平滑)。
-    """
-    bars = _recent_bars(conn, cand["code"], as_of=as_of)
+def _score_candidate_from_bars(cand: Dict[str, Any], bars: List[Dict[str, Any]],
+                               pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+    """给单只候选按给定 bars 打分；离线/实时路径共用同一套形态逻辑。"""
     out = dict(cand)
     res = _score_bars(cand["code"], bars)
     if res is None:
@@ -1580,6 +1934,17 @@ def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
             hist.append(_reversal_raw_features(cand["code"], sub))
         out["rev_hist"] = hist
     return out
+
+
+def score_candidate(conn: sqlite3.Connection, cand: Dict[str, Any],
+                    as_of: Optional[str] = None, pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+    """给单只龙头算当下潜伏分 + 游资形态匹配，返回带子分/原始信号/形态的明细行。
+
+    as_of 给定时只用该日期及以前的 bar（PIT 防泄漏，供历史复盘）。
+    pool='hotmoney' 且开启平滑(REVERSAL_SMOOTH_DAYS>1)时附 rev_hist(近 N 日原始过热因子,供 EMA 平滑)。
+    """
+    bars = _recent_bars(conn, cand["code"], as_of=as_of)
+    return _score_candidate_from_bars(cand, bars, pool=pool)
 
 
 # ── 输出 ──────────────────────────────────────────────────────
@@ -1840,6 +2205,19 @@ def _apply_accumulation_model(rows: List[Dict[str, Any]]) -> None:
         r["invalidations"] = _phase_invalidations(phase)
 
 
+def _attach_capital_evidence(row: Dict[str, Any]) -> None:
+    ev = row.get("evidence")
+    if not isinstance(ev, list):
+        return
+    hc = row.get("holder_change")
+    if hc is not None and hc <= -5:
+        ev.append({"label": f"股东户数降{abs(hc):.0f}%", "kind": "bullish"})
+    if row.get("repurchase_recent"):
+        ev.append({"label": "公司回购中", "kind": "bullish"})
+    if row.get("lhb_recent"):
+        ev.append({"label": "近期上龙虎榜(避雷)", "kind": "bearish"})
+
+
 # ── 游资池超短反转分（hotmoney 专用，纪要14）──────────────────
 # 游资小盘池 3 日尺度无可交易动量、反转极强(verify: 反转分 IC3d +0.101/t7.4、多空 +0.68%/3日，
 #   首个多空转正信号)。分 = 把"过热"因子(换手分位/振幅/涨停/量比/动量)截面 rank 后【反向】加权——
@@ -1994,6 +2372,206 @@ def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dic
     }
 
 
+def _quote_to_realtime_bar(bars: List[Dict[str, Any]], quote: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    price = _safe(quote.get("price"))
+    quote_date = str(quote.get("quote_date") or "")[:10]
+    if price is None or not quote_date or not bars:
+        return None
+    last = bars[-1]
+    # 本地 stock_history 是前复权(qfq)日线；实时接口返回不复权现价。
+    # 为保证形态序列连续，实时 bar 的价格一律投影到本地 qfq 基准：
+    #   - 同日替换时，用前一交易日 qfq close 作基准；
+    #   - 新增今日时，用最后一根本地 qfq close 作基准；
+    #   - close 优先按实时涨跌幅计算，open/high/low 按未复权盘口相对昨收比例缩放。
+    # 成交量/额/换手率则保留 raw_*，盘中按已交易分钟投影成全天量后再给因子使用。
+    basis = bars[-2] if quote_date == last.get("date") and len(bars) >= 2 else last
+    basis_close = _safe(basis.get("close"))
+    raw_pre_close = _safe(quote.get("pre_close"))
+    change_pct = _safe(quote.get("change_pct"))
+    if change_pct is None and raw_pre_close:
+        change_pct = (price / raw_pre_close - 1.0) * 100.0
+    if basis_close is not None and change_pct is not None:
+        close = basis_close * (1.0 + change_pct / 100.0)
+    elif basis_close is not None and raw_pre_close:
+        close = basis_close * price / raw_pre_close
+    else:
+        close = price
+
+    def adjusted_price(raw_value: Any, fallback: Optional[float] = None) -> Optional[float]:
+        raw = _safe(raw_value)
+        if raw is None:
+            return fallback
+        if basis_close is not None and raw_pre_close:
+            return basis_close * raw / raw_pre_close
+        if price and close:
+            return close * raw / price
+        return raw
+
+    open_px = adjusted_price(quote.get("open"), close)
+    high = adjusted_price(quote.get("high"), close)
+    low = adjusted_price(quote.get("low"), close)
+    high = max(v for v in (high, close, open_px) if v is not None)
+    low = min(v for v in (low, close, open_px) if v is not None)
+    same_day = quote_date == last.get("date")
+    raw_volume = _safe(quote.get("volume"))
+    raw_amount = _safe(quote.get("amount"))
+    raw_turnover = _safe(quote.get("turnover"))
+    volume_factor, volume_elapsed, volume_projected = _intraday_volume_projection(quote)
+
+    def projected_metric(value: Optional[float]) -> Optional[float]:
+        return value * volume_factor if value is not None else None
+
+    volume = projected_metric(raw_volume)
+    amount = projected_metric(raw_amount)
+    turnover = projected_metric(raw_turnover)
+    return {
+        "date": quote_date,
+        "open": round(open_px, 6) if open_px is not None else None,
+        "high": round(high, 6),
+        "low": round(low, 6),
+        "close": round(close, 6),
+        "volume": volume if volume is not None else (last.get("volume") if same_day else 0.0),
+        "amount": amount if amount is not None else (last.get("amount") if same_day else None),
+        "chg": change_pct,
+        "turnover": turnover if turnover is not None else (last.get("turnover") if same_day else None),
+        "raw_close": price,
+        "raw_pre_close": raw_pre_close,
+        "raw_volume": raw_volume,
+        "raw_amount": raw_amount,
+        "raw_turnover": raw_turnover,
+        "volume_projection_factor": round(volume_factor, 4),
+        "volume_elapsed_minutes": round(volume_elapsed, 2) if volume_elapsed is not None else None,
+        "volume_projected": volume_projected,
+        "volume_projection_method": "u_shape_intraday" if volume_projected else "none",
+        "price_adjust": "qfq_intraday_from_change_pct",
+    }
+
+
+def _merge_realtime_quote_bars(
+    bars: List[Dict[str, Any]],
+    quote: Optional[Dict[str, Any]],
+    limit: int = LOOKBACK,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    if not bars or not quote:
+        return bars, False
+    bar = _quote_to_realtime_bar(bars, quote)
+    if not bar:
+        return bars, False
+    last_date = str(bars[-1].get("date") or "")
+    quote_date = str(bar.get("date") or "")
+    if quote_date < last_date:
+        return bars, False
+    merged = list(bars)
+    if quote_date == last_date:
+        merged[-1] = bar
+    else:
+        merged.append(bar)
+    return merged[-limit:], True
+
+
+def realtime_rescore_payload(
+    payload: Dict[str, Any],
+    quotes: Dict[str, Dict[str, Any]],
+    fetched_at: Optional[str] = None,
+) -> Dict[str, Any]:
+    """用东财全 A 快照重算当前雷达 payload，不落盘。
+
+    网络层只拉一次全 A，数据库层批量读取近端 K 线；每只股票只做 O(LOOKBACK) 的内存形态计算。
+    """
+    base = dict(payload or {})
+    stocks = [dict(row) for row in (base.get("stocks") or []) if row.get("code")]
+    fetched_at = fetched_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    if not stocks:
+        base["realtime_quote"] = {
+            "available": False,
+            "source": "eastmoney_a_spot",
+            "updated_at": fetched_at,
+            "message": "当前雷达没有可刷新的股票",
+        }
+        return base
+
+    codes = [str(row.get("code")).zfill(6) for row in stocks]
+    conn = stock_storage.connect(DB_FILE)
+    try:
+        bars_by_code = _bulk_recent_bars(conn, codes, LOOKBACK)
+    finally:
+        conn.close()
+
+    pool = str(base.get("pool") or DEFAULT_POOL)
+    quote_sources = Counter(str(quote.get("source") or "unknown") for quote in quotes.values())
+    primary_source = quote_sources.most_common(1)[0][0] if quote_sources else "realtime_batch"
+    rescored: List[Dict[str, Any]] = []
+    matched_quotes = 0
+    used_realtime = 0
+    missing_history = 0
+    for old in stocks:
+        code = str(old.get("code")).zfill(6)
+        bars = bars_by_code.get(code) or []
+        quote = quotes.get(code)
+        if quote:
+            matched_quotes += 1
+        merged_bars, used_quote = _merge_realtime_quote_bars(bars, quote, LOOKBACK)
+        if not merged_bars:
+            missing_history += 1
+            row = dict(old)
+            row["realtime_status"] = "NO_LOCAL_BARS"
+            rescored.append(row)
+            continue
+        row = _score_candidate_from_bars(old, merged_bars, pool=pool)
+        if quote:
+            row["realtime_price"] = quote.get("price")
+            row["realtime_change_pct"] = quote.get("change_pct")
+            row["realtime_quote_time"] = quote.get("quote_time")
+            if used_quote and merged_bars:
+                row["realtime_adjusted_close"] = merged_bars[-1].get("close")
+                row["realtime_price_adjust"] = merged_bars[-1].get("price_adjust")
+                row["realtime_raw_volume"] = merged_bars[-1].get("raw_volume")
+                row["realtime_projected_volume"] = merged_bars[-1].get("volume")
+                row["realtime_raw_turnover"] = merged_bars[-1].get("raw_turnover")
+                row["realtime_projected_turnover"] = merged_bars[-1].get("turnover")
+                row["realtime_volume_projection_factor"] = merged_bars[-1].get("volume_projection_factor")
+                row["realtime_volume_elapsed_minutes"] = merged_bars[-1].get("volume_elapsed_minutes")
+                row["realtime_volume_projected"] = merged_bars[-1].get("volume_projected")
+                row["realtime_volume_projection_method"] = merged_bars[-1].get("volume_projection_method")
+            if quote.get("market_cap_yi") is not None:
+                row["market_cap_yi"] = quote.get("market_cap_yi")
+        row["realtime_status"] = "UPDATED" if used_quote else "LOCAL_BARS_ONLY"
+        if used_quote:
+            used_realtime += 1
+        _apply_distribution_model(row)
+        _attach_capital_evidence(row)
+        rescored.append(row)
+
+    ranked = [row for row in rescored if row.get("ambush_score") is not None]
+    _apply_accumulation_model(ranked)
+    if pool == "hotmoney":
+        _apply_reversal_model(ranked)
+        ranked.sort(key=lambda r: (r.get("reversal_score") or 0.0), reverse=True)
+    else:
+        ranked.sort(key=lambda r: (r.get("opportunity_score") or 0.0, r.get("ambush_score") or 0.0), reverse=True)
+
+    base.update({
+        "stocks": ranked,
+        "scored_count": len(ranked),
+        "skipped_count": len(rescored) - len(ranked),
+        "triggered_count": sum(1 for row in ranked if row.get("triggered")),
+        "phase_counts": dict(Counter(row.get("pattern_phase") for row in ranked)),
+        "realtime_quote": {
+            "available": True,
+            "source": primary_source,
+            "source_counts": dict(quote_sources),
+            "updated_at": fetched_at,
+            "interval_seconds": 120,
+            "snapshot_count": len(quotes),
+            "matched_count": matched_quotes,
+            "used_count": used_realtime,
+            "missing_history_count": missing_history,
+            "note": "批量实时行情只用于当前页面实时重算，不写回离线结果文件。",
+        },
+    })
+    return base
+
+
 def run_ambush(as_of: Optional[str] = None,
                max_cap: Optional[float] = None,
                pool: str = DEFAULT_POOL,
@@ -2016,15 +2594,7 @@ def run_ambush(as_of: Optional[str] = None,
         r["repurchase_recent"] = bool(info and info.get("repurchase_recent"))
         r["lhb_recent"] = bool(info and info.get("lhb_recent"))
         _apply_distribution_model(r)
-        ev = r.get("evidence")
-        if isinstance(ev, list):
-            hc = r["holder_change"]
-            if hc is not None and hc <= -5:
-                ev.append({"label": f"股东户数降{abs(hc):.0f}%", "kind": "bullish"})
-            if r["repurchase_recent"]:
-                ev.append({"label": "公司回购中", "kind": "bullish"})
-            if r["lhb_recent"]:
-                ev.append({"label": "近期上龙虎榜(避雷)", "kind": "bearish"})
+        _attach_capital_evidence(r)
 
     # PIT 防泄漏：theme_candidates.json 是「最新日」快照，历史 as-of 复盘时用它会泄露未来题材热度，
     # 故只在 as_of=None（实时跑）时才挂题材/行业热度映射；历史复盘留空，避免未来热度泄漏。

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+import time
 from datetime import datetime
 from typing import Any, Dict, List
 
@@ -8,17 +10,71 @@ from app.services.job_service import get_job_state, start_command_job
 
 import stock_storage
 from stock_crawl_common import load_json_file
-from stock_hot_money_radar import AMBUSH_RESULT_FILE, pattern_catalog
+from stock_hot_money_radar import (
+    AMBUSH_RESULT_FILE,
+    fetch_realtime_a_quotes,
+    pattern_catalog,
+    realtime_rescore_payload,
+)
 
 
 RADAR_RUN_JOB_ID = "radar-run"          # 刷新结果：跑 ambush 重新打分
 RADAR_DATA_JOB_ID = "radar-data"        # 刷新数据：跑 stock_radar_fresh_data.sh 重爬行情/板块/题材
 RADAR_REFRESH_SCRIPT = "stock_radar_fresh_data.sh"
+RADAR_REALTIME_CACHE_SECONDS = 30
+RADAR_REALTIME_INTERVAL_SECONDS = 120
+_REALTIME_LOCK = threading.Lock()
+_REALTIME_CACHE: Dict[str, Any] = {"fetched_at_ts": 0.0, "fetched_at": "", "codes_key": (), "quotes": None}
 
 
 def radar_payload() -> Dict[str, Any]:
     """游资雷达 ambush 结果（stock_hot_money_radar.py 落盘的 hot_money_ambush.json）。"""
     return load_json_file(AMBUSH_RESULT_FILE, {}) or {}
+
+
+def _payload_codes(payload: Dict[str, Any]) -> List[str]:
+    return [str(row.get("code") or "").zfill(6) for row in payload.get("stocks", []) if row.get("code")]
+
+
+def _cached_realtime_quotes(codes: List[str]) -> tuple[Dict[str, Dict[str, Any]], str]:
+    now = time.time()
+    codes_key = tuple(sorted(dict.fromkeys(codes)))
+    with _REALTIME_LOCK:
+        cached_quotes = _REALTIME_CACHE.get("quotes")
+        cached_ts = float(_REALTIME_CACHE.get("fetched_at_ts") or 0.0)
+        if (
+            cached_quotes is not None
+            and _REALTIME_CACHE.get("codes_key") == codes_key
+            and now - cached_ts <= RADAR_REALTIME_CACHE_SECONDS
+        ):
+            return cached_quotes, str(_REALTIME_CACHE.get("fetched_at") or "")
+        quotes = fetch_realtime_a_quotes(codes)
+        fetched_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        _REALTIME_CACHE.update({
+            "fetched_at_ts": now,
+            "fetched_at": fetched_at,
+            "codes_key": codes_key,
+            "quotes": quotes,
+        })
+        return quotes, fetched_at
+
+
+def radar_realtime_payload() -> Dict[str, Any]:
+    """把批量实时行情叠加到当前雷达结果，仅返回页面展示，不写回结果文件。"""
+    payload = radar_payload()
+    try:
+        quotes, fetched_at = _cached_realtime_quotes(_payload_codes(payload))
+        return realtime_rescore_payload(payload, quotes, fetched_at=fetched_at)
+    except Exception as exc:
+        out = dict(payload)
+        out["realtime_quote"] = {
+            "available": False,
+            "source": "realtime_batch",
+            "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "interval_seconds": RADAR_REALTIME_INTERVAL_SECONDS,
+            "error": str(exc),
+        }
+        return out
 
 
 def radar_pattern_catalog() -> List[Dict[str, Any]]:

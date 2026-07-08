@@ -228,9 +228,9 @@
     }
 
     async function startOptimize() {
-      const msg = "将对长线/短线各运行 1500 次参数搜索回测"
+      const msg = "将对长线/短线各运行 1500 次 Optuna/TPE 参数搜索回测"
         + "（相当于 python stock_strategy_optimizer.py --iterations 1500），"
-        + "约需 10 分钟左右，期间页面将锁定。确定开始吗？";
+        + "长线和短线会以独立进程并行搜索，约需 10 分钟左右，期间页面将锁定。确定开始吗？";
       if (!window.confirm(msg)) return;
       try {
         const resp = await fetch("/api/optimize", {method: "POST"});

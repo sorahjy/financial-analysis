@@ -41,6 +41,10 @@
   color: var(--muted);
   cursor: pointer;
 }
+.radar .radar-live-toggle { color: #1f7a3f; }
+.radar-live-status { min-width: 112px; text-align: left; }
+.radar-live-status.is-live { color: #16803a; }
+.radar-live-status.is-error { color: var(--r-down); }
 
 .radar-meta {
   display: flex;
@@ -313,6 +317,8 @@ table.radar-grid tbody tr.is-selected { background: #e6efff; box-shadow: inset 3
 table.radar-grid td.mono, table.radar-grid .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
 table.radar-grid td.dim { color: var(--muted); }
 table.radar-grid td.strong { font-weight: 700; }
+table.radar-grid td.up { color: var(--r-up); font-weight: 700; }
+table.radar-grid td.down { color: var(--r-down); font-weight: 700; }
 table.radar-grid td.hot-turnover { color: var(--r-up); font-weight: 700; }   /* 换手分位>84% 拥挤标红 */
 table.radar-grid small { color: var(--muted); font-size: 11px; }
 

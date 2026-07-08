@@ -17,6 +17,11 @@
     return "w";
   }
   const fmt = (v, d = 2) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? "-" : Number(v).toFixed(d));
+  const fmtSignedPct = (v, d = 2) => {
+    if (v === null || v === undefined || v === "" || Number.isNaN(Number(v))) return "-";
+    const n = Number(v);
+    return `${n > 0 ? "+" : ""}${n.toFixed(d)}%`;
+  };
   const scoreValue = (s, key, fallbackKey) => {
     const v = s && s[key];
     if (v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(v))) return Number(v);
@@ -50,6 +55,8 @@
   const KLINE_DEFAULT_VISIBLE = { day: 140, week: 96, month: 72 };
   const KLINE_MIN_VISIBLE = { day: 24, week: 18, month: 12 };
   const KLINE_HISTORY_LIMIT = 3600;
+  const REALTIME_REFRESH_MS = 120000;
+  const REALTIME_SOURCE_LABEL = { tencent_batch: "腾讯", sina_batch: "新浪", eastmoney_a_spot: "东财" };
 
   function initRadar() {
     const root = document.querySelector("#radar-dashboard");
@@ -68,6 +75,8 @@
     let klineDrag = null;
     let klineFetchSeq = 0;
     let pollTimer = null;
+    let realtimeTimer = null;
+    let realtimeBusy = false;
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
     let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
@@ -252,6 +261,62 @@
       }
     }
 
+    function updateRealtimeStatus(text, tone) {
+      const el = $("radar-live-status");
+      if (!el) return;
+      el.textContent = text;
+      el.classList.toggle("is-live", tone === "live");
+      el.classList.toggle("is-error", tone === "error");
+    }
+
+    async function fetchRealtimeData() {
+      const toggle = $("radar-live-quote");
+      if (!toggle || !toggle.checked || realtimeBusy || disposed) return;
+      realtimeBusy = true;
+      updateRealtimeStatus("刷新中…", "live");
+      try {
+        const resp = await fetch("/api/radar/realtime");
+        const data = await resp.json();
+        if (disposed || !toggle.checked) return;
+        payload = normalizePayload(data.payload || {});
+        stocks = payload.stocks;
+        syncSw2Filter();
+        renderMeta();
+        renderPhaseFilter();
+        renderPhaseChips();
+        applyFilters();
+        if (selectedCode) {
+          const selected = stocks.find((s) => s.code === selectedCode);
+          if (selected) renderPatternInfo(selected);
+        }
+        const rt = payload.realtime_quote || {};
+        const sourceLabel = REALTIME_SOURCE_LABEL[rt.source] || "实时";
+        if (rt.available) updateRealtimeStatus(`${sourceLabel} ${rt.updated_at || ""} · 2分钟`, "live");
+        else updateRealtimeStatus(rt.error ? "实时失败" : "无实时数据", rt.error ? "error" : "");
+      } catch (err) {
+        if (!disposed) updateRealtimeStatus("实时失败", "error");
+      } finally {
+        realtimeBusy = false;
+      }
+    }
+
+    function setRealtimeEnabled(enabled) {
+      const toggle = $("radar-live-quote");
+      if (toggle) toggle.checked = !!enabled;
+      if (realtimeTimer) {
+        clearInterval(realtimeTimer);
+        realtimeTimer = null;
+      }
+      if (!enabled) {
+        updateRealtimeStatus("未开启", "");
+        fetchData();
+        return;
+      }
+      updateRealtimeStatus("等待刷新…", "live");
+      fetchRealtimeData();
+      realtimeTimer = setInterval(fetchRealtimeData, REALTIME_REFRESH_MS);
+    }
+
     function renderMeta() {
       const p = payload || {};
       if (!p.generated_at) {
@@ -279,11 +344,16 @@
       const regimeLine = (mr && mr.available)
         ? `<span>大盘 <strong>${mr.above_ma20 ? "强势(>MA20)·反转分可做多" : "弱势(<MA20)·做多易接刀"}</strong></span>`
         : "";
+      const rt = p.realtime_quote || {};
+      const sourceLabel = REALTIME_SOURCE_LABEL[rt.source] || "实时";
+      const realtimeLine = rt.available
+        ? `<span>实时: ${esc(sourceLabel)} <strong>${esc(rt.updated_at || "")}</strong> · 匹配<strong>${rt.matched_count ?? 0}</strong> · 重算<strong>${rt.used_count ?? 0}</strong></span>`
+        : (rt.error ? `<span>实时: <strong>失败</strong> ${esc(rt.error)}</span>` : "");
       $("radar-meta").innerHTML =
         `<span>生成 <strong>${esc(p.generated_at)}</strong>${asOf}</span>` +
         `<span>候选 <strong>${p.candidate_count ?? "-"}</strong>（${esc(pool)}）</span>` +
         `<span>已打分 <strong>${p.scored_count ?? "-"}</strong></span>` +
-        `<span>${esc(theme)}</span>` + capLine + regimeLine;
+        `<span>${esc(theme)}</span>` + capLine + regimeLine + realtimeLine;
     }
 
     function orderedPhases() {
@@ -403,13 +473,17 @@
         $("radar-table").innerHTML = "<div class='radar-empty'>无匹配结果</div>";
         return;
       }
+      const hasRealtime = !!(payload && payload.realtime_quote && payload.realtime_quote.available);
       const sortTh = (key, label) => {
         const active = sortState.key === key;
         const arrow = active ? (sortState.dir === "asc" ? "▲" : "▼") : "↕";
         return `<th class="num sortable${active ? " active" : ""}" data-key="${key}">${label} <span class="sort-arrow">${arrow}</span></th>`;
       };
+      const realtimeHead = hasRealtime
+        ? `${sortTh("realtime_price", "现价")}${sortTh("realtime_change_pct", "涨幅")}`
+        : "";
       const head = `<tr>
-        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${sortTh("opportunity_score", "机会分")}${sortTh("ambush_score", "吸筹分")}${sortTh("distribution_score", "出货分")}
+        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${realtimeHead}${sortTh("opportunity_score", "机会分")}${sortTh("ambush_score", "吸筹分")}${sortTh("distribution_score", "出货分")}
         <th class="num">量比</th><th class="num">价分位</th><th class="num">换手分位</th><th class="num">CMF</th><th class="num">筹码</th>
         <th class="num">连板</th><th>命中形态</th><th>阶段·把握</th><th>走势相似行业</th><th>二级行业</th><th>依据</th>
       </tr>`;
@@ -434,6 +508,7 @@
           <td class="mono">${esc(s.code)}</td>
           <td>${esc(s.name || "")}</td>
           <td class="num">${fmtMarketCap(s.market_cap_yi)}</td>
+          ${hasRealtime ? `<td class="num">${fmt(s.realtime_price, 2)}</td><td class="num ${Number(s.realtime_change_pct) > 0 ? "up" : Number(s.realtime_change_pct) < 0 ? "down" : ""}">${fmtSignedPct(s.realtime_change_pct)}</td>` : ""}
           <td class="num strong">${fmt(s.opportunity_score, 1)}</td>
           <td class="num" title="机会分计算用吸筹分位 ${fmt(s.accumulation_percentile, 1)}">${fmt(s.ambush_score, 1)}</td>
           <td class="num" title="机会分计算用出货分位 ${fmt(s.distribution_percentile, 1)}">${fmt(s.distribution_score, 1)}</td>
@@ -910,6 +985,7 @@
         if (!window.confirm("刷新数据将重爬全市场行情 + 板块 + 题材，大约需要 10–30 分钟，期间请勿关闭页面。\n\n确认现在开始吗？")) return;
         startJob("/api/radar/refresh-data", "数据刷新", null);
       };
+      $("radar-live-quote").addEventListener("change", (ev) => setRealtimeEnabled(ev.target.checked));
       $("radar-sw2-trigger").onclick = () => setSw2PanelOpen($("radar-sw2-panel").hidden);
       $("radar-sw2-search").addEventListener("input", renderSw2Filter);
       $("radar-sw2-min-heat").addEventListener("input", renderSw2Filter);
@@ -961,6 +1037,7 @@
     window.FinancialAnalysisPages.cleanup = () => {
       disposed = true;
       if (pollTimer) clearInterval(pollTimer);
+      if (realtimeTimer) clearInterval(realtimeTimer);
       window.removeEventListener("resize", onResize);
       document.removeEventListener("click", onDocumentClick);
       document.removeEventListener("keydown", onDocumentKeyDown);

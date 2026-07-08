@@ -7,6 +7,7 @@ from app.services.radar_service import (
     radar_data_state,
     radar_pattern_catalog,
     radar_payload,
+    radar_realtime_payload,
     radar_run_state,
     start_radar_data_refresh,
     start_radar_run,
@@ -30,6 +31,11 @@ def radar_data():
             "data_job": radar_data_state(),
         }
     )
+
+
+@bp.get("/api/radar/realtime")
+def radar_realtime():
+    return jsonify({"payload": radar_realtime_payload()})
 
 
 @bp.get("/api/radar/patterns")
