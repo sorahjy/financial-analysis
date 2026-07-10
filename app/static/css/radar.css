@@ -284,8 +284,9 @@
 @media (max-width: 1100px) { .radar-split { grid-template-columns: 1fr; } }
 
 .radar-table {
-  max-height: 72vh;
-  overflow: auto;
+  max-height: none;
+  overflow-x: auto;
+  overflow-y: hidden;
   border: 1px solid var(--line);
   border-radius: 10px;
   background: var(--panel);
@@ -368,8 +369,83 @@ table.radar-grid td.ev-cell { white-space: normal; min-width: 200px; max-width: 
   background: var(--panel);
   padding: 12px;
 }
-.radar-kline-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.radar-kline-head { display: flex; align-items: flex-start; flex-direction: column; gap: 3px; margin-bottom: 8px; }
 .radar-kline-head strong { font-size: 14px; }
+.radar-kline-head .status { white-space: normal; }
+.radar-stock-info {
+  margin-bottom: 10px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel-soft);
+  transition: opacity .16s ease;
+}
+.radar-stock-info.is-empty { opacity: .72; }
+.radar-stock-market {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--line);
+}
+.radar-stock-metric {
+  min-width: 0;
+  padding: 7px 8px;
+  background: var(--panel);
+}
+.radar-stock-metric span,
+.radar-stock-metric small {
+  display: block;
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.35;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.radar-stock-metric strong {
+  display: block;
+  margin-top: 3px;
+  overflow: hidden;
+  color: var(--ink);
+  font-size: 16px;
+  font-variant-numeric: tabular-nums;
+  line-height: 1.2;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.radar-stock-metric strong.up { color: var(--r-up); }
+.radar-stock-metric strong.down { color: var(--r-down); }
+.radar-stock-price strong { font-size: 18px; }
+.radar-stock-metric small {
+  min-height: 14px;
+  margin-top: 2px;
+  font-size: 9px;
+}
+.radar-stock-facts {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px 12px;
+  margin: 9px 0 0;
+  padding-top: 9px;
+  border-top: 1px solid var(--line);
+}
+.radar-stock-facts div { min-width: 0; }
+.radar-stock-facts dt {
+  margin: 0 0 2px;
+  color: var(--muted);
+  font-size: 10px;
+}
+.radar-stock-facts dd {
+  margin: 0;
+  color: var(--ink);
+  font-size: 11px;
+  font-weight: 650;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 .radar-kline-periods {
   display: inline-flex;
   gap: 0;

@@ -20,20 +20,66 @@ class FlaskAppTest(unittest.TestCase):
         self.client = create_app().test_client()
 
     def test_workspace_pages_load(self):
-        for path in ("/", "/fund", "/stock"):
+        for path in ("/", "/fund", "/fund/report", "/stock", "/radar"):
             with self.subTest(path=path):
                 response = self.client.get(path)
                 self.assertEqual(response.status_code, 200)
                 self.assertIn("text/html", response.content_type)
 
     def test_app_shell_loads_shared_scripts_once_per_page(self):
-        for path in ("/", "/fund", "/stock"):
+        for path in ("/", "/fund", "/stock", "/radar"):
             with self.subTest(path=path):
                 html = self.client.get(path).get_data(as_text=True)
                 self.assertEqual(html.count("js/fund-report.js"), 1)
                 self.assertEqual(html.count("js/stock-dashboard.js"), 1)
+                self.assertEqual(html.count("js/radar.js"), 1)
                 self.assertEqual(html.count("js/app-navigation.js"), 1)
                 self.assertEqual(html.count("vendor/live2d-widget/autoload.js"), 1)
+
+    def test_app_shell_exposes_refreshed_design_and_active_navigation(self):
+        css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
+        self.assertIn("--topbar-height", css)
+        self.assertIn(":focus-visible", css)
+        self.assertIn("prefers-reduced-motion", css)
+
+        home = self.client.get("/").get_data(as_text=True)
+        self.assertIn('class="page-home"', home)
+        self.assertIn('class="skip-link"', home)
+        self.assertEqual(home.count("css/ui-refresh.css"), 1)
+        self.assertIn("今天想看什么？", home)
+        self.assertNotIn('class="home-hero"', home)
+        self.assertNotIn("把复杂数据", home)
+        self.assertNotIn(".home-hero", css)
+        self.assertNotIn(".hero-visual", css)
+
+        for path, body_class, nav_path in (
+            ("/fund", "page-fund", "/fund"),
+            ("/stock", "page-stock", "/stock"),
+            ("/radar", "page-radar", "/radar"),
+        ):
+            with self.subTest(path=path):
+                html = self.client.get(path).get_data(as_text=True)
+                self.assertIn(f'class="{body_class}"', html)
+                self.assertRegex(
+                    html,
+                    rf'data-nav-path="{re.escape(nav_path)}"[^>]*aria-current="page"',
+                )
+
+    def test_fund_toolbars_scroll_with_content_instead_of_covering_rows(self):
+        app_css = (ROOT_DIR / "app/static/css/app.css").read_text(encoding="utf-8")
+        report_css = (ROOT_DIR / "app/static/css/fund-report.css").read_text(encoding="utf-8")
+        refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
+
+        self.assertRegex(app_css, r"\.fund-command-bar\s*\{\s*position:\s*static;")
+        self.assertRegex(report_css, r"\.fund-native \.control-panel\s*\{\s*position:\s*static;")
+        self.assertRegex(refresh_css, r"\.fund-command-bar\s*\{\s*position:\s*static;")
+        self.assertRegex(refresh_css, r"\.fund-native \.control-panel\s*\{\s*position:\s*static;")
+
+    def test_radar_filter_bar_scrolls_with_content(self):
+        refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
+
+        self.assertRegex(refresh_css, r"\.radar-filters\s*\{\s*position:\s*static;")
+        self.assertNotRegex(refresh_css, r"\.radar-filters\s*\{\s*position:\s*sticky;")
 
     def test_internal_navigation_replaces_main_without_reloading_shell(self):
         script = (ROOT_DIR / "app/static/js/app-navigation.js").read_text(encoding="utf-8")
@@ -44,6 +90,9 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('querySelector(".app-main")', script)
         self.assertIn("currentMain.innerHTML = nextMain.innerHTML", script)
         self.assertIn("window.history.pushState", script)
+        self.assertIn("function updateShellState", script)
+        self.assertIn('name.startsWith("page-")', script)
+        self.assertIn('link.setAttribute("aria-current", "page")', script)
         self.assertIn("pages.cleanup()", script)
         self.assertIn("pages.stock && pages.stock()", script)
         self.assertIn("pages.fund && pages.fund()", script)
@@ -83,6 +132,7 @@ class FlaskAppTest(unittest.TestCase):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
         css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+        refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
 
         self.assertIn('"观望⚪"', script)
         self.assertIn('replace("空仓观望", "观望")', script)
@@ -90,8 +140,8 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('sortTh("realtime_price", "现价")', script)
         self.assertIn('sortTh("realtime_change_pct", "涨幅")', script)
         self.assertIn('sortTh("opportunity_score", "机会分")', script)
-        self.assertIn('sortTh("ambush_score", "吸筹分")', script)
-        self.assertIn('sortTh("distribution_score", "出货分")', script)
+        self.assertNotIn('sortTh("ambush_score", "吸筹分")', script)
+        self.assertNotIn('sortTh("distribution_score", "出货分")', script)
         self.assertIn('key: "opportunity_score"', script)
         self.assertIn("户数/回购已并入吸筹总分", script)
         self.assertIn("fmtMarketCap(s.market_cap_yi)", script)
@@ -106,7 +156,8 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('id="radar-sw2-filter"', body)
         self.assertIn('id="radar-sw2-search"', body)
         self.assertIn('id="radar-sw2-min-heat"', body)
-        self.assertIn('value="50"', body)
+        self.assertIn('id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="0"', body)
+        self.assertNotIn('id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="50"', body)
         self.assertIn('id="radar-sw2-options"', body)
         self.assertIn("热度Top10", body)
         self.assertIn("全选", body)
@@ -136,12 +187,20 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn(".industry-heat-filter", css)
         self.assertIn(".industry-option-heat", css)
         self.assertIn("function exportTopOpportunityStocks()", script)
+        self.assertIn('aria-sort="${ariaSort}"', script)
+        self.assertIn('event.key !== "Enter" && event.key !== " "', script)
         self.assertIn("REALTIME_REFRESH_MS = 120000", script)
         self.assertIn("REALTIME_SOURCE_LABEL", script)
         self.assertIn('tencent_batch: "腾讯"', script)
         self.assertIn('sina_batch: "新浪"', script)
         self.assertIn('fetch("/api/radar/realtime")', script)
         self.assertIn("function setRealtimeEnabled(enabled)", script)
+        self.assertIn("async function fetchRealtimeData(queueIfBusy = false)", script)
+        self.assertIn("let realtimeRefreshPending = false", script)
+        self.assertIn("let realtimeRefreshQueued = false", script)
+        self.assertIn('updateRealtimeStatus("等待新股票池…", "live")', script)
+        self.assertIn("if (wasRadarRunBusy && !radarRunBusy && realtimeRefreshPending)", script)
+        self.assertIn("fetchRealtimeData(true)", script)
         self.assertIn("realtime_quote", script)
         self.assertIn("text/plain;charset=utf-8", script)
         self.assertIn("hot_money_radar_opportunity_top", script)
@@ -152,13 +211,59 @@ class FlaskAppTest(unittest.TestCase):
         self.assertNotIn('sortTh("capital_score", "资金分")', script)
         self.assertIn(".radar-export-limit", css)
         self.assertIn(".radar-live-status", css)
-        self.assertIn("走势相似行业", script)
+        self.assertIn('title="按筹码成本估算，当前价以下的筹码占比">获利盘</th>', script)
+        self.assertIn("fmtRatioPct(sig.chip_winner)", script)
+        for hidden_header in ("量比", "价分位", "换手分位", "CMF", "筹码", "连板", "走势相似行业"):
+            self.assertNotIn(f'<th class="num">{hidden_header}</th>', script)
+            self.assertNotIn(f'<th>{hidden_header}</th>', script)
+        self.assertNotIn("themeCell(s)", script)
+        self.assertRegex(
+            css,
+            r"\.radar-table\s*\{\s*max-height:\s*none;\s*overflow-x:\s*auto;\s*overflow-y:\s*hidden;",
+        )
+        self.assertRegex(
+            refresh_css,
+            r"\.radar-kline\s*\{\s*position:\s*sticky;\s*align-self:\s*start;",
+        )
+        self.assertIn("走势相似行业", body)
         self.assertIn("二级行业", script)
         self.assertIn("function sw2Cell(s)", script)
         self.assertIn("s.sw2_heat_pctile", script)
         self.assertIn("esc(industry) + heat", script)
         self.assertNotIn("三级行业", script)
         self.assertNotIn("跟踪二级行业", script)
+
+    def test_radar_kline_card_shows_selected_stock_basic_info(self):
+        body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+
+        self.assertIn('id="radar-stock-info"', body)
+        self.assertIn('aria-label="股票基本信息"', body)
+        self.assertLess(body.index('id="radar-kline-title"'), body.index('id="radar-stock-info"'))
+        self.assertLess(body.index('id="radar-stock-info"'), body.index('id="radar-kline-periods"'))
+        for field in ("price", "change", "cap", "sw2", "sw3", "theme", "date"):
+            self.assertIn(f'id="radar-stock-{field}"', body)
+
+        self.assertIn("function renderStockInfo(s, bars = [])", script)
+        self.assertIn("renderStockInfo(s, []);", script)
+        self.assertIn("renderStockInfo(selected, klineBars);", script)
+        self.assertIn("s.realtime_price", script)
+        self.assertIn("s.parent_segment", script)
+        self.assertIn("s.segment_name", script)
+        self.assertIn("s.tracking_theme", script)
+        self.assertIn("s.last_date", script)
+        self.assertIn(".radar-stock-info", css)
+        self.assertIn(".radar-stock-facts", css)
+
+    def test_radar_kline_date_range_uses_slider_without_mouse_wheel_zoom(self):
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+
+        self.assertNotIn("function onCanvasWheel", script)
+        self.assertNotIn('canvas.addEventListener("wheel"', script)
+        self.assertIn('klineDrag = { type: "range"', script)
+        self.assertIn('klineDrag = { type: "start"', script)
+        self.assertIn('klineDrag = { type: "end"', script)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -346,6 +451,10 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn(".chart-modal-status", css)
         self.assertNotIn("long-chart-card", css)
         self.assertNotIn("查看走势", script)
+        self.assertIn('data-stock-view="results"', body)
+        self.assertIn('data-stock-view="settings"', body)
+        self.assertIn("function setMobileView(view)", script)
+        self.assertIn('event.key === "Escape"', script)
 
     def test_stock_kline_endpoint_returns_weekly_bars(self):
         payload = {"code": "002511", "period": "week", "bars": [{"date": "2026-06-19", "close": 10.0}]}

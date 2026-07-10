@@ -21,6 +21,7 @@
     let runAgainAfterDone = false;
     let exactStockSearch = "";
     let chartInFlight = false;
+    let chartReturnFocus = null;
     let klineRenderSeq = 0;
     const klineCache = new Map();
 
@@ -88,6 +89,9 @@
     }
 
     function bindEvents() {
+      dashboardRoot.querySelectorAll("[data-stock-view]").forEach((button) => {
+        button.onclick = () => setMobileView(button.dataset.stockView);
+      });
       $("tab-long").onclick = () => switchStrategy("long");
       $("tab-short").onclick = () => switchStrategy("short");
       $("run").onclick = runNow;
@@ -129,7 +133,23 @@
       $("long-chart-modal").onclick = (event) => {
         if (event.target === $("long-chart-modal")) hideLongBacktestChart();
       };
+      document.addEventListener("keydown", onStockKeyDown);
       window.addEventListener("resize", redrawVisibleMiniKlines);
+    }
+
+    function onStockKeyDown(event) {
+      if (event.key === "Escape" && !$("long-chart-modal").hidden) hideLongBacktestChart();
+    }
+
+    function setMobileView(view) {
+      const layout = dashboardRoot.querySelector("[data-stock-mobile-view]");
+      if (!layout || !["results", "settings"].includes(view)) return;
+      layout.dataset.stockMobileView = view;
+      dashboardRoot.querySelectorAll("[data-stock-view]").forEach((button) => {
+        const active = button.dataset.stockView === view;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-selected", active ? "true" : "false");
+      });
     }
 
     function setRefreshButtonBusy(busy) {
@@ -698,7 +718,7 @@
       $("long-chart-image").removeAttribute("src");
       $("long-chart-open").removeAttribute("href");
       $("long-chart-open").hidden = true;
-      $("long-chart-modal").hidden = false;
+      revealLongChartModal();
     }
 
     function renderLongBacktestChart(payload) {
@@ -717,7 +737,14 @@
       $("long-chart-image").hidden = false;
       $("long-chart-open").href = url;
       $("long-chart-open").hidden = false;
-      $("long-chart-modal").hidden = false;
+      revealLongChartModal();
+    }
+
+    function revealLongChartModal() {
+      const modal = $("long-chart-modal");
+      if (modal.hidden) chartReturnFocus = document.activeElement;
+      modal.hidden = false;
+      $("long-chart-close").focus();
     }
 
     function hideLongBacktestChart() {
@@ -728,6 +755,8 @@
       $("long-chart-status").hidden = true;
       $("long-chart-status").classList.remove("warn");
       $("long-chart-open").hidden = false;
+      if (chartReturnFocus && typeof chartReturnFocus.focus === "function") chartReturnFocus.focus();
+      chartReturnFocus = null;
     }
 
     function exportCurrentPicks() {
@@ -1094,6 +1123,7 @@
       clearTimeout(runTimer);
       clearInterval(optimizeTimer);
       clearInterval(refreshTimer);
+      document.removeEventListener("keydown", onStockKeyDown);
       window.removeEventListener("resize", redrawVisibleMiniKlines);
     };
     init();

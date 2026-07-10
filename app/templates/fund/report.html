@@ -1,12 +1,13 @@
 {% extends "base.html" %}
 
 {% block title %}基金报告 - financial-analysis{% endblock %}
+{% block body_class %}page-fund{% endblock %}
 
 {% block content %}
-<section class="fund-command-bar" data-fund-status>
+<section class="fund-command-bar" data-fund-status aria-label="基金报告操作与状态">
   <div class="fund-command-meta">
     <span>数据基于 <b data-field="data-updated">{{ report.updated_at or signals.updated_at or "未生成" }}</b></span>
-    <span>任务 <b data-field="job-state">空闲</b></span>
+    <span>任务 <b data-field="job-state" role="status" aria-live="polite">空闲</b></span>
   </div>
   <div class="action-row">
     <button
@@ -34,7 +35,7 @@
       <textarea data-fund-editor-code spellcheck="false" aria-label="funds.py Python 编辑器"></textarea>
     </div>
     <footer class="fund-editor-actions">
-      <span data-fund-editor-status>未加载</span>
+      <span data-fund-editor-status role="status" aria-live="polite">未加载</span>
       <div class="action-row">
         <button class="btn ghost" type="button" data-fund-editor-cancel>取消编辑</button>
         <button class="btn primary" type="button" data-fund-editor-save>保存编辑</button>

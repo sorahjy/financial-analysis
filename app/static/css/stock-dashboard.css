@@ -39,7 +39,7 @@
       min-height: 0;
       overflow: auto;
       padding: 2px 18px 18px;
-    }.stock-native main {
+    }.stock-native .stock-results {
       padding: 18px 22px 32px;
       overflow: auto;
       max-height: 100vh;
@@ -673,9 +673,9 @@
       color: var(--muted);
       text-align: center;
     }
-    @media (max-width: 980px) {.stock-native .app { grid-template-columns: 1fr; }.stock-native aside { display: block; max-height: none; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }.stock-native .side-sticky { position: static; }.stock-native .side-body { overflow: visible; }.stock-native main { max-height: none; }.stock-native .cards { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
+    @media (max-width: 980px) {.stock-native .app { grid-template-columns: 1fr; }.stock-native aside { display: block; max-height: none; overflow: visible; border-right: 0; border-bottom: 1px solid var(--line); }.stock-native .side-sticky { position: static; }.stock-native .side-body { overflow: visible; }.stock-native .stock-results { max-height: none; }.stock-native .cards { grid-template-columns: repeat(2, minmax(140px, 1fr)); }
     }
-    @media (max-width: 560px) {.stock-native main { padding: 14px; }.stock-native .side-sticky, .stock-native .side-body { padding-left: 14px; padding-right: 14px; }.stock-native .grid, .stock-native .cards, .stock-native .rule-list { grid-template-columns: 1fr; }.stock-native .factor-tools, .stock-native .factor-actions, .stock-native .factor-group-body { grid-template-columns: 1fr; }.stock-native .factor-row { grid-template-columns: minmax(0, 1fr) 72px; }.stock-native .bar-row { grid-template-columns: 1fr 1fr; }.stock-native .bar-track { grid-column: 1 / -1; }
+    @media (max-width: 560px) {.stock-native .stock-results { padding: 14px; }.stock-native .side-sticky, .stock-native .side-body { padding-left: 14px; padding-right: 14px; }.stock-native .grid, .stock-native .cards, .stock-native .rule-list { grid-template-columns: 1fr; }.stock-native .factor-tools, .stock-native .factor-actions, .stock-native .factor-group-body { grid-template-columns: 1fr; }.stock-native .factor-row { grid-template-columns: minmax(0, 1fr) 72px; }.stock-native .bar-row { grid-template-columns: 1fr 1fr; }.stock-native .bar-track { grid-column: 1 / -1; }
       .stock-native .stock-search-card { grid-column: auto; }
       .stock-native .chart-modal { padding: 10px; }
       .stock-native .chart-modal-head { align-items: flex-start; flex-direction: column; }
@@ -689,12 +689,12 @@
   min-height: calc(100vh - 58px);
 }
 .stock-native aside,
-.stock-native main {
+.stock-native .stock-results {
   max-height: calc(100vh - 58px);
 }
 @media (max-width: 980px) {
   .stock-native aside,
-  .stock-native main {
+  .stock-native .stock-results {
     max-height: none;
   }
 }

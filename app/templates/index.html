@@ -1,45 +1,70 @@
 {% extends "base.html" %}
 
 {% block title %}工作台 - financial-analysis{% endblock %}
+{% block body_class %}page-home{% endblock %}
 
 {% block content %}
-<section class="page-head">
-  <div>
-    <p class="eyebrow">Workspace</p>
-    <h1>金融量化工作台</h1>
+<section class="module-section" aria-labelledby="module-title">
+  <div class="module-section-head">
+    <div>
+      <p class="eyebrow">Choose a workspace</p>
+      <h2 id="module-title">今天想看什么？</h2>
+    </div>
+    <p>每个模块都保留上次数据状态，进入后可继续刷新、筛选或调参。</p>
   </div>
-</section>
 
-<section class="module-grid">
-  <a class="module-card" href="{{ url_for('fund.fund_page') }}">
-    <span class="module-type">基金</span>
-    <strong>技术分析报告</strong>
-    <dl>
-      <dt>报告</dt>
-      <dd>{{ fund_report.updated_at or "未生成" }}</dd>
-      <dt>大小</dt>
-      <dd>{{ fund_report.size_kb or "-" }} KB</dd>
-    </dl>
-  </a>
-  <a class="module-card" href="{{ url_for('stock.stock_page') }}">
-    <span class="module-type">股票</span>
-    <strong>A股策略配置台</strong>
-    <dl>
-      <dt>策略结果</dt>
-      <dd>{{ stock_result.updated_at or "未生成" }}</dd>
-      <dt>优化参数</dt>
-      <dd>{{ optimized_config.updated_at or "未生成" }}</dd>
-    </dl>
-  </a>
-  <a class="module-card" href="{{ url_for('radar.radar_page') }}">
-    <span class="module-type">游资</span>
-    <strong>游资雷达</strong>
-    <dl>
-      <dt>吸筹分结果</dt>
-      <dd>{{ radar_result.updated_at or "未生成" }}</dd>
-      <dt>大小</dt>
-      <dd>{{ radar_result.size_kb or "-" }} KB</dd>
-    </dl>
-  </a>
+  <div class="module-grid">
+    <a class="module-card module-card-fund" href="{{ url_for('fund.fund_page') }}">
+      <span class="module-card-top">
+        <span class="module-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M5 19V9m4.7 10V5m4.6 14v-7m4.7 7V3"/></svg></span>
+        <span class="module-arrow" aria-hidden="true">↗</span>
+      </span>
+      <span class="module-copy">
+        <span class="module-type">基金分析</span>
+        <strong>量化指标报告</strong>
+        <small>对比超额收益、技术信号与持仓状态。</small>
+      </span>
+      <dl>
+        <dt>数据更新</dt>
+        <dd>{{ fund_report.updated_at or "未生成" }}</dd>
+        <dt>报告大小</dt>
+        <dd>{{ fund_report.size_kb or "-" }} KB</dd>
+      </dl>
+    </a>
+    <a class="module-card module-card-stock" href="{{ url_for('stock.stock_page') }}">
+      <span class="module-card-top">
+        <span class="module-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="m4 16 5-5 3.5 3L20 6"/><path d="M15.5 6H20v4.5"/></svg></span>
+        <span class="module-arrow" aria-hidden="true">↗</span>
+      </span>
+      <span class="module-copy">
+        <span class="module-type">A 股策略</span>
+        <strong>策略配置台</strong>
+        <small>长短线参数、因子权重与候选股一站完成。</small>
+      </span>
+      <dl>
+        <dt>策略结果</dt>
+        <dd>{{ stock_result.updated_at or "未生成" }}</dd>
+        <dt>优化参数</dt>
+        <dd>{{ optimized_config.updated_at or "未生成" }}</dd>
+      </dl>
+    </a>
+    <a class="module-card module-card-radar" href="{{ url_for('radar.radar_page') }}">
+      <span class="module-card-top">
+        <span class="module-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/><circle cx="12" cy="12" r="3"/><path d="M12 4v2m8 6h-2m-6 8v-2m-8-6h2"/></svg></span>
+        <span class="module-arrow" aria-hidden="true">↗</span>
+      </span>
+      <span class="module-copy">
+        <span class="module-type">资金行为</span>
+        <strong>游资雷达</strong>
+        <small>发现吸筹阶段、形态信号与实时机会。</small>
+      </span>
+      <dl>
+        <dt>雷达更新</dt>
+        <dd>{{ radar_result.updated_at or "未生成" }}</dd>
+        <dt>结果大小</dt>
+        <dd>{{ radar_result.size_kb or "-" }} KB</dd>
+      </dl>
+    </a>
+  </div>
 </section>
 {% endblock %}

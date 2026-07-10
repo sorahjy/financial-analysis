@@ -307,6 +307,8 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertIsNotNone(acc["sub_scores"]["chip_winner_mid_low"])
         self.assertGreater(acc["signals"]["cmf"], 0)          # 收盘买压为正
         self.assertLess(acc["signals"]["close_pctile"], 0.6)  # 中低位
+        for signal in ("vol_ratio", "close_pctile", "turnover_pctile", "cmf", "chip_concentration", "chip_winner", "limit_streak"):
+            self.assertIn(signal, acc["signals"])
         self.assertIsNotNone(acc["signals"]["chip_peak_pctile"])
         self.assertIsNotNone(acc["signals"]["chip_price_to_peak"])
         self.assertEqual(acc["signals"]["accumulation_model_features"]["holder_change"], 100.0)

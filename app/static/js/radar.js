@@ -22,6 +22,10 @@
     const n = Number(v);
     return `${n > 0 ? "+" : ""}${n.toFixed(d)}%`;
   };
+  const fmtRatioPct = (v) =>
+    (v === null || v === undefined || v === "" || Number.isNaN(Number(v))
+      ? "-"
+      : `${(Number(v) * 100).toFixed(0)}%`);
   const scoreValue = (s, key, fallbackKey) => {
     const v = s && s[key];
     if (v !== null && v !== undefined && v !== "" && !Number.isNaN(Number(v))) return Number(v);
@@ -77,6 +81,9 @@
     let pollTimer = null;
     let realtimeTimer = null;
     let realtimeBusy = false;
+    let radarRunBusy = false;
+    let realtimeRefreshPending = false;
+    let realtimeRefreshQueued = false;
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
     let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
@@ -237,7 +244,11 @@
     }
 
     function onDocumentKeyDown(ev) {
-      if (ev.key === "Escape") setSw2PanelOpen(false);
+      if (ev.key !== "Escape") return;
+      const panel = $("radar-sw2-panel");
+      const wasOpen = Boolean(panel && !panel.hidden);
+      setSw2PanelOpen(false);
+      if (wasOpen) $("radar-sw2-trigger").focus();
     }
 
     // ---------- 数据加载 ----------
@@ -253,6 +264,13 @@
         renderPhaseFilter();
         renderPhaseChips();
         applyFilters();
+        if (selectedCode) {
+          const selected = stocks.find((s) => s.code === selectedCode);
+          if (selected) {
+            renderPatternInfo(selected);
+            renderStockInfo(selected, klineBars);
+          }
+        }
         reflectJobs(data.run_job, data.data_job);
         return data;
       } catch (err) {
@@ -269,15 +287,29 @@
       el.classList.toggle("is-error", tone === "error");
     }
 
-    async function fetchRealtimeData() {
+    async function fetchRealtimeData(queueIfBusy = false) {
       const toggle = $("radar-live-quote");
-      if (!toggle || !toggle.checked || realtimeBusy || disposed) return;
+      if (!toggle || !toggle.checked || disposed) return;
+      if (radarRunBusy) {
+        realtimeRefreshPending = true;
+        updateRealtimeStatus("等待新股票池…", "live");
+        return;
+      }
+      if (realtimeBusy) {
+        if (queueIfBusy) realtimeRefreshQueued = true;
+        return;
+      }
       realtimeBusy = true;
       updateRealtimeStatus("刷新中…", "live");
       try {
         const resp = await fetch("/api/radar/realtime");
         const data = await resp.json();
         if (disposed || !toggle.checked) return;
+        if (radarRunBusy) {
+          realtimeRefreshPending = true;
+          updateRealtimeStatus("等待新股票池…", "live");
+          return;
+        }
         payload = normalizePayload(data.payload || {});
         stocks = payload.stocks;
         syncSw2Filter();
@@ -287,7 +319,10 @@
         applyFilters();
         if (selectedCode) {
           const selected = stocks.find((s) => s.code === selectedCode);
-          if (selected) renderPatternInfo(selected);
+          if (selected) {
+            renderPatternInfo(selected);
+            renderStockInfo(selected, klineBars);
+          }
         }
         const rt = payload.realtime_quote || {};
         const sourceLabel = REALTIME_SOURCE_LABEL[rt.source] || "实时";
@@ -297,6 +332,10 @@
         if (!disposed) updateRealtimeStatus("实时失败", "error");
       } finally {
         realtimeBusy = false;
+        if (realtimeRefreshQueued && !disposed && toggle.checked) {
+          realtimeRefreshQueued = false;
+          fetchRealtimeData(true);
+        }
       }
     }
 
@@ -308,6 +347,8 @@
         realtimeTimer = null;
       }
       if (!enabled) {
+        realtimeRefreshPending = false;
+        realtimeRefreshQueued = false;
         updateRealtimeStatus("未开启", "");
         fetchData();
         return;
@@ -452,14 +493,6 @@
       $("radar-status").textContent = `已导出机会分Top${rows.length}`;
     }
 
-    function themeCell(s) {
-      const t = s.tracking_theme || "";
-      if (!t) return "<span class='dim'>-</span>";
-      const heat = (s.theme_heat_pctile === null || s.theme_heat_pctile === undefined)
-        ? "" : ` <small>热${Math.round(s.theme_heat_pctile)}</small>`;
-      return esc(t) + heat;
-    }
-
     function sw2Cell(s) {
       const industry = s.parent_segment || "";
       if (!industry) return "<span class='dim'>-</span>";
@@ -477,15 +510,15 @@
       const sortTh = (key, label) => {
         const active = sortState.key === key;
         const arrow = active ? (sortState.dir === "asc" ? "▲" : "▼") : "↕";
-        return `<th class="num sortable${active ? " active" : ""}" data-key="${key}">${label} <span class="sort-arrow">${arrow}</span></th>`;
+        const ariaSort = active ? (sortState.dir === "asc" ? "ascending" : "descending") : "none";
+        return `<th class="num sortable${active ? " active" : ""}" data-key="${key}" aria-sort="${ariaSort}"><button class="sort-control" type="button">${label} <span class="sort-arrow" aria-hidden="true">${arrow}</span></button></th>`;
       };
       const realtimeHead = hasRealtime
         ? `${sortTh("realtime_price", "现价")}${sortTh("realtime_change_pct", "涨幅")}`
         : "";
       const head = `<tr>
-        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${realtimeHead}${sortTh("opportunity_score", "机会分")}${sortTh("ambush_score", "吸筹分")}${sortTh("distribution_score", "出货分")}
-        <th class="num">量比</th><th class="num">价分位</th><th class="num">换手分位</th><th class="num">CMF</th><th class="num">筹码</th>
-        <th class="num">连板</th><th>命中形态</th><th>阶段·把握</th><th>走势相似行业</th><th>二级行业</th><th>依据</th>
+        <th>#</th><th>代码</th><th>名称</th>${sortTh("market_cap_yi", "市值")}${realtimeHead}${sortTh("opportunity_score", "机会分")}
+        <th class="num" title="按筹码成本估算，当前价以下的筹码占比">获利盘</th><th>命中形态</th><th>阶段·把握</th><th>二级行业</th><th>依据</th>
       </tr>`;
       const rows = list.map((s, i) => {
         const sig = s.signals || {};
@@ -503,24 +536,16 @@
               return `<span class="ev ${cls}">${esc(lab)}</span>`;
             }).join("")
           : "<span class='dim'>-</span>";
-        return `<tr class="rrow${sel}" data-code="${esc(s.code)}">
+        return `<tr class="rrow${sel}" data-code="${esc(s.code)}" tabindex="0" aria-selected="${s.code === selectedCode ? "true" : "false"}" aria-label="查看 ${esc(s.code)} ${esc(s.name || "")} K线与形态">
           <td class="dim">${i + 1}</td>
           <td class="mono">${esc(s.code)}</td>
           <td>${esc(s.name || "")}</td>
           <td class="num">${fmtMarketCap(s.market_cap_yi)}</td>
           ${hasRealtime ? `<td class="num">${fmt(s.realtime_price, 2)}</td><td class="num ${Number(s.realtime_change_pct) > 0 ? "up" : Number(s.realtime_change_pct) < 0 ? "down" : ""}">${fmtSignedPct(s.realtime_change_pct)}</td>` : ""}
           <td class="num strong">${fmt(s.opportunity_score, 1)}</td>
-          <td class="num" title="机会分计算用吸筹分位 ${fmt(s.accumulation_percentile, 1)}">${fmt(s.ambush_score, 1)}</td>
-          <td class="num" title="机会分计算用出货分位 ${fmt(s.distribution_percentile, 1)}">${fmt(s.distribution_score, 1)}</td>
-          <td class="num">${fmt(sig.vol_ratio, 2)}</td>
-          <td class="num">${fmt(sig.close_pctile, 2)}</td>
-          <td class="num${(sig.turnover_pctile != null && sig.turnover_pctile > 0.84) ? " hot-turnover" : ""}">${fmt(sig.turnover_pctile, 2)}</td>
-          <td class="num">${fmt(sig.cmf, 3)}</td>
-          <td class="num">${fmt(sig.chip_concentration, 2)}</td>
-          <td class="num">${sig.limit_streak ?? 0}</td>
+          <td class="num" title="当前价以下的估算筹码占比">${fmtRatioPct(sig.chip_winner)}</td>
           <td class="pats mono">${patCell}</td>
           <td><span class="phase phase-${cls}">${esc(s.pattern_phase || "")}</span>${conf}${isBreakdownConflict(s) ? ` <span class="pi-warn" title="${esc(CONFLICT_TIP)}">⚠破位</span>` : ""}</td>
-          <td>${themeCell(s)}</td>
           <td>${sw2Cell(s)}</td>
           <td class="ev-cell">${evCell}</td>
         </tr>`;
@@ -528,6 +553,11 @@
       $("radar-table").innerHTML = `<table class="radar-grid"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
       $("radar-table").querySelectorAll(".rrow").forEach((tr) => {
         tr.onclick = () => selectStock(tr.dataset.code);
+        tr.onkeydown = (event) => {
+          if (event.key !== "Enter" && event.key !== " ") return;
+          event.preventDefault();
+          selectStock(tr.dataset.code);
+        };
       });
       $("radar-table").querySelectorAll("th.sortable").forEach((th) => {
         th.onclick = () => {
@@ -542,11 +572,15 @@
     // ---------- K线 ----------
     async function selectStock(code) {
       selectedCode = code;
-      $("radar-table").querySelectorAll(".rrow").forEach((tr) =>
-        tr.classList.toggle("is-selected", tr.dataset.code === code));
+      $("radar-table").querySelectorAll(".rrow").forEach((tr) => {
+        const active = tr.dataset.code === code;
+        tr.classList.toggle("is-selected", active);
+        tr.setAttribute("aria-selected", active ? "true" : "false");
+      });
       const s = stocks.find((x) => x.code === code) || {};
-      $("radar-kline-title").textContent = `${code} ${s.name || ""} · 市值 ${fmtMarketCap(s.market_cap_yi)}`;
+      $("radar-kline-title").textContent = `${code} ${s.name || ""}`;
       $("radar-kline-sub").textContent = "加载K线…";
+      renderStockInfo(s, []);
       renderPatternInfo(s);
       await loadKline(code);
     }
@@ -554,8 +588,11 @@
     function setKlinePeriod(period) {
       if (!KLINE_PERIOD_LABEL[period] || period === klinePeriod) return;
       klinePeriod = period;
-      $("radar-kline-periods").querySelectorAll("button").forEach((btn) =>
-        btn.classList.toggle("is-active", btn.dataset.period === period));
+      $("radar-kline-periods").querySelectorAll("button").forEach((btn) => {
+        const active = btn.dataset.period === period;
+        btn.classList.toggle("is-active", active);
+        btn.setAttribute("aria-selected", active ? "true" : "false");
+      });
       if (selectedCode) loadKline(selectedCode);
       else drawKline();
     }
@@ -582,9 +619,69 @@
         updateKlineSub();
         drawKline();
         updateKlineDetail(klineBars.length ? klineBars.length - 1 : null);
+        const selected = stocks.find((s) => s.code === code);
+        if (selected) renderStockInfo(selected, klineBars);
       } catch (err) {
         $("radar-kline-sub").textContent = "K线加载失败";
       }
+    }
+
+    function stockInfoNumber(value) {
+      if (value === null || value === undefined || value === "" || Number.isNaN(Number(value))) return null;
+      return Number(value);
+    }
+
+    function stockInfoIndustry(name, heat) {
+      const label = String(name || "").trim();
+      if (!label) return "—";
+      const value = stockInfoNumber(heat);
+      return value === null ? label : `${label} · 热${Math.round(value)}`;
+    }
+
+    function setStockInfoTone(element, value) {
+      if (!element) return;
+      element.classList.remove("up", "down");
+      if (value > 0) element.classList.add("up");
+      else if (value < 0) element.classList.add("down");
+    }
+
+    function renderStockInfo(s, bars = []) {
+      const root = $("radar-stock-info");
+      if (!root) return;
+      const hasStock = Boolean(s && s.code);
+      root.classList.toggle("is-empty", !hasStock);
+
+      const list = Array.isArray(bars) ? bars : [];
+      const latest = list.length ? list[list.length - 1] : null;
+      const previous = list.length > 1 ? list[list.length - 2] : null;
+      const livePrice = hasStock ? stockInfoNumber(s.realtime_price) : null;
+      const liveChange = hasStock ? stockInfoNumber(s.realtime_change_pct) : null;
+      const historicalChange = latest && previous && previous.close
+        ? (latest.close / previous.close - 1) * 100
+        : null;
+      const price = livePrice !== null ? livePrice : stockInfoNumber(latest && latest.close);
+      const change = liveChange !== null ? liveChange : historicalChange;
+      const realtime = livePrice !== null;
+
+      $("radar-stock-price").textContent = price === null ? "—" : fmt(price, 2);
+      $("radar-stock-change").textContent = change === null ? "—" : fmtSignedPct(change, 2);
+      $("radar-stock-cap").textContent = hasStock ? fmtMarketCap(s.market_cap_yi) : "—";
+      $("radar-stock-change-label").textContent = realtime
+        ? "实时涨跌"
+        : (latest ? `${KLINE_PERIOD_LABEL[klinePeriod]}涨跌` : "涨跌幅");
+
+      const rt = (payload && payload.realtime_quote) || {};
+      const source = REALTIME_SOURCE_LABEL[rt.source] || "实时";
+      $("radar-stock-price-source").textContent = realtime
+        ? `${source} · ${s.realtime_quote_time || rt.updated_at || "刚刚"}`
+        : (latest ? `${KLINE_PERIOD_LABEL[klinePeriod]}收盘 · ${latest.date || s.last_date || ""}` : "等待K线");
+
+      $("radar-stock-sw2").textContent = hasStock ? stockInfoIndustry(s.parent_segment, s.sw2_heat_pctile) : "—";
+      $("radar-stock-sw3").textContent = hasStock ? (String(s.segment_name || "").trim() || "—") : "—";
+      $("radar-stock-theme").textContent = hasStock ? stockInfoIndustry(s.tracking_theme, s.theme_heat_pctile) : "—";
+      $("radar-stock-date").textContent = hasStock ? (s.last_date || (latest && latest.date) || "—") : "—";
+      setStockInfoTone($("radar-stock-price"), change);
+      setStockInfoTone($("radar-stock-change"), change);
     }
 
     function renderPatternInfo(s) {
@@ -903,20 +1000,6 @@
       try { ev.currentTarget.releasePointerCapture(ev.pointerId); } catch (err) { /* pointer already released */ }
     }
 
-    function onCanvasWheel(ev) {
-      if (!klineLayout || !klineBars.length) return;
-      ev.preventDefault();
-      const total = klineBars.length;
-      const count = klineView.end - klineView.start;
-      const minVisible = Math.min(total, KLINE_MIN_VISIBLE[klinePeriod] || 20);
-      const nextCount = clamp(Math.round(count * (ev.deltaY < 0 ? 0.82 : 1.22)), minVisible, total);
-      const { x } = canvasPoint(ev);
-      const anchor = visibleIndexFromX(x);
-      const ratio = count > 1 ? (anchor - klineView.start) / count : 1;
-      const nextStart = anchor - nextCount * ratio;
-      setKlineView(nextStart, nextStart + nextCount);
-    }
-
     // ---------- 任务（运行 / 刷新数据）----------
     function setBusy(busy) {
       $("radar-run").disabled = busy;
@@ -938,15 +1021,28 @@
     }
 
     function reflectJobs(runJob, dataJob) {
+      const wasRadarRunBusy = radarRunBusy;
+      radarRunBusy = Boolean(runJob && runJob.running);
       const running = (runJob && runJob.running) || (dataJob && dataJob.running);
       setBusy(running);
       if (dataJob && (dataJob.running || activeJobType === "data")) showJobLog(dataJob, "数据刷新");
       else if (runJob && (runJob.running || activeJobType === "run")) showJobLog(runJob, "运行");
       if (running && !pollTimer) pollTimer = setInterval(fetchData, 2000);
       if (!running && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (wasRadarRunBusy && !radarRunBusy && realtimeRefreshPending) {
+        realtimeRefreshPending = false;
+        fetchRealtimeData(true);
+      }
     }
 
     async function startJob(url, label, body) {
+      if (url === "/api/radar/run") {
+        radarRunBusy = true;
+        if ($("radar-live-quote").checked) {
+          realtimeRefreshPending = true;
+          updateRealtimeStatus("等待新股票池…", "live");
+        }
+      }
       setBusy(true);
       activeJobType = url.includes("refresh-data") ? "data" : "run";
       $("radar-status").textContent = label + "已启动…";
@@ -1017,7 +1113,6 @@
       canvas.addEventListener("pointermove", onCanvasMove);
       canvas.addEventListener("pointerup", onCanvasUp);
       canvas.addEventListener("pointercancel", onCanvasUp);
-      canvas.addEventListener("wheel", onCanvasWheel, { passive: false });
       canvas.addEventListener("mouseleave", () => {
         if (klineDrag) return;
         hoverIdx = null;

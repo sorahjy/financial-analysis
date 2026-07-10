@@ -153,6 +153,7 @@
       const saveButton = modal.querySelector("[data-fund-editor-save]");
       const cancelButtons = Array.from(modal.querySelectorAll("[data-fund-editor-cancel]"));
       let originalContent = "";
+      let returnFocus = null;
 
       const setEditorStatus = (text) => {
         if (statusLabel) statusLabel.textContent = text;
@@ -174,9 +175,11 @@
         modal.hidden = true;
         if (codeInput) codeInput.value = originalContent;
         renderHighlight();
+        if (returnFocus && typeof returnFocus.focus === "function") returnFocus.focus();
       };
 
       const openEditor = async () => {
+        returnFocus = document.activeElement;
         modal.hidden = false;
         setEditorBusy(true);
         setEditorStatus("读取中");
@@ -190,11 +193,11 @@
           if (pathLabel) pathLabel.textContent = payload.path || "funds.py";
           setEditorStatus("已加载");
           renderHighlight();
-          codeInput.focus();
         } catch (error) {
           setEditorStatus(error.message);
         } finally {
           setEditorBusy(false);
+          if (!modal.hidden && codeInput) codeInput.focus();
         }
       };
 
@@ -235,6 +238,9 @@
       cancelButtons.forEach((button) => button.addEventListener("click", closeEditor));
       modal.addEventListener("click", (event) => {
         if (event.target === modal) closeEditor();
+      });
+      modal.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") closeEditor();
       });
     }
 

@@ -1,9 +1,13 @@
-<div class="app">
+  <div class="stock-mobile-view" role="tablist" aria-label="策略页面区域">
+    <button class="is-active" type="button" role="tab" aria-selected="true" data-stock-view="results">策略结果</button>
+    <button type="button" role="tab" aria-selected="false" data-stock-view="settings">参数设置</button>
+  </div>
+  <div class="app" data-stock-mobile-view="results">
     <aside>
       <div class="side-sticky">
         <div class="topbar">
           <h1>A股策略配置台</h1>
-          <span id="status" class="status">启动中</span>
+          <span id="status" class="status" role="status" aria-live="polite">启动中</span>
         </div>
         <div class="tabs">
           <button id="tab-long" class="tab active" type="button">长线</button>
@@ -13,11 +17,11 @@
           <button id="run" class="btn primary" type="button">运行</button>
           <button id="save" class="btn" type="button">保存配置</button>
           <button id="reset" class="btn" type="button">重置</button>
-          <button id="optimize" class="btn" type="button">搜索参数</button>
+          <button id="optimize" class="btn" type="button" title="长线与短线分别搜索，预计约 10 分钟">搜索参数</button>
           <button id="refresh-data" class="btn" type="button">刷新数据</button>
           <button id="long-chart-show" class="btn" type="button" hidden>策略走势</button>
           <button id="export-picks" class="btn" type="button" disabled>导出</button>
-          <label class="toggle"><input id="auto" type="checkbox" checked>实时</label>
+          <label class="toggle"><input id="auto" type="checkbox" checked>自动运行</label>
         </div>
         <div class="data-refresh-meta">
           <span>数据刷新</span>
@@ -49,22 +53,22 @@
         <div id="factors" class="factor-list"></div>
       </div>
     </aside>
-    <main>
+    <section class="stock-results" aria-labelledby="title">
       <div class="topbar">
         <div>
           <h1 id="title">长线策略</h1>
           <div id="subtitle" class="status"></div>
         </div>
-        <div id="generated" class="status"></div>
+        <div id="generated" class="status" aria-live="polite"></div>
       </div>
       <div id="metrics" class="cards"></div>
       <div id="pool-rules" class="pool-rules"></div>
       <div id="notes" class="notes"></div>
       <div id="bars" class="score-visual"></div>
       <div id="table" class="table-wrap"></div>
-    </main>
+    </section>
   </div>
-  <div id="optimize-overlay" class="overlay" hidden>
+  <div id="optimize-overlay" class="overlay" role="status" aria-live="polite" aria-busy="true" hidden>
     <div class="overlay-card">
       <div class="spinner"></div>
       <div class="overlay-title">正在搜索参数…</div>
@@ -73,7 +77,7 @@
     </div>
   </div>
   <div id="long-chart-modal" class="chart-modal" hidden>
-    <div class="chart-modal-card">
+    <div class="chart-modal-card" role="dialog" aria-modal="true" aria-labelledby="long-chart-title">
       <div class="chart-modal-head">
         <div>
           <strong id="long-chart-title">长线历史回测走势</strong>

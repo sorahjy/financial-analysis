@@ -31,8 +31,7 @@
 		        margin: 0 auto;
 	        padding: 0;
 	    }.fund-native .control-panel {
-	        position: sticky;
-	        top: 0;
+	        position: static;
 	        z-index: 20;
 	        display: grid;
 	        grid-template-columns: minmax(320px, 1.2fr) minmax(420px, 1.6fr) auto;
@@ -302,7 +301,3 @@
 	    @media (max-width: 900px) {
 	        .fund-native { min-width: 760px; }.fund-native .page { width: 90%; padding: 0; }.fund-native .control-panel { grid-template-columns: 1fr; position: static; }.fund-native .view-actions { justify-content: flex-start; }.fund-native .report-header { align-items: flex-start; flex-direction: column; }.fund-native .date { text-align: left; }.fund-native .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }.fund-native h1 { font-size: 24px; }
     }
-.fund-native .control-panel {
-  top: 108px;
-}
-

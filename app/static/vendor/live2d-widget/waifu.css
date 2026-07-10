@@ -116,6 +116,40 @@
 	fill: #0684bd; /* #34495e */
 }
 
+/* Keep the companion available on dense data pages without covering tables. */
+body:not(.page-home) #waifu {
+	left: -34px;
+	z-index: 18;
+	opacity: .62;
+	transform: translateY(122px) scale(.72);
+	transform-origin: left bottom;
+	transition: opacity .2s ease, transform .2s ease, bottom 3s ease-in-out;
+}
+
+body:not(.page-home) #waifu:hover {
+	z-index: 38;
+	opacity: 1;
+	transform: translateY(72px) scale(.78);
+}
+
+body:not(.page-home) #waifu-tips {
+	width: 220px;
+	min-height: 58px;
+}
+
+@media (max-width: 720px) {
+	body:not(.page-home) #waifu {
+		left: -58px;
+		opacity: .42;
+		transform: translateY(158px) scale(.66);
+	}
+
+	body:not(.page-home) #waifu:hover {
+		opacity: .9;
+		transform: translateY(112px) scale(.7);
+	}
+}
+
 @keyframes waifu-shake {
 	2% {
 		transform: translate(.5px, -1.5px) rotate(-.5deg);

@@ -29,6 +29,28 @@
     }
   }
 
+  function updateShellState(url, nextDocument, shouldFocus) {
+    const nextPageClasses = Array.from(nextDocument.body.classList).filter((name) => name.startsWith("page-"));
+    Array.from(document.body.classList).forEach((name) => {
+      if (name.startsWith("page-")) document.body.classList.remove(name);
+    });
+    nextPageClasses.forEach((name) => document.body.classList.add(name));
+
+    const path = normalizePath(url);
+    document.querySelectorAll("[data-nav-path]").forEach((link) => {
+      const navPath = link.dataset.navPath;
+      const active = Boolean(navPath && (path === navPath || path.startsWith(`${navPath}/`)));
+      link.classList.toggle("is-active", active);
+      if (active) link.setAttribute("aria-current", "page");
+      else link.removeAttribute("aria-current");
+    });
+
+    const main = document.querySelector(".app-main");
+    if (shouldFocus && main) main.focus({preventScroll: true});
+    const announcer = document.querySelector("[data-route-announcer]");
+    if (announcer) announcer.textContent = `已进入${nextDocument.title || "新页面"}`;
+  }
+
   async function navigate(url, pushState = true) {
     if (navigating || !isNavigable(url)) return false;
     navigating = true;
@@ -54,6 +76,7 @@
       currentMain.innerHTML = nextMain.innerHTML;
       if (pushState) window.history.pushState({}, "", url);
       window.scrollTo({top: 0, left: 0});
+      updateShellState(url, nextDocument, pushState);
       initCurrentPage();
       return true;
     } catch (error) {

@@ -1,13 +1,18 @@
 {% extends "base.html" %}
 
 {% block title %}游资雷达 - financial-analysis{% endblock %}
+{% block body_class %}page-radar{% endblock %}
 
 {% block content %}
 <section id="radar-dashboard" class="radar">
   <div class="radar-topbar">
     <div class="radar-head">
-      <h1>游资雷达</h1>
-      <span id="radar-status" class="status">读取中…</span>
+      <div>
+        <p class="eyebrow">Capital Flow Radar</p>
+        <h1>游资雷达</h1>
+        <p class="radar-subtitle">追踪资金阶段、量价形态与实时机会</p>
+      </div>
+      <span id="radar-status" class="status" role="status" aria-live="polite">读取中…</span>
     </div>
     <div class="radar-actions">
       <label class="toggle">池&nbsp;<select id="radar-pool" aria-label="候选池">
@@ -47,7 +52,7 @@
         <div class="industry-filter-search">
           <input id="radar-sw2-search" type="search" placeholder="搜索二级行业">
           <label class="industry-heat-filter">热度 &gt;
-            <input id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="50">
+            <input id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="0">
           </label>
         </div>
         <div id="radar-sw2-selected" class="industry-selected"></div>
@@ -77,10 +82,33 @@
         <strong id="radar-kline-title">点击左侧个股查看 K 线</strong>
         <span id="radar-kline-sub" class="status"></span>
       </div>
+      <div id="radar-stock-info" class="radar-stock-info is-empty" role="group" aria-label="股票基本信息" aria-live="polite">
+        <div class="radar-stock-market">
+          <div class="radar-stock-metric radar-stock-price">
+            <span>最新价</span>
+            <strong id="radar-stock-price">—</strong>
+            <small id="radar-stock-price-source">选择股票</small>
+          </div>
+          <div class="radar-stock-metric">
+            <span id="radar-stock-change-label">涨跌幅</span>
+            <strong id="radar-stock-change">—</strong>
+          </div>
+          <div class="radar-stock-metric">
+            <span>总市值</span>
+            <strong id="radar-stock-cap">—</strong>
+          </div>
+        </div>
+        <dl class="radar-stock-facts">
+          <div><dt>二级行业</dt><dd id="radar-stock-sw2">—</dd></div>
+          <div><dt>细分行业</dt><dd id="radar-stock-sw3">—</dd></div>
+          <div><dt>走势相似行业</dt><dd id="radar-stock-theme">—</dd></div>
+          <div><dt>数据日期</dt><dd id="radar-stock-date">—</dd></div>
+        </dl>
+      </div>
       <div id="radar-kline-periods" class="radar-kline-periods" role="tablist" aria-label="K线周期">
-        <button class="is-active" type="button" data-period="day">日K</button>
-        <button type="button" data-period="week">周K</button>
-        <button type="button" data-period="month">月K</button>
+        <button class="is-active" type="button" role="tab" aria-selected="true" data-period="day">日K</button>
+        <button type="button" role="tab" aria-selected="false" data-period="week">周K</button>
+        <button type="button" role="tab" aria-selected="false" data-period="month">月K</button>
       </div>
       <canvas id="radar-kline-canvas"></canvas>
       <div id="radar-kline-detail" class="radar-kline-detail"></div>

@@ -155,8 +155,7 @@ input {
 }
 
 .fund-command-bar {
-  position: sticky;
-  top: 58px;
+  position: static;
   z-index: 9;
   display: flex;
   align-items: center;
