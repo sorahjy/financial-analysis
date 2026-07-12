@@ -1,0 +1,63 @@
+{
+  "generated_at": "2026-07-12 11:57:40",
+  "iterations": 1500,
+  "optimized_strategies": [
+    "smallcap"
+  ],
+  "seed": 2333,
+  "strategy_seed": 1078566356,
+  "smallcap_universe_version": "hotmoney_small_cap_v1",
+  "caveat": "复用长线PIT回测框架；股票池为当前游资小盘成员，存在当前成员回看历史的幸存者偏差。",
+  "config": {
+    "smallcap": {
+      "enabled": true,
+      "top_n": 20,
+      "min_score": 50,
+      "require_high_drawdown": true,
+      "min_high_drawdown_pct": 63,
+      "exclude_st": true,
+      "hold_years_min": 2,
+      "hold_years_max": 5,
+      "weights": {
+        "liquidity": 1.452,
+        "low_volatility": 1.145,
+        "roe_mean": 0.311,
+        "roe_stability": 0.258,
+        "revenue_growth": 1.926,
+        "net_profit_growth": 2.669,
+        "gross_margin": 1.866,
+        "net_margin": 0.299,
+        "cashflow_quality": 0.883,
+        "dividend_yield_5y": 0.436,
+        "dividend_consistency": 1.861,
+        "holder_count_change": 1.354,
+        "repurchase_recent": 2.88,
+        "lhb_recent_avoid": 0.676,
+        "debt_safety": 1.704,
+        "pledge_safety": 2.629,
+        "book_to_market": 0.492,
+        "earnings_yield": 1.397,
+        "cashflow_yield": 0.146,
+        "sales_to_price": 0.096,
+        "roa": 0.164,
+        "operating_profitability": 0.007,
+        "gross_profit_assets": 1.988,
+        "asset_growth": 1.741,
+        "accrual_quality": 0.278,
+        "margin_stability": 0.497,
+        "revenue_stability": 0.016,
+        "leverage_trend": 0.596,
+        "reversal_1m": 0.911,
+        "momentum_12_1": 2.65,
+        "dist_52w_high": 0.798,
+        "reversal_long_term": 0.427,
+        "abnormal_turnover": 2.083,
+        "piotroski_f": 0.736,
+        "industry_leadership": 0.0
+      }
+    }
+  },
+  "scores": {
+    "smallcap_objective": -12.01806
+  }
+}

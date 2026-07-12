@@ -6,8 +6,10 @@ from unittest.mock import patch
 
 from stock_advanced_strategies import (
     FactorSpec,
+    SMALLCAP_EXCLUDED_FACTOR_KEYS,
     apply_scores,
     build_long_candidates,
+    build_smallcap_candidates,
     compute_long_raw_factors,
     csi300_persistence_proxy,
     first_not_none,
@@ -21,6 +23,7 @@ from stock_advanced_strategies import (
     reports_available_asof,
     rsi_sweetspot_score,
     run_long_strategy,
+    run_smallcap_strategy,
     run_strategies,
     strip_internal,
 )
@@ -73,7 +76,19 @@ class StockAdvancedStrategyTest(unittest.TestCase):
 
         self.assertGreaterEqual(registry["total"], 20)
         self.assertGreaterEqual(len(registry["long"]), 20)
+        self.assertGreaterEqual(len(registry["smallcap"]), 20)
         self.assertGreaterEqual(len(registry["short"]), 20)
+
+    def test_smallcap_registry_reuses_long_without_index_or_size_factors(self):
+        registry = get_factor_registry()
+        long_keys = {item["key"] for item in registry["long"]}
+        smallcap_keys = {item["key"] for item in registry["smallcap"]}
+
+        self.assertEqual(smallcap_keys, long_keys - SMALLCAP_EXCLUDED_FACTOR_KEYS)
+        self.assertFalse(smallcap_keys & SMALLCAP_EXCLUDED_FACTOR_KEYS)
+        self.assertFalse(
+            set(get_default_config()["smallcap"]["weights"]) & SMALLCAP_EXCLUDED_FACTOR_KEYS
+        )
 
     def test_long_factor_registry_exposes_capital_group(self):
         registry = get_factor_registry()
@@ -112,6 +127,53 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(config["short"]["top_n"], 6)
         self.assertEqual(config["_optimized_defaults"]["source"], str(backup))
         self.assertEqual(config["_optimized_defaults"]["iterations_per_strategy"], 1500)
+
+    def test_smallcap_default_falls_back_to_its_own_backup(self):
+        payload = {
+            "generated_at": "2026-07-12 10:00:00",
+            "iterations": 1500,
+            "seed": 42,
+            "smallcap_universe_version": "hotmoney_small_cap_v1",
+            "config": {
+                "smallcap": {
+                    "top_n": 17,
+                    "weights": {
+                        "roe_mean": 1.75,
+                        "market_cap": 3.0,
+                    },
+                },
+            },
+            "caveat": "test",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "data" / "stock_strategy_smallcap_optimized_config.json"
+            backup = Path(tmpdir) / "meta_data_backup" / "stock_strategy_smallcap_optimized_config.json"
+            backup.parent.mkdir(parents=True)
+            backup.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            with patch("stock_advanced_strategies.SMALLCAP_OPTIMIZED_CONFIG_FILE", primary), \
+                 patch("stock_advanced_strategies.SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                config = get_default_config()
+
+        self.assertEqual(config["smallcap"]["top_n"], 10)
+        self.assertEqual(config["smallcap"]["weights"]["roe_mean"], 1.75)
+        self.assertNotIn("market_cap", config["smallcap"]["weights"])
+        self.assertEqual(config["_smallcap_optimized_defaults"]["source"], str(backup))
+
+    def test_smallcap_default_ignores_backup_for_wrong_universe(self):
+        payload = {
+            "smallcap_universe_version": "legacy",
+            "config": {"smallcap": {"top_n": 99}},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "smallcap.json"
+            backup = Path(tmpdir) / "missing.json"
+            primary.write_text(json.dumps(payload), encoding="utf-8")
+            with patch("stock_advanced_strategies.SMALLCAP_OPTIMIZED_CONFIG_FILE", primary), \
+                 patch("stock_advanced_strategies.SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                config = get_default_config()
+
+        self.assertEqual(config["smallcap"]["top_n"], 10)
 
     def test_default_config_ignores_short_config_from_legacy_universe(self):
         payload = {
@@ -227,6 +289,27 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual([item["code"] for item in candidates], ["600000"])
         self.assertTrue(any("SW3 细分龙头池" in note for note in notes))
 
+    def test_build_smallcap_candidates_intersects_hot_money_pool(self):
+        cfg = get_default_config()["smallcap"]
+        base_candidates = [{
+            "code": "000002",
+            "name": "测试小盘",
+            "strategy": "long",
+            "raw_factors": {"roe_stability": 12.0},
+            "reasons": [],
+            "warnings": [],
+        }]
+        with patch("stock_advanced_strategies.load_hot_money_codes", return_value={"000001", "000002"}), \
+             patch("stock_advanced_strategies.build_long_candidates", return_value=(base_candidates, [])) as build_long:
+            candidates, notes = build_smallcap_candidates(cfg, universe={"000002", "000003"})
+
+        self.assertEqual(build_long.call_args.kwargs["universe"], {"000002"})
+        self.assertFalse(build_long.call_args.args[0]["use_segment_leaders"])
+        self.assertFalse(build_long.call_args.args[0]["require_csi300"])
+        self.assertEqual(build_long.call_args.args[0]["min_market_cap_yi"], 0)
+        self.assertEqual(candidates[0]["strategy"], "smallcap")
+        self.assertTrue(any("is_hot_money=1" in note for note in notes))
+
     def test_strip_internal_keeps_sw3_industry_fields_for_frontend(self):
         row = strip_internal([{
             "rank": 1,
@@ -266,9 +349,14 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertGreater(by_code["A"], by_code["C"])
 
     def test_top_n_zero_selects_nothing(self):
-        result = run_strategies({"long": {"top_n": 0}, "short": {"top_n": 0}}, persist=False)
+        result = run_strategies({
+            "long": {"top_n": 0},
+            "smallcap": {"top_n": 0},
+            "short": {"top_n": 0},
+        }, persist=False)
 
         self.assertEqual(result["long"]["selected_count"], 0)
+        self.assertEqual(result["smallcap"]["selected_count"], 0)
         self.assertEqual(result["short"]["selected_count"], 0)
 
     def test_high_to_latest_drawdown_pct_uses_available_history_peak(self):
@@ -413,11 +501,39 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         result = run_strategies(persist=False)
 
         self.assertIn("long", result)
+        self.assertIn("smallcap", result)
         self.assertIn("short", result)
         self.assertGreaterEqual(result["factor_total"], 20)
         self.assertIsInstance(result["long"]["picks"], list)
+        self.assertIsInstance(result["smallcap"]["picks"], list)
         self.assertIsInstance(result["short"]["picks"], list)
         self.assertTrue(result["self_review"]["factor_count_ok"])
+
+    def test_run_smallcap_uses_long_factors_on_hot_money_candidates(self):
+        cfg = get_default_config()["smallcap"]
+        cfg.update({
+            "min_score": 0,
+            "top_n": 10,
+            "require_high_drawdown": False,
+            "exclude_st": False,
+        })
+        candidates = [{
+            "code": "000001",
+            "name": "测试股份",
+            "strategy": "smallcap",
+            "raw_factors": {"roe_mean": 12.0},
+            "data_quality": 0.5,
+            "reasons": [],
+            "warnings": [],
+        }]
+        with patch("stock_advanced_strategies.live_smallcap_candidate_pool", return_value=(candidates, [])):
+            result = run_smallcap_strategy(cfg)
+
+        self.assertEqual(result["candidate_count"], 1)
+        self.assertEqual(result["picks"][0]["strategy"], "smallcap")
+        self.assertFalse(
+            set(result["picks"][0]["factor_scores"]) & SMALLCAP_EXCLUDED_FACTOR_KEYS
+        )
 
 
 if __name__ == "__main__":

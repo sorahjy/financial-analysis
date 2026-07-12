@@ -77,9 +77,31 @@
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
     let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
+    let activeInsightModal = null;
+    let insightReturnFocus = null;
     let sw2Options = [];
     let selectedSw2Industries = new Set();
     const $ = (id) => document.getElementById(id);
+
+    function openInsightModal(id) {
+      const modal = $(id);
+      if (!modal) return;
+      insightReturnFocus = document.activeElement;
+      activeInsightModal = modal;
+      modal.hidden = false;
+      document.body.classList.add("radar-modal-open");
+      const dialog = modal.querySelector("[role='dialog']");
+      if (dialog) dialog.focus();
+    }
+
+    function closeInsightModal() {
+      if (!activeInsightModal) return;
+      activeInsightModal.hidden = true;
+      activeInsightModal = null;
+      document.body.classList.remove("radar-modal-open");
+      if (insightReturnFocus && typeof insightReturnFocus.focus === "function") insightReturnFocus.focus();
+      insightReturnFocus = null;
+    }
 
     function patternTagClass(code) {
       const meta = patternMap[code];
@@ -249,6 +271,10 @@
     }
 
     function onDocumentKeyDown(ev) {
+      if (ev.key === "Escape" && activeInsightModal) {
+        closeInsightModal();
+        return;
+      }
       if (ev.key !== "Escape") return;
       const panel = $("radar-sw2-panel");
       const wasOpen = Boolean(panel && !panel.hidden);
@@ -1113,6 +1139,12 @@
         el.addEventListener(el.tagName === "SELECT" || el.type === "checkbox" ? "change" : "input", applyFilters);
       });
       $("radar-export").onclick = exportTopOpportunityStocks;
+      $("radar-score-help").onclick = () => openInsightModal("radar-score-modal");
+      $("radar-factor-help").onclick = () => openInsightModal("radar-factor-modal");
+      root.querySelectorAll(".radar-insight-modal").forEach((modal) => {
+        modal.addEventListener("click", (event) => { if (event.target === modal) closeInsightModal(); });
+        modal.querySelectorAll("[data-radar-modal-close]").forEach((button) => { button.onclick = closeInsightModal; });
+      });
       const canvas = $("radar-kline-canvas");
       $("radar-kline-periods").querySelectorAll("button").forEach((btn) => {
         btn.addEventListener("click", () => setKlinePeriod(btn.dataset.period));

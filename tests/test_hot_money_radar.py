@@ -364,11 +364,12 @@ class HotMoneyRadarTest(unittest.TestCase):
 
     def test_accumulation_model_uses_raw_feature_weights(self):
         weights = {
-            "position": 0.10,
+            "chip": 0.20,
+            "position": 0.20,
             "cmf_eff": 0.10,
-            "p3": 0.25,
-            "p24": 0.25,
-            "holder_change": 0.20,
+            "p3": 0.20,
+            "p24": 0.10,
+            "holder_change": 0.10,
             "repurchase": 0.10,
         }
         rows = [
@@ -399,10 +400,11 @@ class HotMoneyRadarTest(unittest.TestCase):
                 },
             },
         ]
-        with patch.object(radar, "ACCUM_MODEL_WEIGHTS", weights):
-            radar._apply_accumulation_model(rows)
+        self.assertEqual(radar.ACCUM_MODEL_WEIGHTS, weights)
+        self.assertAlmostEqual(sum(radar.ACCUM_MODEL_WEIGHTS.values()), 1.0)
+        radar._apply_accumulation_model(rows)
 
-        self.assertEqual(rows[0]["ambush_score"], 91.0)
+        self.assertEqual(rows[0]["ambush_score"], 84.0)
         self.assertEqual(rows[0]["accumulation_percentile"], 100.0)
         self.assertEqual(rows[0]["distribution_percentile"], 0.0)
         self.assertEqual(rows[0]["opportunity_score"], 100.0)
@@ -410,7 +412,7 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertNotIn("technical_ambush_score", rows[0]["signals"])
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p3"], 100.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p24"], 100.0)
-        self.assertNotIn("chip", rows[0]["signals"]["accumulation_model_features"])
+        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["chip"], 80.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["holder_change"], 100.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["repurchase"], 100.0)
         self.assertEqual(rows[1]["accumulation_percentile"], 0.0)
@@ -656,6 +658,10 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertIsNotNone(acc["signals"]["chip_price_to_peak"])
         self.assertEqual(acc["signals"]["accumulation_model_features"]["holder_change"], 100.0)
         self.assertEqual(acc["signals"]["accumulation_model_features"]["repurchase"], 100.0)
+        self.assertEqual(
+            acc["signals"]["accumulation_model_features"]["chip"],
+            acc["sub_scores"]["chip"],
+        )
         self.assertGreaterEqual(by_code["600001"]["signals"]["close_pctile"], 0.9)  # 已拉升在高位
         # 封板：不再给旧技术分打折，但仍识别并标记为已启动。
         self.assertEqual(by_code["600003"]["signals"]["sealed_recent"], 1)

@@ -13,7 +13,7 @@
   估值: 总市值(market_cap,亿元)、PE(TTM)(pe_ttm)、PE(静)(pe_static)、PB(pb)、PCF(pcf)
         — 来自百度接口，只覆盖近5年（非逐日，约914点），更早记录该字段为 None
 存储路径: data/stock_data/CN_{code}_{name}.json 的 history 字段
-增量更新: 已有文件只补充 end_date+1 至今的缺失数据
+增量更新: 常规情况只补新交易日；若送转/分红导致前复权尺度改变，自动全量重刷该股历史
 并发: 默认32线程(stock 级)，可通过 STOCK_THREAD_COUNT 环境变量调整(上限64)；日线源另有独立进程池
 
 附带:
@@ -43,6 +43,7 @@ from stock_crawl_common import (
     history_payload_from_records,
     latest_weekday_date,
     merge_records_by_date,
+    normalize_history_records,
     prune_snapshot_only_history_records,
 )
 
@@ -52,6 +53,12 @@ MAX_RETRIES = 3
 # 远超核数只会让线程抢 GIL 互拖、CPU 空转（境内行情接口也更易触发限流）。可用 STOCK_THREAD_COUNT 覆盖。
 DEFAULT_THREAD_COUNT = min(32, (os.cpu_count() or 4) * 2)
 VALUATION_FRESH_DAYS = 7   # 最近一条估值在该天数内则跳过重抓（百度估值非逐日，几天延迟对长线 PB/PE 选股可忽略）
+QFQ_OVERLAP_DAYS = 7
+# 前复权价在不同行情商间会因差异化分红/四舍五入有小幅偏差；
+# 容差只屏蔽这类正常源切换，送转造成的尺度变化远大于该阈值。
+QFQ_PRICE_REL_TOLERANCE = 0.005
+QFQ_PRICE_ABS_TOLERANCE = 0.05
+QFQ_RETURN_GAP_TOLERANCE_PCT = 1.0
 
 
 def _date_dash(value):
@@ -340,6 +347,83 @@ def records_need_ohlcv_backfill(records):
     return missing > len(rows) / 2
 
 
+def _qfq_close(row):
+    """Return close from either canonical SQLite rows or crawler rows."""
+    if not isinstance(row, dict):
+        return None
+    value = row.get("daily_close")
+    if value is None:
+        value = row.get("close")
+    return _safe_float(value)
+
+
+def qfq_overlap_scale_change(existing_records, refreshed_records):
+    """Detect a retroactive qfq scale change on dates present in both datasets.
+
+    QFQ providers rewrite historical OHLC after dividends/splits.  A normal
+    incremental append must not join those rewritten prices to the old scale.
+    Return the largest mismatch for logging, or ``None`` when the overlap is
+    consistent within price-rounding tolerance.
+    """
+    existing_by_date = {
+        str(row.get("date"))[:10]: _qfq_close(row)
+        for row in existing_records or []
+        if isinstance(row, dict) and row.get("date")
+    }
+    mismatches = []
+    for row in refreshed_records or []:
+        if not isinstance(row, dict) or not row.get("date"):
+            continue
+        date_text = str(row["date"])[:10]
+        old_close = existing_by_date.get(date_text)
+        new_close = _qfq_close(row)
+        if old_close is None or new_close is None or old_close <= 0:
+            continue
+        gap = abs(new_close - old_close)
+        tolerance = max(QFQ_PRICE_ABS_TOLERANCE, abs(old_close) * QFQ_PRICE_REL_TOLERANCE)
+        if gap > tolerance:
+            mismatches.append({
+                "date": date_text,
+                "old_close": old_close,
+                "new_close": new_close,
+                "gap_pct": abs(new_close / old_close - 1.0) * 100.0,
+            })
+    return max(mismatches, key=lambda item: item["gap_pct"]) if mismatches else None
+
+
+def qfq_return_discontinuity(records):
+    """Find a stored qfq seam using source change_pct as the continuity check."""
+    rows = normalize_history_records(records, include_valuation=False, drop_future=False)
+    largest = None
+    previous_close = None
+    for row in rows:
+        close = _safe_float(row.get("daily_close"))
+        source_change = _safe_float(row.get("daily_change_pct"))
+        # Long-horizon additive qfq can become non-positive on high-dividend
+        # stocks.  Ratios across those values are not meaningful continuity
+        # checks, so reset the comparison chain until prices are positive again.
+        if (
+            previous_close is not None
+            and previous_close > 0
+            and close is not None
+            and close > 0
+            and source_change is not None
+        ):
+            computed_change = (close / previous_close - 1.0) * 100.0
+            gap = abs(computed_change - source_change)
+            if gap > QFQ_RETURN_GAP_TOLERANCE_PCT and (
+                largest is None or gap > largest["gap_pct"]
+            ):
+                largest = {
+                    "date": row["date"],
+                    "computed_change_pct": computed_change,
+                    "source_change_pct": source_change,
+                    "gap_pct": gap,
+                }
+        previous_close = close if close is not None and close > 0 else None
+    return largest
+
+
 # ─── 单股增量更新 ─────────────────────────────────────────────
 
 def _decide_valuation_period(records, today):
@@ -414,30 +498,74 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     ).strftime("%Y-%m-%d")
 
     hist_new_records = []
-
     full_daily_backfill = bool(existing_records and records_need_ohlcv_backfill(existing_records))
+    qfq_rebased = False
+    existing_qfq_seam = (
+        qfq_return_discontinuity(existing_records)
+        if existing_records and not full_daily_backfill
+        else None
+    )
+    full_refetch_start = min(
+        date for date in (start_date, max_start) if date
+    )
     if full_daily_backfill:
         safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {max_start} ~ {today}")
-        hist_new_records.extend(fetch_daily_range(code, max_start, today))
+        hist_new_records.extend(fetch_daily_range(code, full_refetch_start, today))
+    elif existing_qfq_seam:
+        qfq_rebased = True
+        safe_print(
+            f"[{idx}/{total}] {code} {name}: 检测到前复权断层 "
+            f"{existing_qfq_seam['date']} "
+            f"(收盘计算={existing_qfq_seam['computed_change_pct']:.2f}%, "
+            f"源涨跌={existing_qfq_seam['source_change_pct']:.2f}%)，"
+            f"全量重刷 {full_refetch_start} ~ {today}"
+        )
+        hist_new_records.extend(fetch_daily_range(code, full_refetch_start, today))
 
-    if not full_daily_backfill and existing_records and start_date and start_date > max_start:
+    if not full_daily_backfill and not qfq_rebased and existing_records and start_date and start_date > max_start:
         prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         if max_start <= prev_day:
             safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {max_start} ~ {prev_day}")
             hist_new_records.extend(fetch_daily_range(code, max_start, prev_day))
 
-    if full_daily_backfill:
+    if full_daily_backfill or qfq_rebased:
         pass
     elif end_date:
         if end_date < today:
-            next_day = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
-            safe_print(f"[{idx}/{total}] {code} {name}: 补行情 {next_day} ~ {today}")
-            hist_new_records.extend(fetch_daily_range(code, next_day, today))
+            overlap_start = (
+                datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=QFQ_OVERLAP_DAYS)
+            ).strftime("%Y-%m-%d")
+            overlap_start = max(date for date in (overlap_start, start_date, max_start) if date)
+            safe_print(f"[{idx}/{total}] {code} {name}: 重叠校验并补行情 {overlap_start} ~ {today}")
+            overlap_records = fetch_daily_range(code, overlap_start, today)
+            scale_change = qfq_overlap_scale_change(existing_records, overlap_records)
+            if scale_change:
+                qfq_rebased = True
+                safe_print(
+                    f"[{idx}/{total}] {code} {name}: 前复权尺度已变 "
+                    f"{scale_change['date']} {scale_change['old_close']:.2f} -> "
+                    f"{scale_change['new_close']:.2f}，全量重刷 "
+                    f"{full_refetch_start} ~ {today}"
+                )
+                hist_new_records = fetch_daily_range(code, full_refetch_start, today)
+            else:
+                hist_new_records.extend(
+                    row for row in overlap_records
+                    if str(row.get("date", ""))[:10] > end_date
+                )
     else:
         safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {max_start} ~ {today}")
         hist_new_records.extend(fetch_daily_range(code, max_start, today))
 
-    merged = merge_records(existing_records, hist_new_records)
+    # SQLite rows use daily_* names while crawler rows use compact aliases.
+    # Normalize fetched daily fields first so same-date full refetches actually
+    # overwrite old OHLCV, while omitting valuation keys preserves PIT values.
+    normalized_new_records = normalize_history_records(
+        hist_new_records,
+        include_valuation=False,
+        drop_future=False,
+    )
+    merged = merge_records(existing_records, normalized_new_records)
 
     result = {"symbol": code, "name": name}
     val_period = None
@@ -458,11 +586,12 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         new_rows = [r for r in merged if r["date"] not in existing_dates]
         # 全无变化(估值新、无新交易日、未 prune、非回补、不刷财报)→ 重写会原样落回同样数据，
         # 直接跳过：免去对「已最新」股票的整段 DELETE+重插（重复跑/周末/停牌股尤其明显）。
+        force_history_replace = full_daily_backfill or qfq_rebased
         if (val_period is None and existing_unchanged and not new_rows
-                and not full_daily_backfill and not need_fundamentals):
+                and not force_history_replace and not need_fundamentals):
             safe_print(f"[{idx}/{total}] {code} {name}: 已最新({end_date})，跳过写库")
             return
-        if val_period is None and existing_unchanged and new_rows and not full_daily_backfill:
+        if val_period is None and existing_unchanged and new_rows and not force_history_replace:
             result["history_write_records"] = new_rows
             result["history_replace"] = False
         else:

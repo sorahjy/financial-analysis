@@ -3,11 +3,12 @@
 Advanced A-share strategy engine.
 
 This module is intentionally self-contained and read-only against existing
-project data, scores two strategy families, and can be used by both CLI and
+project data, scores three strategy families, and can be used by both CLI and
 the dashboard:
 
 1. Long horizon: quality compounders, intended for 2-5 years.
-2. Short horizon: the radar's stable hot-money small-cap universe enriched by
+2. Small-cap: the short/radar universe scored with the long-factor framework.
+3. Short horizon: the radar's stable hot-money small-cap universe enriched by
    Dragon Tiger List / seat signals, intended for 1-5 trading days.
 """
 
@@ -22,7 +23,7 @@ import math
 import numpy as np
 import threading
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -40,9 +41,12 @@ CAPITAL_DIR = DATA_DIR / "capital"
 OUTPUT_FILE = DATA_DIR / "stock_advanced_strategy_results.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
 OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_config.json"
+SMALLCAP_OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_smallcap_optimized_config.json"
+SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_smallcap_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
 LIVE_CANDIDATE_CACHE_VERSION = 3
 SHORT_UNIVERSE_VERSION = "hotmoney_small_cap_v1"
+SMALLCAP_UNIVERSE_VERSION = SHORT_UNIVERSE_VERSION
 LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
 LONG_CAPITAL_EVENT_DAYS = 90
 HOLDER_TABLE = "shareholder_count"
@@ -174,11 +178,27 @@ SHORT_FACTORS: List[FactorSpec] = [
 ]
 
 
+# 小盘策略复用长线的财务/价量因子，但其股票池已经由游资小盘池限定，以下规模与
+# 指数约束因子不再重复参与展示、评分或优化。
+SMALLCAP_EXCLUDED_FACTOR_KEYS = {
+    "csi300_current",
+    "csi300_persistence",
+    "market_cap",
+    "size_reversal",
+}
+SMALLCAP_FACTORS: List[FactorSpec] = [
+    replace(spec, strategy="smallcap")
+    for spec in LONG_FACTORS
+    if spec.key not in SMALLCAP_EXCLUDED_FACTOR_KEYS
+]
+
+
 FACTOR_REGISTRY: Dict[str, FactorSpec] = {
     spec.key: spec for spec in LONG_FACTORS + SHORT_FACTORS
 }
 
 LONG_DEFAULT_TOP_N = 20
+SMALLCAP_DEFAULT_TOP_N = 10
 SHORT_DEFAULT_TOP_N = 10
 
 
@@ -208,6 +228,17 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "min_hot_money_concurrent": 0,
         "max_consecutive_limit_up": 3,
         "weights": {spec.key: spec.default_weight for spec in SHORT_FACTORS},
+    },
+    "smallcap": {
+        "enabled": True,
+        "top_n": SMALLCAP_DEFAULT_TOP_N,
+        "min_score": 60,
+        "require_high_drawdown": False,
+        "min_high_drawdown_pct": 40,
+        "exclude_st": True,
+        "hold_years_min": 2,
+        "hold_years_max": 5,
+        "weights": {spec.key: spec.default_weight for spec in SMALLCAP_FACTORS},
     },
 }
 
@@ -360,6 +391,7 @@ def invalidate_dir_fingerprints() -> None:
         _load_fundamental_stocks_cached,
         _load_long_capital_signals_cached,
         _build_live_long_candidates_cached,
+        _build_live_smallcap_candidates_cached,
         _build_live_short_candidates_cached,
     ):
         try:
@@ -379,6 +411,15 @@ def load_json_optional(path: Path, default: Any) -> Any:
 
 def load_optimized_config_payload() -> Tuple[Dict[str, Any], Optional[Path]]:
     for path in (OPTIMIZED_CONFIG_FILE, OPTIMIZED_CONFIG_BACKUP_FILE):
+        payload = load_json_optional(path, {})
+        if isinstance(payload, dict) and payload.get("config"):
+            return payload, path
+    return {}, None
+
+
+def load_smallcap_optimized_config_payload() -> Tuple[Dict[str, Any], Optional[Path]]:
+    """小盘权重独立回退：本地优化结果 → meta_data_backup → 代码默认值。"""
+    for path in (SMALLCAP_OPTIMIZED_CONFIG_FILE, SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE):
         payload = load_json_optional(path, {})
         if isinstance(payload, dict) and payload.get("config"):
             return payload, path
@@ -958,6 +999,19 @@ def load_segment_leader_codes() -> set:
             if code:
                 codes.add(code.zfill(6))
         return codes
+    finally:
+        conn.close()
+
+
+def load_hot_money_codes() -> set:
+    """与短线策略、游资雷达共用的固定游资小盘池。"""
+    conn = stock_storage.connect()
+    try:
+        return {
+            str(item.get("code") or "").zfill(6)
+            for item in stock_storage.pool_members(conn, "hotmoney")
+            if item.get("code")
+        }
     finally:
         conn.close()
 
@@ -1563,6 +1617,62 @@ def build_long_candidates(
     return candidates, notes
 
 
+def smallcap_reasons(item: Dict[str, Any]) -> List[str]:
+    """沿用长线解释口径，但不展示小盘策略已明确排除的指数/市值信号。"""
+    raw = item["raw_factors"]
+    reasons = []
+    if safe_float(raw.get("roe_stability")) is not None:
+        reasons.append(f"ROE稳定因子{raw['roe_stability']:.1f}")
+    if safe_float(raw.get("dividend_yield_5y")) is not None:
+        reasons.append(f"五年股息率{raw['dividend_yield_5y']:.2f}%")
+    if safe_float(raw.get("cashflow_quality")) is not None:
+        reasons.append(f"现金流/利润{raw['cashflow_quality']:.2f}")
+    holder_change = safe_float(raw.get("holder_count_change"))
+    if holder_change is not None and holder_change < 0:
+        reasons.append(f"股东户数下降{abs(holder_change):.1f}%")
+    if safe_float(raw.get("repurchase_recent")):
+        reasons.append("近期回购")
+    return reasons[:5]
+
+
+def build_smallcap_candidates(
+        config: Dict[str, Any],
+        as_of: Optional[str] = None,
+        universe: Optional[set] = None,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """用游资小盘成员作为候选集合，复用长线的 PIT 基本面/价量因子计算。"""
+    hot_money_codes = load_hot_money_codes()
+    target = set(hot_money_codes)
+    if universe is not None:
+        target &= {str(code).zfill(6) for code in universe}
+
+    long_style_config = deep_merge(DEFAULT_CONFIG["long"], config)
+    long_style_config.update({
+        "use_segment_leaders": False,
+        "min_market_cap_yi": 0,
+        "require_csi300": False,
+    })
+    candidates, notes = build_long_candidates(
+        long_style_config,
+        as_of=as_of,
+        universe=target,
+    )
+    for item in candidates:
+        item["strategy"] = "smallcap"
+        item["horizon"] = (
+            f"{config.get('hold_years_min', 2)}-"
+            f"{config.get('hold_years_max', 5)} years"
+        )
+        item["data_quality"] = available_factor_ratio(item["raw_factors"], SMALLCAP_FACTORS)
+        item["reasons"] = smallcap_reasons(item)
+    notes.insert(
+        0,
+        "小盘候选池与短线策略/游资雷达共用 is_hot_money=1 成员"
+        f"（当前 {len(hot_money_codes)} 只）；评分复用长线因子。",
+    )
+    return candidates, notes
+
+
 def passes_long_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bool:
     raw = item.get("raw_factors", {})
     if bool(config.get("exclude_st", True)) and is_st_name(str(item.get("name") or "")):
@@ -1582,6 +1692,18 @@ def passes_long_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bo
         if high_drawdown is None or high_drawdown < min_high_drawdown_pct:
             return False
 
+    return True
+
+
+def passes_smallcap_hard_filters(item: Dict[str, Any], config: Dict[str, Any]) -> bool:
+    """小盘不使用沪深300或总市值约束，只保留通用风控过滤。"""
+    if bool(config.get("exclude_st", True)) and is_st_name(str(item.get("name") or "")):
+        return False
+    if bool(config.get("require_high_drawdown", False)):
+        min_high_drawdown_pct = safe_float(config.get("min_high_drawdown_pct")) or 0.0
+        high_drawdown = safe_float((item.get("raw_factors") or {}).get("historical_high_drawdown"))
+        if high_drawdown is None or high_drawdown < min_high_drawdown_pct:
+            return False
     return True
 
 
@@ -2353,6 +2475,55 @@ def _build_live_long_candidates_cached(
     return build_long_candidates(config_from_key(config_key))
 
 
+def live_smallcap_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
+    key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
+    conn = stock_storage.connect()
+    try:
+        hot_money_pool_signature = stock_storage.pool_signature(conn, "hotmoney")
+    finally:
+        conn.close()
+    stock_data_signature = stock_storage.db_signature()
+    capital_signature = long_capital_signal_signature()
+    meta = {
+        "config_key": key,
+        "universe_version": SMALLCAP_UNIVERSE_VERSION,
+        "hot_money_pool": hot_money_pool_signature,
+        "stock_data": stock_data_signature,
+        "capital_signals": capital_signature,
+        "long_liquidity_factor": LONG_LIQUIDITY_FACTOR_VERSION,
+    }
+    cached = read_live_candidate_cache("smallcap", meta)
+    if cached is not None:
+        return cached
+
+    candidates, notes = _build_live_smallcap_candidates_cached(
+        _signature_key(hot_money_pool_signature),
+        _signature_key(stock_data_signature),
+        _signature_key(capital_signature),
+        SMALLCAP_UNIVERSE_VERSION,
+        LONG_LIQUIDITY_FACTOR_VERSION,
+        key,
+    )
+    write_live_candidate_cache("smallcap", meta, candidates, notes)
+    return copy.deepcopy(candidates), list(notes)
+
+
+@lru_cache(maxsize=8)
+def _build_live_smallcap_candidates_cached(
+        hot_money_pool_signature: Tuple[Tuple[str, Any], ...],
+        stock_data_signature: Tuple[Tuple[str, Any], ...],
+        capital_signature: Tuple[Tuple[str, Any], ...],
+        universe_version: str,
+        liquidity_factor_version: str,
+        config_key: str,
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    _ = (
+        hot_money_pool_signature, stock_data_signature, capital_signature,
+        universe_version, liquidity_factor_version,
+    )
+    return build_smallcap_candidates(config_from_key(config_key))
+
+
 def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
     conn = stock_storage.connect()
@@ -2454,6 +2625,42 @@ def run_long_strategy(
     return payload
 
 
+def run_smallcap_strategy(
+    config: Optional[Dict[str, Any]] = None,
+    *,
+    include_search_pool: bool = False,
+) -> Dict[str, Any]:
+    merged = deep_merge(get_default_config()["smallcap"], config or {})
+    scoring_config = copy.deepcopy(merged)
+    scoring_config["exclude_st"] = False
+    scoring_config["require_high_drawdown"] = False
+    candidates, notes = live_smallcap_candidate_pool(scoring_config)
+    scored = apply_scores(candidates, SMALLCAP_FACTORS, merged.get("weights", {}))
+    scored = rerank_scored([
+        item for item in scored if passes_smallcap_hard_filters(item, merged)
+    ])
+    candidate_codes = {item["code"] for item in scored}
+    candidates = [item for item in candidates if item["code"] in candidate_codes]
+    min_score = safe_float(merged.get("min_score")) or 0.0
+    selected = [item for item in scored if item["score"] >= min_score]
+    selected = selected[: max(0, int(first_not_none(merged.get("top_n"), 30)))]
+    payload = {
+        "strategy": "smallcap",
+        "title": "Small-cap long-factor strategy on hot-money universe",
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "config": merged,
+        "factor_count": len(SMALLCAP_FACTORS),
+        "candidate_count": len(candidates),
+        "selected_count": len(selected),
+        "notes": notes + long_data_notes(candidates, include_csi_note=False),
+        "picks": strip_internal(selected),
+        "diagnostics": diagnostics(scored, SMALLCAP_FACTORS),
+    }
+    if include_search_pool:
+        payload["search_pool"] = strip_internal(scored)
+    return payload
+
+
 def run_short_strategy(
     config: Optional[Dict[str, Any]] = None,
     *,
@@ -2499,13 +2706,16 @@ def run_strategies(
     merged = deep_merge(get_default_config(), config or {})
     payload = {
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "factor_total": len(LONG_FACTORS) + len(SHORT_FACTORS),
+        "factor_total": len(LONG_FACTORS) + len(SMALLCAP_FACTORS) + len(SHORT_FACTORS),
         "factor_counts": {
             "long": len(LONG_FACTORS),
+            "smallcap": len(SMALLCAP_FACTORS),
             "short": len(SHORT_FACTORS),
-            "total": len(LONG_FACTORS) + len(SHORT_FACTORS),
+            "total": len(LONG_FACTORS) + len(SMALLCAP_FACTORS) + len(SHORT_FACTORS),
         },
-        "factor_registry": [spec.to_dict() for spec in LONG_FACTORS + SHORT_FACTORS],
+        "factor_registry": [
+            spec.to_dict() for spec in LONG_FACTORS + SMALLCAP_FACTORS + SHORT_FACTORS
+        ],
         "long": (
             run_long_strategy(merged.get("long", {}), include_search_pool=include_search_pool)
             if merged.get("long", {}).get("enabled", True)
@@ -2514,6 +2724,11 @@ def run_strategies(
         "short": (
             run_short_strategy(merged.get("short", {}), include_search_pool=include_search_pool)
             if merged.get("short", {}).get("enabled", True)
+            else None
+        ),
+        "smallcap": (
+            run_smallcap_strategy(merged.get("smallcap", {}), include_search_pool=include_search_pool)
+            if merged.get("smallcap", {}).get("enabled", True)
             else None
         ),
         "self_review": self_review_summary(),
@@ -2535,6 +2750,14 @@ def run_strategies(
                     )
                 else:
                     payload[key]["notes"].append(optimized_note)
+    smallcap_optimized_meta = merged.get("_smallcap_optimized_defaults")
+    if isinstance(smallcap_optimized_meta, dict) and payload.get("smallcap"):
+        smallcap_note = (
+            f"小盘默认参数来自 {smallcap_optimized_meta.get('source') or '未知文件'} 的独立优化配置"
+            f"（{smallcap_optimized_meta.get('generated_at') or '未知时间'}）："
+            f"{smallcap_optimized_meta.get('caveat') or ''}"
+        ).rstrip("：")
+        payload["smallcap"]["notes"].append(smallcap_note)
     if persist:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
@@ -2547,6 +2770,8 @@ def get_default_config() -> Dict[str, Any]:
     optimized, optimized_source = load_optimized_config_payload()
     if optimized.get("config"):
         optimized_config = copy.deepcopy(optimized["config"])
+        # 小盘权重只允许从独立文件加载，避免与长/短配置互相覆盖。
+        optimized_config.pop("smallcap", None)
         # 旧优化结果基于“席位共振 JSON 候选池”，不能跨池沿用短线硬过滤与权重；
         # 长线配置仍可安全复用。新版 optimizer 会写入明确的 universe 版本。
         if optimized.get("short_universe_version") != SHORT_UNIVERSE_VERSION:
@@ -2560,14 +2785,49 @@ def get_default_config() -> Dict[str, Any]:
             "caveat": optimized.get("caveat"),
             "short_universe_version": optimized.get("short_universe_version"),
         }
+    smallcap_optimized, smallcap_source = load_smallcap_optimized_config_payload()
+    if (
+        smallcap_optimized.get("config")
+        and smallcap_optimized.get("smallcap_universe_version", SMALLCAP_UNIVERSE_VERSION)
+        == SMALLCAP_UNIVERSE_VERSION
+    ):
+        source_config = smallcap_optimized["config"]
+        smallcap_override = (
+            source_config.get("smallcap")
+            if isinstance(source_config.get("smallcap"), dict)
+            else source_config
+        )
+        config["smallcap"] = deep_merge(config["smallcap"], smallcap_override)
+        # 小盘优化器固定不搜索、不启用历史高点回撤过滤；旧优化文件中的 True
+        # 不得继续把实盘候选池从完整 is_hot_money 成员压缩成少量样本。
+        config["smallcap"]["require_high_drawdown"] = False
+        config["smallcap"]["min_high_drawdown_pct"] = DEFAULT_CONFIG["smallcap"]["min_high_drawdown_pct"]
+        config["smallcap"]["top_n"] = min(
+            SMALLCAP_DEFAULT_TOP_N,
+            max(1, int(config["smallcap"].get("top_n") or SMALLCAP_DEFAULT_TOP_N)),
+        )
+        # 旧文件或手工编辑不得把已明确剔除的因子重新带回前端。
+        config["smallcap"]["weights"] = {
+            spec.key: config["smallcap"].get("weights", {}).get(spec.key, spec.default_weight)
+            for spec in SMALLCAP_FACTORS
+        }
+        config["_smallcap_optimized_defaults"] = {
+            "source": str(smallcap_source),
+            "generated_at": smallcap_optimized.get("generated_at"),
+            "iterations": smallcap_optimized.get("iterations"),
+            "seed": smallcap_optimized.get("seed"),
+            "caveat": smallcap_optimized.get("caveat"),
+            "smallcap_universe_version": smallcap_optimized.get("smallcap_universe_version"),
+        }
     return config
 
 
 def get_factor_registry() -> Dict[str, Any]:
     return {
         "long": [spec.to_dict() for spec in LONG_FACTORS],
+        "smallcap": [spec.to_dict() for spec in SMALLCAP_FACTORS],
         "short": [spec.to_dict() for spec in SHORT_FACTORS],
-        "total": len(LONG_FACTORS) + len(SHORT_FACTORS),
+        "total": len(LONG_FACTORS) + len(SMALLCAP_FACTORS) + len(SHORT_FACTORS),
     }
 
 
@@ -2630,13 +2890,16 @@ def factor_coverage(items: List[Dict[str, Any]], specs: List[FactorSpec]) -> Lis
     return rows
 
 
-def long_data_notes(candidates: List[Dict[str, Any]]) -> List[str]:
+def long_data_notes(
+        candidates: List[Dict[str, Any]], *, include_csi_note: bool = True
+) -> List[str]:
     notes = []
     if candidates:
         avg_quality = mean(item.get("data_quality", 0) for item in candidates)
         if avg_quality < 0.7:
             notes.append("Long strategy data coverage is below 70%; enrich financial/price history for production use.")
-    notes.append("CSI300 long-term membership is proxied unless historical constituent snapshots are added.")
+    if include_csi_note:
+        notes.append("CSI300 long-term membership is proxied unless historical constituent snapshots are added.")
     return notes
 
 
@@ -2650,8 +2913,9 @@ def short_data_notes(candidates: List[Dict[str, Any]]) -> List[str]:
 
 def self_review_summary() -> Dict[str, Any]:
     return {
-        "factor_count_ok": len(LONG_FACTORS) + len(SHORT_FACTORS) >= 20,
+        "factor_count_ok": len(LONG_FACTORS) + len(SMALLCAP_FACTORS) + len(SHORT_FACTORS) >= 20,
         "long_factor_count": len(LONG_FACTORS),
+        "smallcap_factor_count": len(SMALLCAP_FACTORS),
         "short_factor_count": len(SHORT_FACTORS),
         "old_files_modified": False,
         "network_required": False,
@@ -2671,7 +2935,7 @@ def self_review_summary() -> Dict[str, Any]:
 def print_cli_summary(result: Dict[str, Any], top: int = 10) -> None:
     print(f"Generated: {result['generated_at']}")
     print(f"Total factors: {result['factor_total']}")
-    for key in ("long", "short"):
+    for key in ("long", "smallcap", "short"):
         section = result.get(key)
         if not section:
             continue
@@ -2687,8 +2951,8 @@ def print_cli_summary(result: Dict[str, Any], top: int = 10) -> None:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Advanced A-share long/short strategy engine")
-    parser.add_argument("--strategy", choices=["all", "long", "short"], default="all")
+    parser = argparse.ArgumentParser(description="Advanced A-share long/small-cap/short strategy engine")
+    parser.add_argument("--strategy", choices=["all", "long", "smallcap", "short"], default="all")
     parser.add_argument("--top", type=int, default=10)
     parser.add_argument("--persist", action="store_true", help=f"write {OUTPUT_FILE}")
     parser.add_argument("--rebuild-cache", action="store_true",
@@ -2701,9 +2965,14 @@ def main() -> None:
 
     config = get_default_config()
     if args.strategy == "long":
+        config["smallcap"]["enabled"] = False
+        config["short"]["enabled"] = False
+    elif args.strategy == "smallcap":
+        config["long"]["enabled"] = False
         config["short"]["enabled"] = False
     elif args.strategy == "short":
         config["long"]["enabled"] = False
+        config["smallcap"]["enabled"] = False
 
     result = run_strategies(config, persist=args.persist)
     if args.json:

@@ -1,6 +1,6 @@
 # financial-analysis
 
-一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
+一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/小盘/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
 当前版本：v3.3.3
 
@@ -48,8 +48,9 @@
 | 基金超额收益报告 | 对持仓基金和关注基金做跨周期超额收益比较，并提示基金经理变动 | `data/fund_report_data.json`（Flask `/fund` 页面渲染） |
 | 基金技术分析 | 结合 MA、RSI、MACD、KDJ、布林带、ADX、ATR、百分位和止盈逻辑生成买卖信号 | `data/signals.json` |
 | A 股长线策略 | 面向 2-5 年持有期，从细分行业龙头池中筛选质量、价值、盈利、低波、反转/动量等多因子候选 | `data/stock_advanced_strategy_results.json` |
+| A 股小盘策略 | 与短线/游资雷达共用游资小盘池，复用长线基本面因子和 PIT 回测，但排除沪深300、总市值和小市值因子 | 同上；独立权重见 `data/stock_strategy_smallcap_optimized_config.json` |
 | A 股短线策略 | 面向 1-5 个交易日，围绕龙虎榜、游资席位、机构共振、价量和风控因子选股 | 同上 |
-| 参数搜索 | 对长线/短线策略用两个独立进程并行做 Optuna/TPE 搜索和代理回测，写入优化后的默认参数 | `data/stock_strategy_optimized_config.json` |
+| 参数搜索 | 对长线/小盘/短线策略用三个独立进程并行做 Optuna/TPE 搜索和代理回测，分别写入默认参数 | `data/stock_strategy_optimized_config.json`、`data/stock_strategy_smallcap_optimized_config.json` |
 | 统一 Flask 工作台 | 在本地网页中查看基金报告、调参运行 A 股策略、保存配置、查看入选股票、周 K 小图和关键因子 | `python run.py --port 8765`（`/`、`/fund`、`/stock`、`/radar`） |
 | 游资雷达 | 在细分行业龙头池中跟踪吸筹分、出货预警、形态阶段、题材热度和盘中实时形态重算，并提供 K 线详情与 TopN 导出 | `data/capital/hot_money_ambush.json` |
 | 行业周期 | 抓取申万二级行业日线，提取周期位置、聪明资金、景气度和行业强弱特征 | `data/industry_cycle/*.json` |
@@ -112,7 +113,7 @@ FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
 
 ## 5. A 股策略配置台
 
-A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strategies.py` 评分，既可以命令行运行，也可以通过本地 Dashboard 调参。
+A 股模块分为长线、小盘和短线三套策略，统一由 `stock_advanced_strategies.py` 评分，既可以命令行运行，也可以通过本地 Dashboard 调参。
 
 ### 5.1 长线大盘股策略
 
@@ -124,7 +125,11 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 - 风险与稳健性：低波动、低负债、低质押、杠杆改善、资产扩张约束。
 - 价格行为：一月反转、12-1 月动量、52 周高点距离、长期反转、异常换手。
 
-### 5.2 短线游资小盘策略
+### 5.2 小盘长线因子策略
+
+小盘策略的股票池与短线策略、游资雷达完全一致，统一读取 `sw3_member.is_hot_money=1`；因子计算、持有周期和 optimizer 的 PIT walk-forward 风险目标复用长线策略。由于股票池已经限定小盘属性，小盘页不提供“必须当前沪深300”和总市值门槛，并从因子注册表、评分与搜索空间中剔除 `csi300_current`、`csi300_persistence`、`market_cap`、`size_reversal`。小盘优化权重独立保存在 `data/stock_strategy_smallcap_optimized_config.json`，加载顺序为本地文件、`meta_data_backup/stock_strategy_smallcap_optimized_config.json`、代码默认值，不会覆盖长线或短线权重。
+
+### 5.3 短线游资小盘策略
 
 短线策略面向 1-5 个交易日，基础成员与游资雷达的游资小盘池完全一致：近一年龙虎榜上榜次数达到门槛、属于标准 A 股且非 ST、至少有 250 根有效日线，并按近 20 个有效交易日反推流通市值中位数不高于 100 亿元。`sw3_member.is_hot_money=1` 是唯一成员来源；龙虎榜席位、机构和技术面快照只补充打分，缺失时不会把成员移出股票池。典型因子包括：
 
@@ -134,32 +139,32 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 - 均线多头、量比、RSI 甜区、MACD 强度、短反 Alpha、涨停热度。
 - 连板约束、过热惩罚、一字板/T 字板等可交易性过滤。
 
-### 5.3 股票数据持久化
+### 5.4 股票数据持久化
 
 v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
 
 股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 随后只补齐龙头股票的基本面，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
 
-### 5.4 参数搜索与可视化
+### 5.5 参数搜索与可视化
 
-`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.3.0 当前口径为每 60 个交易日取一个折起点、固定持有 60 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并采用等权口径，最旧折到最新折均为 1.0x。选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。优化器会固定 `min_market_cap_yi=0`，并将 `csi300_current`、`csi300_persistence`、`market_cap`、`size_reversal`、`industry_leadership` 等市值/指数相关权重固定为 0，不参与搜索。游资小盘池变更后可用 `python -B stock_strategy_optimizer.py --strategy short --iterations 1500` 单独重跑短线参数，并保留已有长线配置。
+`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线与小盘采用同一套 **Point-in-Time (PIT) walk-forward 回测**框架：每 60 个交易日取一个折起点、固定持有 60 个交易日，以当时可见的财报、价格、估值和分红重算因子，再对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。小盘仅把候选集合替换为当前游资小盘池，并排除指数与市值因子；长线仍限制为 SW3 细分龙头池。短线继续使用自身的短周期真实前推和代理评分回测。可分别用 `--strategy long`、`--strategy smallcap`、`--strategy short` 单独重跑并保留其他策略配置。
 
-> 注意：受本地约 10 年日线与基准 ETF 覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认长线/短线各搜索 1500 次，两个独立进程并行运行；短线候选池会在 trial 前预转为 NumPy 矩阵以减少重复打分开销，整体运行时间仍取决于本地缓存规模。
+> 注意：受本地约 10 年日线与基准 ETF 覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益。小盘回测使用“当前游资小盘成员回看历史”，存在幸存者偏差。默认长线/小盘/短线各搜索 1500 次，三个独立进程并行运行，整体时间取决于本地缓存规模。
 
 Dashboard 支持：
 
-- 长线/短线 tabs 切换。
+- 长线/小盘/短线 tabs 切换。
 - 调整硬过滤参数、因子权重、输出数量和最低分。
 - 运行策略、保存配置、重置参数。
-- 直接触发长线/短线各 1500 次参数搜索，并查看后台搜索状态。
+- 直接触发长线/小盘/短线各 1500 次参数搜索，并查看后台搜索状态。
 - 展示候选数、入选数、平均分、分数区间、数据覆盖率、筛选解释和主要因子贡献。
 - 长线专属“策略走势”按钮：默认参数直接展示 `data/stock_strategy_best_fold_paths.svg`，非默认参数会按当前配置重新生成自定义 SVG。
 - “导出”按钮按当前策略的输出数量导出 txt，每行格式为 `股票代码,股票名,`。
-- 长线和短线入选股票表格内置固定范围简易周 K 线，不提供拖拽或缩放。
+- 三种策略的入选股票表格均内置固定范围简易周 K 线，不提供拖拽或缩放。
 - 支持精确搜索代码/名称，把匹配股票临时加入当前结果表查看因子与周 K。
 
 
-### 5.5 常用CLI命令
+### 5.6 常用CLI命令
 
 首次使用推荐后台跑以下命令组合
 
@@ -201,7 +206,7 @@ python stock_strategy_optimizer.py --iterations 1500
 - `patterns`：把游资形态 playbook 落到股票与板块数据上，输出形态匹配与验证结果。
 - `verify`：复盘吸筹分与形态信号的后续收益、分层和 IC。
 - `distribution`：复盘出货分候选特征，做 0.1 步长权重网格搜索和消融实验。
-- `accumulation`：复盘 `position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购` 六个吸筹候选特征，做 0.05 步长权重网格搜索和消融实验。
+- `accumulation`：复盘 `chip / position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购` 七个吸筹候选特征，做 0.05 步长权重网格搜索和消融实验。
 - `watch`：预留盘中监控状态文件，当前仍以离线数据推断为主。
 
 ```bash
@@ -235,14 +240,14 @@ bash stock_radar_fresh_data.sh
 - `data/capital/hot_money_watch.json`：盘中监控状态占位。
 - `data/capital/hot_money_verify.json`：吸筹分复盘结果。
 - `data/capital/hot_money_distribution_experiment.json`：出货分权重网格搜索和消融实验结果。
-- `data/capital/hot_money_accumulation_experiment.json`：六原始分吸筹总分权重网格搜索和消融实验结果。
+- `data/capital/hot_money_accumulation_experiment.json`：七原始分吸筹总分权重网格搜索和消融实验结果。
 
 ### 6.4 使用边界
 
 - 盘中没有席位级实时数据，雷达输出是行为推断，不是席位实锤。
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
 - `阶段·把握` 中的阶段来自命中形态；把握度会按阶段混合形态强度、吸筹分和出货分，观望表示“暂无明显阶段信号”的可信度，不再等同于吸筹分或简单形态计数。
-- 吸筹总分候选特征为 `position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购`；当前线上权重为 `0.1*position + 0.1*cmf_eff + 0.25*P3 + 0.25*P24 + 0.2*股东户数变化 + 0.1*公司回购`。P3/P24 命中为 100、未命中为 0；缺股东户数变化按中性 50，近 90 日无回购按 0。筹码分及数据流继续保留用于展示和形态匹配，但不参与吸筹总分。
+- 吸筹总分候选特征为 `chip / position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购`；当前线上权重为 `0.2*chip + 0.2*position + 0.1*cmf_eff + 0.2*P3 + 0.1*P24 + 0.1*股东户数变化 + 0.1*公司回购`。P3/P24 命中为 100、未命中为 0；缺股东户数变化按中性 50，近 90 日无回购按 0。
 - 出货分候选特征为 `technical / P11 / P19 / P20 / 近期龙虎榜 / divergence`；当前线上权重为 `0.2*technical + 0.2*P11 + 0.1*P19 + 0.1*P20 + 0.2*近期龙虎榜 + 0.2*divergence`，其中 `divergence` 使用原始 div 分，不使用吸筹侧反向后的 `div_eff`。
 - 调整出货权重前先跑 `python stock_hot_money_radar.py distribution` 查看 train、validation 与消融结果。
 - 调整吸筹总分权重前先跑 `python stock_hot_money_radar.py accumulation`，并同时检查 train、validation 与消融结果。
@@ -275,10 +280,12 @@ python industry_cycle_engine.py --write
 | `data/fund_report_data.json` | 基金超额收益和技术信号报告数据，由 Flask `/fund` 页面渲染（生成物，不入库） |
 | `data/signals.json` | 基金技术信号 |
 | `data/fund_data.sqlite3` | 基金核心缓存，包含历史净值、实时估算和 Scrapy 基金概况快照 |
-| `data/stock_advanced_strategy_results.json` | A 股长线/短线策略结果 |
-| `data/stock_strategy_candidate_cache.json` | A 股长线/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
+| `data/stock_advanced_strategy_results.json` | A 股长线/小盘/短线策略结果 |
+| `data/stock_strategy_candidate_cache.json` | A 股长线/小盘/短线候选池缓存，由 `stock_data_refresh.py` 刷新后重建，用于 Dashboard 快速调参 |
 | `data/stock_strategy_optimization.json` | 参数搜索过程和结果摘要 |
 | `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数；optimizer 只写入 data 路径，data 文件缺失时前端可兜底读取 `meta_data_backup/stock_strategy_optimized_config.json` |
+| `data/stock_strategy_smallcap_optimization.json` | 小盘策略独立参数搜索过程和回测摘要 |
+| `data/stock_strategy_smallcap_optimized_config.json` | 小盘独立优化权重；缺失时回退 `meta_data_backup/stock_strategy_smallcap_optimized_config.json`，再回退代码默认值 |
 | `data/stock_strategy_best_fold_paths.svg` | 长线默认参数历史折走势小图矩阵 |
 | `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
 | `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
@@ -291,7 +298,7 @@ python industry_cycle_engine.py --write
 | `data/capital/hot_money_pattern_verify.json` | 游资形态事件复盘输出 |
 | `data/capital/hot_money_watch.json` | 实时交易监控状态占位 |
 | `data/capital/hot_money_verify.json` | 吸筹分命中验证输出 |
-| `data/capital/hot_money_accumulation_experiment.json` | 六原始分吸筹总分权重实验输出 |
+| `data/capital/hot_money_accumulation_experiment.json` | 七原始分吸筹总分权重实验输出 |
 | `data/industry_cycle/*.json` | 行业周期位置、聪明资金、景气度、行业强弱和运行报告 |
 
 ## 9. 项目结构
@@ -303,7 +310,7 @@ python industry_cycle_engine.py --write
 ├── fund_*.py                     # 基金数据、技术分析、回测和报告生成
 ├── fund_storage.py                # 基金 SQLite 缓存 schema、读写和导入工具
 ├── funds.py                      # 基金列表和基准配置
-├── stock_advanced_strategies.py   # A 股长线/短线策略引擎
+├── stock_advanced_strategies.py   # A 股长线/小盘/短线策略引擎
 ├── stock_strategy_optimizer.py    # 参数搜索和代理回测
 ├── stock_data_refresh.py          # 股票数据刷新编排
 ├── stock_crawl_common.py          # 股票爬虫公共文件、JSON、历史行情和日线统计工具

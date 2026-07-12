@@ -28,6 +28,8 @@ import stock_crawl_price_valuation as stock_price_valuation
 from stock_crawl_price_valuation import (
     _decide_valuation_period,
     load_stock_file,
+    qfq_overlap_scale_change,
+    qfq_return_discontinuity,
     records_need_ohlcv_backfill,
     save_stock_file,
 )
@@ -737,6 +739,123 @@ class StockHistorySchemaTest(unittest.TestCase):
         self.assertEqual(
             _normalize_volume_to_hands(125014.55, 1528515000, 124.42),
             125014.55,
+        )
+
+    def test_qfq_return_discontinuity_detects_mixed_adjustment_scales(self):
+        seam = qfq_return_discontinuity([
+            {**self.complete_row("2026-07-01"), "daily_close": 41.2, "daily_change_pct": 1.402904},
+            {**self.complete_row("2026-07-02"), "daily_close": 28.17, "daily_change_pct": -2.593361},
+        ])
+
+        self.assertEqual(seam["date"], "2026-07-02")
+        self.assertAlmostEqual(seam["computed_change_pct"], -31.626214, places=5)
+        self.assertAlmostEqual(seam["source_change_pct"], -2.593361, places=6)
+
+    def test_qfq_overlap_scale_change_detects_rewritten_history(self):
+        changed = qfq_overlap_scale_change(
+            [{"date": "2026-07-01", "daily_close": 41.2}],
+            [{"date": "2026-07-01", "close": 28.92}],
+        )
+
+        self.assertEqual(changed["date"], "2026-07-01")
+        self.assertEqual(changed["old_close"], 41.2)
+        self.assertEqual(changed["new_close"], 28.92)
+
+    def test_qfq_overlap_scale_change_allows_small_cross_source_rounding(self):
+        changed = qfq_overlap_scale_change(
+            [{"date": "2026-07-01", "daily_close": 28.94}],
+            [{"date": "2026-07-01", "close": 28.92}],
+        )
+
+        self.assertIsNone(changed)
+
+    def test_qfq_return_discontinuity_ignores_nonpositive_long_horizon_qfq(self):
+        seam = qfq_return_discontinuity([
+            {**self.complete_row("2026-01-01"), "daily_close": 1.0, "daily_change_pct": 0.0},
+            {**self.complete_row("2026-01-02"), "daily_close": -0.5, "daily_change_pct": -150.0},
+            {**self.complete_row("2026-01-05"), "daily_close": 2.0, "daily_change_pct": -500.0},
+        ])
+
+        self.assertIsNone(seam)
+
+    def test_process_stock_rewrites_full_history_when_existing_qfq_seam_is_found(self):
+        existing = [
+            {**self.complete_row("2026-07-01"), "daily_close": 41.2, "daily_change_pct": 1.402904},
+            {**self.complete_row("2026-07-02"), "daily_close": 28.17, "daily_change_pct": -2.593361},
+        ]
+        refreshed = [
+            {"date": "2026-07-01", "open": 28.12, "high": 29.6, "low": 28.0,
+             "close": 28.92, "volume": 108508.84, "amount": 446790220,
+             "change_pct": 1.402525, "turnover_rate": 2.9065},
+            {"date": "2026-07-02", "open": 28.29, "high": 29.05, "low": 26.82,
+             "close": 28.17, "volume": 93989.8, "amount": 378106574,
+             "change_pct": -2.593361, "turnover_rate": 2.5176},
+        ]
+        saved = []
+
+        with patch.object(
+            stock_price_valuation,
+            "load_stock_file",
+            return_value={"records": existing, "start_date": "2026-07-01", "end_date": "2026-07-02"},
+        ), patch.object(
+            stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
+        ), patch.object(
+            stock_price_valuation, "fetch_daily_range", return_value=refreshed
+        ) as fetch_mock:
+            stock_price_valuation.process_stock(
+                "603281",
+                "江瀚新材",
+                1,
+                1,
+                save_callback=lambda code, name, data: saved.append((code, name, data)),
+                max_years=0.001,
+                refresh_valuation=False,
+            )
+
+        self.assertEqual(fetch_mock.call_count, 1)
+        result = saved[0][2]
+        self.assertTrue(result["history_replace"])
+        self.assertAlmostEqual(result["records"][0]["daily_close"], 28.92)
+        self.assertAlmostEqual(result["records"][1]["daily_close"], 28.17)
+
+    def test_process_stock_keeps_append_fast_path_when_overlap_scale_is_stable(self):
+        existing = [
+            {**self.complete_row("2026-07-01"), "daily_close": 28.92, "daily_change_pct": 1.402525},
+        ]
+        overlap = [
+            {"date": "2026-07-01", "open": 28.12, "high": 29.6, "low": 28.0,
+             "close": 28.92, "volume": 108508.84, "amount": 446790220,
+             "change_pct": 1.402525, "turnover_rate": 2.9065},
+            {"date": "2026-07-02", "open": 28.29, "high": 29.05, "low": 26.82,
+             "close": 28.17, "volume": 93989.8, "amount": 378106574,
+             "change_pct": -2.593361, "turnover_rate": 2.5176},
+        ]
+        saved = []
+
+        with patch.object(
+            stock_price_valuation,
+            "load_stock_file",
+            return_value={"records": existing, "start_date": "2026-07-01", "end_date": "2026-07-01"},
+        ), patch.object(
+            stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
+        ), patch.object(
+            stock_price_valuation, "fetch_daily_range", return_value=overlap
+        ):
+            stock_price_valuation.process_stock(
+                "603281",
+                "江瀚新材",
+                1,
+                1,
+                save_callback=lambda code, name, data: saved.append((code, name, data)),
+                max_years=0.001,
+                refresh_valuation=False,
+            )
+
+        result = saved[0][2]
+        self.assertFalse(result["history_replace"])
+        self.assertEqual(
+            [row["date"] for row in result["history_write_records"]],
+            ["2026-07-02"],
         )
 
     def test_sw3_member_schema_adds_official_market_cap_ratio_to_old_db(self):

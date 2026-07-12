@@ -6,14 +6,14 @@
   调研背景：「放量+创新高」经 verify 回测证明是右侧追高(截面 RankIC 显著为负)。吸筹的真正
   指纹是方向性的——参考 Wyckoff/VSA、A股筹码分布、OBV/ADL 三套体系，落地三个判别信号：
 
-ambush 吸筹分（六项 0~100 原始分直接加权）：
-  位置  价格中低位                                    权重 0.10
+ambush 吸筹分（七项 0~100 原始分直接加权）：
+  筹码  低位筹码集中                                  权重 0.20
+  位置  价格中低位                                    权重 0.20
   CMF   高买压反向有效分（最高50）                     权重 0.10
-  P3    缩量打压后首次完整收复                         权重 0.25
-  P24   OBV底背离连续确认后的首次成立                   权重 0.25
-  户数  股东户数下降                                  权重 0.20
+  P3    缩量打压后首次完整收复                         权重 0.20
+  P24   OBV底背离连续确认后的首次成立                   权重 0.10
+  户数  股东户数下降                                  权重 0.10
   回购  近90日公司回购                                权重 0.10
-筹码分及其明细数据继续计算和展示，但不再参与吸筹总分。
 旧四技术因子加权分及其一字板/派发/P20折扣已删除；出货风险只在机会分中单独折扣。
 
 另叠加「游资形态匹配」(规格见 meta_data_backup/hot_money_patterns.md)：把游资坐庄的「吸筹→试盘→
@@ -365,11 +365,12 @@ REPURCHASE_TABLE = "repurchase"        # code, disclose_date
 LHB_TABLE = "lhb_all"                  # code, date(上榜日)
 CAPITAL_EVENT_DAYS = 90                # 回购/上榜：近 N 自然日内有事件视为"近期"
 ACCUM_MODEL_WEIGHTS = {
-    "position": 0.1,                    # 价格中低位
+    "chip": 0.2,                        # 低位筹码集中
+    "position": 0.2,                    # 价格中低位
     "cmf_eff": 0.1,                     # CMF 反向有效分：高买压反转风险不加分
-    "p3": 0.25,                         # P3 缩量阴线打压吸筹
-    "p24": 0.25,                        # P24 OBV 底背离：连续确认后的首次成立日
-    "holder_change": 0.2,               # 股东户数变化：户数降=高分，缺失=中性50
+    "p3": 0.2,                          # P3 缩量阴线打压吸筹
+    "p24": 0.1,                         # P24 OBV 底背离：连续确认后的首次成立日
+    "holder_change": 0.1,               # 股东户数变化：户数降=高分，缺失=中性50
     "repurchase": 0.1,                  # 公司回购：近90日回购=100，否则0
 }
 ACCUM_FEATURES = tuple(ACCUM_MODEL_WEIGHTS.keys())
@@ -1999,8 +2000,8 @@ def _apply_distribution_model(row: Dict[str, Any]) -> None:
 def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     """提取雷达需要的技术原始分与形态上下文；数据不足返回 None。
 
-    这里继续计算 position/chip/cmf_eff 等原始特征；chip 供展示与部分形态匹配，
-    不再参与吸筹总分。不再生成旧四技术因子加权分。
+    这里继续计算 position/chip/cmf_eff 等原始特征；chip 同时供吸筹总分、展示与形态匹配。
+    不再生成旧四技术因子加权分。
     最终吸筹分统一由 ``_accumulation_model_score`` 计算。
     """
     if len(bars) < MIN_BARS:
@@ -2014,7 +2015,7 @@ def _score_bars(code: str, bars: List[Dict[str, Any]]) -> Optional[Dict[str, Any
     sealed, streak = _sealed_and_streak(bars, code)
     triggered, trigger = _breakout_trigger(bars, vol)     # 右进左出触发器
 
-    # CMF 在六因子模型中反向计入：高买压是反转风险，低/中性买压最多给50分。
+    # CMF 在七因子模型中反向计入：高买压是反转风险，低/中性买压最多给50分。
     cmf_eff = min(50.0, 100.0 - s_cmf) if s_cmf is not None else None
     technical_dist = _score_distribution(close_pctile, drift, vol_ratio)
     turnover_pctile = _turnover_pctile(bars)              # 最新换手率分位（拥挤度，仅展示）
@@ -2420,6 +2421,7 @@ def _accumulation_raw_features(row: Dict[str, Any]) -> Dict[str, float]:
     sub = row.get("sub_scores") or {}
     pattern_codes = set(row.get("patterns") or [])
     return {
+        "chip": float(sub.get("chip") or 0.0),
         "position": float(sub.get("position") or 0.0),
         "cmf_eff": float(sub.get("cmf_eff") or 0.0),
         "p3": 100.0 if "P3" in pattern_codes else 0.0,
@@ -3118,7 +3120,7 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
 
 def _collect_verify_samples(conn: sqlite3.Connection, candidates: List[Dict[str, Any]],
                             pool: str = DEFAULT_POOL) -> Dict[str, Any]:
-    """对每只候选滑动取历史截面，PIT 重算六因子吸筹分并配对未来前向收益。
+    """对每只候选滑动取历史截面，PIT 重算七因子吸筹分并配对未来前向收益。
 
     返回 {samples, dates, codes}。samples 每项 = {date, code, score, rets:{h:ret}}。
     PIT：打分只用截止 as-of 当日的 LOOKBACK 根 bar；前向收益用其后第 h 根 bar 的收盘价。
@@ -3314,7 +3316,7 @@ def run_verify(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dic
     payload = base_payload("verify", len(candidates))
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "六因子吸筹分后验回测：PIT 重算吸筹分 vs 未来前向收益（分位单调性 / 截面RankIC / 多空价差）。",
+        "description": "七因子吸筹分后验回测：PIT 重算吸筹分 vs 未来前向收益（分位单调性 / 截面RankIC / 多空价差）。",
         "params": {
             "horizons": list(VERIFY_HORIZONS), "step": VERIFY_STEP,
             "window_days": VERIFY_WINDOW_DAYS, "buckets": VERIFY_BUCKETS,
@@ -3981,7 +3983,7 @@ def _print_distribution_summary(payload: Dict[str, Any]) -> None:
     print("=" * 108)
 
 
-# ── accumulation：六原始分吸筹总分权重实验 ─────────────────────
+# ── accumulation：七原始分吸筹总分权重实验 ─────────────────────
 
 def _load_capital_histories(conn: sqlite3.Connection) -> Dict[str, Any]:
     holder_dates: Dict[str, List[str]] = {}
@@ -4036,7 +4038,7 @@ def _holder_change_at(histories: Dict[str, Any], code: str, as_of: str) -> Optio
 
 def _collect_accumulation_samples(conn: sqlite3.Connection,
                                   candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """PIT 收集六个吸筹原始特征 + 未来超额收益。"""
+    """PIT 收集七个吸筹原始特征 + 未来超额收益。"""
     max_h = max(ACCUM_EXPERIMENT_HORIZONS)
     series: Dict[str, Tuple[List[Dict[str, Any]], Dict[str, int]]] = {}
     for cand in candidates:
@@ -4281,7 +4283,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
     payload = base_payload("accumulation", len(candidates))
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "吸筹总分权重实验：用 position、cmf_eff、P3、P24、股东户数变化、公司回购六个原始分直接加权，不用截面 rank 合成线上分数。",
+        "description": "吸筹总分权重实验：用 chip、position、cmf_eff、P3、P24、股东户数变化、公司回购七个原始分直接加权，不用截面 rank 合成线上分数。",
         "params": {
             "horizons": list(ACCUM_EXPERIMENT_HORIZONS),
             "step": VERIFY_STEP,
@@ -4316,7 +4318,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
         return {k: (1.0 if k == feature else 0.0) for k in ACCUM_FEATURES}
 
     market_structure_equal = {
-        k: (1 / 4 if k in ("position", "cmf_eff", "p3", "p24") else 0.0)
+        k: (1 / 5 if k in ("chip", "position", "cmf_eff", "p3", "p24") else 0.0)
         for k in ACCUM_FEATURES
     }
     capital_equal = {
@@ -4377,7 +4379,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
         "accumulation": {
             "best_train_weights": top_models[0]["weights"] if top_models else None,
             "recommended_weights": _round_accum_weights(recommended_weights),
-            "selection_rule": "线上推荐只从六项权重均>=0.1的网格候选中选择；单因子/分组消融仅作为报告参考，不参与推荐。",
+            "selection_rule": "线上推荐只从七项权重均>=0.1的网格候选中选择；单因子/分组消融仅作为报告参考，不参与推荐。",
             "validation_candidate_count": len(candidates_grid),
             "top_models": top_models,
             "validation_top_models": validation_top,
@@ -4386,7 +4388,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
             "recommended_model": recommended,
         },
         "notes": [
-            "线上吸筹总分只用 position、cmf_eff、P3、P24、股东户数变化、公司回购六个原始分按权重相加；筹码分仅保留为展示与形态数据。",
+            "线上吸筹总分使用 chip、position、cmf_eff、P3、P24、股东户数变化、公司回购七个原始分按权重相加。",
             "实验里的 RankIC 仅用于评价分数排序能力；高低差是高分五分位相对低分五分位的未来超额收益差。",
         ],
     })
@@ -4397,7 +4399,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
 
 def _print_accumulation_summary(payload: Dict[str, Any]) -> None:
     print("=" * 112)
-    print("  主力资金雷达 · 六原始分吸筹总分权重实验 (accumulation)")
+    print("  主力资金雷达 · 七原始分吸筹总分权重实验 (accumulation)")
     rng = payload.get("date_range")
     print(f"  生成时间: {payload['generated_at']} · 候选龙头: {payload['candidate_count']}"
           f" · 截面: {payload.get('section_count', 0)} · 样本: {payload.get('sample_count', 0)}"
@@ -4632,7 +4634,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=MODES, default=DEFAULT_MODE,
         help="运行模式：ambush(默认,吸筹分+形态) / watch(实时监控) / "
              "verify(吸筹分回测) / patterns(形态预测力回测) / "
-             "distribution(出货分权重实验) / accumulation(六原始分吸筹总分权重实验) / "
+             "distribution(出货分权重实验) / accumulation(七原始分吸筹总分权重实验) / "
              "latent(潜伏妖股观察名单:左侧低位+安静+吸筹+妖股基因, 建议配 --pool hotmoney)",
     )
     parser.add_argument(

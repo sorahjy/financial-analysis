@@ -11,11 +11,14 @@ The optimizer deliberately separates two layers:
    excess return on the available recent window with risk, hit rate, and for
    short-term Dragon Tiger List picks, event-quality statistics.
 
-Run 1500 Optuna/TPE trials per strategy (long and short run in separate worker processes):
+Run 1500 Optuna/TPE trials per strategy (long, smallcap and short use separate worker processes):
     python3 -B stock_strategy_optimizer.py --iterations 1500
 
 Only re-optimize the short strategy after its universe changes:
     python3 -B stock_strategy_optimizer.py --strategy short --iterations 1500
+
+Only re-optimize the small-cap long-factor strategy:
+    python3 -B stock_strategy_optimizer.py --strategy smallcap --iterations 1500
 """
 
 from __future__ import annotations
@@ -57,10 +60,13 @@ from stock_advanced_strategies import (
     DATA_DIR,
     DEFAULT_CONFIG,
     LONG_FACTORS,
+    SMALLCAP_FACTORS,
+    SMALLCAP_UNIVERSE_VERSION,
     SHORT_FACTORS,
     SHORT_UNIVERSE_VERSION,
     apply_scores,
     build_long_candidates,
+    build_smallcap_candidates,
     build_short_candidates,
     clean_round,
     combined_recent_rows,
@@ -68,9 +74,11 @@ from stock_advanced_strategies import (
     direct_factor_score,
     first_not_none,
     load_segment_leader_codes,
+    load_hot_money_codes,
     load_cn_stock_index,
     load_fundamental_stocks,
     passes_long_hard_filters,
+    passes_smallcap_hard_filters,
     percentile_factor_scores,
     price_history_rows,
     rerank_scored,
@@ -80,6 +88,8 @@ from stock_advanced_strategies import (
 
 OUTPUT_FILE = DATA_DIR / "stock_strategy_optimization.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
+SMALLCAP_OUTPUT_FILE = DATA_DIR / "stock_strategy_smallcap_optimization.json"
+SMALLCAP_OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_smallcap_optimized_config.json"
 # 长线超额基准：沪深300 与 中证500 按日等权再平衡的混合指数（各占50%）。
 # 不直接用中证800：中证800按市值加权、前300只占权重大头，走势≈沪深300，体现不出中盘；
 # 50/50 等权混合让大盘与中盘平权，更贴合本策略选股域。
@@ -91,6 +101,7 @@ BENCHMARK_COMPONENTS = [
     ("510580", DATA_DIR / "csi500_etf_nav.json"),  # 中证500 ETF
 ]
 LONG_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_best_fold_paths.svg"
+SMALLCAP_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_smallcap_fold_paths.svg"
 DEFAULT_OPTIMIZATION_ITERATIONS = 1500
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
@@ -98,6 +109,10 @@ DEFAULT_OPTIMIZATION_ITERATIONS = 1500
 LONG_HOLD_CHOICES = [60]   # 长线持有期固定为60交易日
 LONG_FOLD_STEP_TD = 60     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
 LONG_MAX_LOOKBACK_TD = 2400
+# 小盘独立回测合同：近5年、每20日一折、持有20日，折之间首尾衔接。
+SMALLCAP_HOLD_CHOICES = [20]
+SMALLCAP_FOLD_STEP_TD = 20
+SMALLCAP_MAX_LOOKBACK_TD = 5 * 250
 LONG_COST = 0.004          # 单折买卖往返成本（佣金+冲击的粗略值）
 LONG_MIN_VALID_PICKS = 5   # 一折内至少几只持仓有价格数据才计入
 LONG_MIN_FOLDS = 16        # 有效折数下限，低于此的配置不参与选优(防少数折彩票配置)
@@ -114,6 +129,10 @@ LONG_FIXED_ZERO_WEIGHTS = {
     "industry_leadership",
 }
 LONG_SEARCHABLE_FACTORS = [f for f in LONG_FACTORS if f.key not in LONG_FIXED_ZERO_WEIGHTS]
+SMALLCAP_FIXED_ZERO_WEIGHTS = {"industry_leadership"}
+SMALLCAP_SEARCHABLE_FACTORS = [
+    f for f in SMALLCAP_FACTORS if f.key not in SMALLCAP_FIXED_ZERO_WEIGHTS
+]
 LONG_FIXED_MIN_MARKET_CAP_YI = 0
 LONG_FIXED_MIN_SCORE = 50
 # 去重叠/尾部稳健参数（针对"最差折超额差"专门加的口径）：
@@ -237,6 +256,22 @@ def long_optimizer_universe_codes(
     return codes, notes
 
 
+def smallcap_optimizer_universe_codes(
+    series: Dict[str, List[Dict[str, Any]]],
+    config: Dict[str, Any],
+) -> Tuple[set, List[str]]:
+    """小盘优化股票池：足够长日线 ∩ 当前游资小盘池。"""
+    _ = config
+    min_hist = max(SMALLCAP_HOLD_CHOICES) + 260
+    deep_codes = {code for code, rows in series.items() if len(rows) >= min_hist}
+    hot_money_codes = load_hot_money_codes()
+    codes = deep_codes & hot_money_codes
+    return codes, [
+        "小盘优化候选池复用短线/游资雷达的 is_hot_money=1 成员："
+        f"{len(hot_money_codes)} 只，其中 {len(codes)} 只具备至少 {min_hist} 行历史。"
+    ]
+
+
 def long_anchor_offsets(hold_td: int) -> List[int]:
     """折锚点：距最新交易日的偏移（交易日数），保证持有期之后仍有出场价。"""
     return list(range(hold_td + 1, LONG_MAX_LOOKBACK_TD, LONG_FOLD_STEP_TD))
@@ -246,6 +281,15 @@ def long_partial_anchor_offsets(hold_td: int) -> List[int]:
     """走势图专用：最新端尚未走满持有期的锚点，不参与优化选优。"""
     first = max(1, hold_td + 1 - LONG_FOLD_STEP_TD)
     return list(range(first, 0, -LONG_FOLD_STEP_TD))
+
+
+def smallcap_anchor_offsets(hold_td: int) -> List[int]:
+    return list(range(hold_td + 1, SMALLCAP_MAX_LOOKBACK_TD, SMALLCAP_FOLD_STEP_TD))
+
+
+def smallcap_partial_anchor_offsets(hold_td: int) -> List[int]:
+    first = max(1, hold_td + 1 - SMALLCAP_FOLD_STEP_TD)
+    return list(range(first, 0, -SMALLCAP_FOLD_STEP_TD))
 
 
 def fold_calendar(series: Dict[str, List[Dict[str, Any]]]) -> List[str]:
@@ -958,9 +1002,11 @@ def prepare_candidate_factor_scores(
     return prepared
 
 
-def score_prepared_long_candidates(
+def _score_prepared_long_style_candidates(
     prepared: List[Dict[str, Any]],
     config: Dict[str, Any],
+    specs: List[Any],
+    hard_filter,
     include_details: bool = False,
     *,
     entry_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
@@ -971,8 +1017,8 @@ def score_prepared_long_candidates(
     top_n = max(0, int(first_not_none(config.get("top_n"), 30)))
 
     # 权重向量(config 级，所有股票相同)：缺失/脏值→默认权重，负→0。等价原逐因子 weight 逻辑。
-    w = np.empty(len(LONG_FACTORS), dtype=np.float64)
-    for j, spec in enumerate(LONG_FACTORS):
+    w = np.empty(len(specs), dtype=np.float64)
+    for j, spec in enumerate(specs):
         v = safe_float(weights.get(spec.key))
         w[j] = max(0.0, v if v is not None else spec.default_weight)
     weight_sum = float(w.sum())
@@ -981,11 +1027,11 @@ def score_prepared_long_candidates(
     scored = []
     if not include_details:
         # 主路径(评估)：totals = (因子分矩阵 @ 权重) / weight_sum，numpy 向量化释放 GIL；过滤逐股保留。
-        matrix, items = _prepared_matrix(prepared)
+        matrix, items = _prepared_matrix(prepared, specs)
         with np.errstate(all="ignore"):   # 被硬过滤股票的 nan/inf/overflow 运算噪声;它们随后过滤掉,结果同原标量版
             totals = (matrix @ w) / weight_sum if weight_sum > 0 else np.zeros(len(items))
         for i, item in enumerate(items):
-            if not passes_long_hard_filters(item, config):
+            if not hard_filter(item, config):
                 continue
             if not has_trade_on_date(entry_series, item.get("code"), as_of):
                 continue
@@ -997,7 +1043,7 @@ def score_prepared_long_candidates(
         # 明细路径(repr 选股，少量调用)：逐因子保留 factor_scores 明细。
         for row in prepared:
             item = row["item"]
-            if not passes_long_hard_filters(item, config):
+            if not hard_filter(item, config):
                 continue
             if not has_trade_on_date(entry_series, item.get("code"), as_of):
                 continue
@@ -1005,7 +1051,7 @@ def score_prepared_long_candidates(
             prepared_scores = row["scores"]
             factor_scores = {}
             weighted_sum = 0.0
-            for j, spec in enumerate(LONG_FACTORS):
+            for j, spec in enumerate(specs):
                 weight = float(w[j])
                 score = prepared_scores.get(spec.key, spec.missing_score)
                 if weight > 0:
@@ -1033,6 +1079,34 @@ def score_prepared_long_candidates(
             row["factor_scores"] = factor_scores
         result.append(row)
     return result
+
+
+def score_prepared_long_candidates(
+    prepared: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    include_details: bool = False,
+    *,
+    entry_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    as_of: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    return _score_prepared_long_style_candidates(
+        prepared, config, LONG_FACTORS, passes_long_hard_filters, include_details,
+        entry_series=entry_series, as_of=as_of,
+    )
+
+
+def score_prepared_smallcap_candidates(
+    prepared: List[Dict[str, Any]],
+    config: Dict[str, Any],
+    include_details: bool = False,
+    *,
+    entry_series: Optional[Dict[str, List[Dict[str, Any]]]] = None,
+    as_of: Optional[str] = None,
+) -> List[Dict[str, Any]]:
+    return _score_prepared_long_style_candidates(
+        prepared, config, SMALLCAP_FACTORS, passes_smallcap_hard_filters, include_details,
+        entry_series=entry_series, as_of=as_of,
+    )
 
 
 def score_long_candidates(
@@ -1266,6 +1340,22 @@ def constrain_long_search_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     return cfg
 
 
+def constrain_smallcap_search_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
+    weights = cfg.setdefault("weights", {})
+    for key in SMALLCAP_FIXED_ZERO_WEIGHTS:
+        weights[key] = 0.0
+    # 防止外部旧配置把小盘明确排除的指数/市值因子重新写入。
+    allowed = {factor.key for factor in SMALLCAP_FACTORS}
+    cfg["weights"] = {key: value for key, value in weights.items() if key in allowed}
+    cfg["min_score"] = LONG_FIXED_MIN_SCORE
+    cfg["top_n"] = DEFAULT_CONFIG["smallcap"]["top_n"]
+    # 小盘池本身已经限定为游资小盘成员；历史高点回撤会把成员池再次压缩并引入
+    # regime 选择偏差，因此优化器固定关闭，不作为随机/Optuna 搜索维度。
+    cfg["require_high_drawdown"] = False
+    cfg["min_high_drawdown_pct"] = DEFAULT_CONFIG["smallcap"]["min_high_drawdown_pct"]
+    return cfg
+
+
 def set_long_high_drawdown_filter(cfg: Dict[str, Any], threshold_pct: Any) -> None:
     """设置历史高点回撤过滤阈值；开关由 require_high_drawdown 独立搜索。"""
     threshold = safe_float(threshold_pct)
@@ -1289,6 +1379,19 @@ def random_long_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     return constrain_long_search_config(cfg)
 
 
+def random_smallcap_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
+    cfg = copy.deepcopy(DEFAULT_CONFIG["smallcap"])
+    floors = {key: value for key, value in LONG_WEIGHT_FLOORS.items() if key in cfg["weights"]}
+    cfg["weights"] = mutate_weights(
+        rng,
+        cfg["weights"],
+        [f.key for f in SMALLCAP_SEARCHABLE_FACTORS],
+        iteration,
+        floors=floors,
+    )
+    return constrain_smallcap_search_config(cfg)
+
+
 def random_short_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     cfg = copy.deepcopy(DEFAULT_CONFIG["short"])
     cfg["weights"] = mutate_weights(rng, cfg["weights"], [f.key for f in SHORT_FACTORS], iteration)
@@ -1308,6 +1411,18 @@ def broad_long_candidate_config() -> Dict[str, Any]:
         "min_market_cap_yi": 0,
         "require_csi300": False,
         # broad 候选池不提前按高点回撤筛选；raw factor 由候选构建阶段保留，供 trial 硬过滤使用。
+        "require_high_drawdown": False,
+        "min_high_drawdown_pct": 0,
+        "min_score": 0,
+        "top_n": 80,
+    })
+    return broad_cfg
+
+
+def broad_smallcap_candidate_config() -> Dict[str, Any]:
+    broad_cfg = copy.deepcopy(DEFAULT_CONFIG["smallcap"])
+    broad_cfg.update({
+        "exclude_st": False,
         "require_high_drawdown": False,
         "min_high_drawdown_pct": 0,
         "min_score": 0,
@@ -1354,6 +1469,16 @@ def _suggest_long_config(trial) -> Tuple[Dict[str, Any], int]:
     return constrain_long_search_config(cfg), hold_td
 
 
+def _suggest_smallcap_config(trial) -> Tuple[Dict[str, Any], int]:
+    cfg = copy.deepcopy(DEFAULT_CONFIG["smallcap"])
+    cfg["weights"] = {
+        f.key: round(trial.suggest_float(f"w_{f.key}", *_long_weight_bounds(f.key)), 3)
+        for f in SMALLCAP_SEARCHABLE_FACTORS
+    }
+    hold_td = trial.suggest_categorical("hold_td", SMALLCAP_HOLD_CHOICES)
+    return constrain_smallcap_search_config(cfg), hold_td
+
+
 def _default_long_params() -> Dict[str, Any]:
     base = DEFAULT_CONFIG["long"]
     base_weights = base.get("weights") or {}
@@ -1364,6 +1489,19 @@ def _default_long_params() -> Dict[str, Any]:
     params["require_high_drawdown"] = bool(base.get("require_high_drawdown", False))
     params["min_high_drawdown_pct"] = _nearest_choice(base.get("min_high_drawdown_pct"), LONG_HIGH_DD_PCT_CHOICES)
     params["hold_td"] = LONG_HOLD_CHOICES[0]
+    return params
+
+
+def _default_smallcap_params() -> Dict[str, Any]:
+    base = DEFAULT_CONFIG["smallcap"]
+    base_weights = base.get("weights") or {}
+    params: Dict[str, Any] = {}
+    for f in SMALLCAP_SEARCHABLE_FACTORS:
+        low, high = _long_weight_bounds(f.key)
+        params[f"w_{f.key}"] = round(
+            min(max(safe_float(base_weights.get(f.key)) or 0.0, low), high), 3
+        )
+    params["hold_td"] = SMALLCAP_HOLD_CHOICES[0]
     return params
 
 
@@ -1414,7 +1552,7 @@ def advance_progress(progress) -> None:
         progress.update(1)
 
 
-# 单个 Optuna study 内部 trial 并行度默认 1。外层长线/短线用独立子进程并行；
+# 单个 Optuna study 内部 trial 并行度默认 1。外层长线/小盘/短线用独立子进程并行；
 # study 内部实测多线程是负收益，故只向量化(单核提速)、默认不再拆 trial：
 #   ① 预热以财报计算(纯 python)为主=GIL-bound，ThreadPool 并行因 GIL 争用反而更慢(53.7s vs 串行23.2s)，故预热串行；
 #   ② optuna n_jobs>1 多线程并发退化 TPE 序贯采样、降搜索质量(实测 8 trials best -7.69→-13.6)。
@@ -1470,37 +1608,59 @@ def _run_config_search(
     return f"参数搜索：随机搜索回退（{iterations} 次，未检测到 optuna）。"
 
 
-def optimize_long(iterations: int, rng: random.Random, progress_position: int = 0) -> Dict[str, Any]:
-    broad_cfg = broad_long_candidate_config()
+def _optimize_long_style(
+    strategy: str,
+    iterations: int,
+    rng: random.Random,
+    progress_position: int,
+    *,
+    label: str,
+    factors: List[Any],
+    broad_cfg: Dict[str, Any],
+    universe_codes_fn,
+    build_candidates_fn,
+    score_prepared_fn,
+    suggest_fn,
+    default_params: Dict[str, Any],
+    random_config_fn,
+    strategy_notes: List[str],
+) -> Dict[str, Any]:
+    """长线与小盘共用的 PIT 多折、风险目标与 Optuna 搜索流程。"""
     series = full_series_map()
     price_health = ensure_long_price_history(series)
     cal = fold_calendar(series)
     cal_pos = {date: idx for idx, date in enumerate(cal)}  # as_of -> 交易日序号，供去相关/隔离带用
     benchmark_series, benchmark_notes = load_benchmark_series()
-    # PIT 候选只在有足够多年日线的票上建（快且干净）；最长持有 + 1年回看
-    deep_codes, universe_notes = long_optimizer_universe_codes(series, broad_cfg)
+    deep_codes, universe_notes = universe_codes_fn(series, broad_cfg)
 
     # 折偏移 → PIT 时点日期（全市场日历倒数第 offset 个交易日）。[0] 最近、[-1] 最旧。
+    hold_choices = SMALLCAP_HOLD_CHOICES if strategy == "smallcap" else LONG_HOLD_CHOICES
+    anchor_offsets_fn = smallcap_anchor_offsets if strategy == "smallcap" else long_anchor_offsets
+    fold_step_td = SMALLCAP_FOLD_STEP_TD if strategy == "smallcap" else LONG_FOLD_STEP_TD
+    max_lookback_td = SMALLCAP_MAX_LOOKBACK_TD if strategy == "smallcap" else LONG_MAX_LOOKBACK_TD
     fold_dates_by_hold = {
-        h: [cal[-off] for off in long_anchor_offsets(h) if off <= len(cal)]
-        for h in LONG_HOLD_CHOICES
+        h: [cal[-off] for off in anchor_offsets_fn(h) if off <= len(cal)]
+        for h in hold_choices
     }
 
     pit_cache: Dict[str, List[Dict[str, Any]]] = {}       # as_of -> PIT broad 候选预评分
     fold_stats_cache: Dict[Tuple[str, int, Tuple[str, ...]], Optional[Dict[str, float]]] = {}
     notes: List[str] = list(universe_notes)
+    candidate_notes_loaded = False
     _notes_lock = threading.Lock()
     _fold_stats_lock = threading.Lock()
 
     def get_pit(as_of: str) -> List[Dict[str, Any]]:
+        nonlocal candidate_notes_loaded
         if as_of not in pit_cache:
-            cands, nts = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
-            pit = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-            _prepared_matrix(pit)              # 预构因子分矩阵(预热期建好，trial 期只读)
+            cands, nts = build_candidates_fn(broad_cfg, as_of=as_of, universe=deep_codes)
+            pit = prepare_candidate_factor_scores(cands, factors)
+            _prepared_matrix(pit, factors)     # 预构因子分矩阵(预热期建好，trial 期只读)
             pit_cache[as_of] = pit             # 末尾赋值；并发同 as_of 最多重复算(幂等)
             with _notes_lock:
-                if not notes:
+                if not candidate_notes_loaded:
                     notes.extend(nts)
+                    candidate_notes_loaded = True
         return pit_cache[as_of]
 
     def get_fold_stats(
@@ -1522,11 +1682,11 @@ def optimize_long(iterations: int, rng: random.Random, progress_position: int = 
     for _as_of in sorted({d for dates in fold_dates_by_hold.values() for d in dates}):
         get_pit(_as_of)
 
-    def evaluate_long(cfg: Dict[str, Any], hold_td: int) -> Tuple[float, Dict[str, Any]]:
+    def evaluate(cfg: Dict[str, Any], hold_td: int) -> Tuple[float, Dict[str, Any]]:
         fold_dates = fold_dates_by_hold[hold_td]
         pairs: List[Dict[str, Any]] = []
         for as_of in fold_dates:
-            picks = score_prepared_long_candidates(
+            picks = score_prepared_fn(
                 get_pit(as_of), cfg, entry_series=series, as_of=as_of
             )  # 该折用 PIT 因子重新选股，并要求入场日真实可交易
             fold_stats = get_fold_stats(picks, as_of, hold_td)
@@ -1547,7 +1707,7 @@ def optimize_long(iterations: int, rng: random.Random, progress_position: int = 
             objective = adjusted_obj
         # 报告用最近一折的选股（最接近实盘当下）
         repr_picks = (
-            score_prepared_long_candidates(
+            score_prepared_fn(
                 get_pit(fold_dates[0]), cfg, entry_series=series, as_of=fold_dates[0]
             )
             if fold_dates else []
@@ -1569,7 +1729,7 @@ def optimize_long(iterations: int, rng: random.Random, progress_position: int = 
     trace_lock = threading.Lock()
 
     def _record(cfg: Dict[str, Any], hold_td: int) -> float:
-        objective, row = evaluate_long(cfg, hold_td)
+        objective, row = evaluate(cfg, hold_td)
         with trace_lock:
             row["iteration"] = len(trace) + 1
             trace.append(row)
@@ -1577,40 +1737,78 @@ def optimize_long(iterations: int, rng: random.Random, progress_position: int = 
 
     search_note = _run_config_search(
         iterations, rng,
-        suggest=_suggest_long_config,
-        default_params=_default_long_params(),
+        suggest=suggest_fn,
+        default_params=default_params,
         random_config=lambda i: (
-            random_long_config(rng, i),
-            rng.choice(LONG_HOLD_CHOICES) if i else LONG_HOLD_CHOICES[0],
+            random_config_fn(rng, i),
+            rng.choice(hold_choices) if i else hold_choices[0],
         ),
         record=_record,
-        progress_label="长线参数搜索",
+        progress_label=f"{label}参数搜索",
         n_jobs=OPTUNA_TRIAL_JOBS,
         progress_position=progress_position,
     )
     best = select_best_long_trace(trace)
     return {
-        "strategy": "long",
+        "strategy": strategy,
         "iterations": iterations,
         "candidate_count": len(deep_codes),
         "price_history_health": price_health,
         "notes": [search_note] + benchmark_notes + notes + [
-            "PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，且入选前要求 as_of 当天有真实交易行；固定持有60交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
-            "训练/验证按折随机打乱后切分(~60/40)，按用户口径取消时间分块与隔离带——训练/验证折时间混合、各覆盖全部regime；当前持有期=起点间隔=60个交易日，完整折首尾衔接，不再有旧版125日持有窗口造成的重叠泄漏。",
+            f"PIT 滚动前推回测：每折以全市场日历倒数第N个交易日为时点，财报(按法定披露截止日)/价格/估值/分红全部按当时可见重算因子后再选股，且入选前要求 as_of 当天有真实交易行；固定持有{hold_choices[0]}交易日，组合等权收益-成本-沪深300与中证500按日等权混合(各50%)累计净值基准。",
+            f"训练/验证按折随机打乱后切分(~60/40)；当前持有期={hold_choices[0]}、起点间隔={fold_step_td}个交易日，完整折首尾衔接；最多回看约{max_lookback_td}个交易日。",
             "折样本采用等权口径：最旧折到最新折均为 1.0x，所有历史折在均值、命中率、CVaR、Sortino 和回撤惩罚中权重一致。",
-            "完整折每60交易日取一个起点、持有60交易日；去相关子样本(indep_folds)逻辑仍保留，用于未来若持有期重新大于起点间隔时稳健计算 worst/CVaR/Sortino。",
-            "长线选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR(最差20%折均值)、持有期组合回撤、Sortino下行信息比，并对最差折跌破-15%、最深折回撤超45%、训练/验证年化超额差、有效折数不足、验证折为负分别惩罚；命中率权重已下调。",
-            f"③ 风险预算保底：搜索不再把低波动/低负债/保守投资因子权重清零(下限0.30/0.20/0.20)。市值/指数成分相关权重与市值下限固定为0，不参与搜索；长线 min_score 固定为 {LONG_FIXED_MIN_SCORE}，不参与搜索；高点回撤(抄底)过滤开关参与搜索，开启时 min_high_drawdown_pct 在40~70%搜优。",
+            f"完整折每{fold_step_td}交易日取一个起点、持有{hold_choices[0]}交易日；去相关子样本(indep_folds)逻辑保留。",
+            f"{label}选优目标：训练目标分×0.55+验证×0.45；目标显式纳入 CVaR、持有期组合回撤和 Sortino 下行信息比，并对尾部风险、训练/验证差异和有效折数不足实施惩罚。",
+            f"风险预算保底：低波动/低负债/保守投资因子权重下限为0.30/0.20/0.20；min_score 固定为 {LONG_FIXED_MIN_SCORE}；" + ("小盘高点回撤过滤固定关闭且不参与搜索。" if strategy == "smallcap" else "高点回撤过滤开关与40~70%阈值参与搜索。"),
             "max_drawdown_pct 为各折持有期内按基准交易日历逐日估值的组合路径最大回撤(取最深折)；avg_fold_max_drawdown_pct 为各折回撤均值；worst_fold_excess_pct 为全部折最差单折超额，tail_cvar_excess_pct 为尾部最差20%折的平均超额。",
-            "残留前视：沪深300成分与质押用当前快照(无历史数据)；优化器已将 min_market_cap_yi 以及 csi300_current/csi300_persistence/market_cap/size_reversal/industry_leadership 权重固定为0且不参与搜索，并且不再搜索 require_csi300 或成分稳定硬过滤；候选池显式限制为 stock_crawl_segment_leaders.py 生成的 SW3 细分龙头池，再取其中有多年日线的票。",
-        ],
+        ] + strategy_notes,
         "best": best,
         "top_iterations": sorted(trace, key=lambda x: x["objective"], reverse=True)[:10],
         "convergence": convergence_summary(trace, iterations),
     }
 
 
-def optimize_short(iterations: int, rng: random.Random, progress_position: int = 1) -> Dict[str, Any]:
+def optimize_long(iterations: int, rng: random.Random, progress_position: int = 0) -> Dict[str, Any]:
+    return _optimize_long_style(
+        "long", iterations, rng, progress_position,
+        label="长线",
+        factors=LONG_FACTORS,
+        broad_cfg=broad_long_candidate_config(),
+        universe_codes_fn=long_optimizer_universe_codes,
+        build_candidates_fn=build_long_candidates,
+        score_prepared_fn=score_prepared_long_candidates,
+        suggest_fn=_suggest_long_config,
+        default_params=_default_long_params(),
+        random_config_fn=random_long_config,
+        strategy_notes=[
+            "长线候选池限定为 SW3 细分龙头池；市值/指数成分相关信号及行业规模地位在优化中固定为0。",
+            "残留前视：沪深300成分与质押使用当前快照。",
+        ],
+    )
+
+
+def optimize_smallcap(iterations: int, rng: random.Random, progress_position: int = 1) -> Dict[str, Any]:
+    return _optimize_long_style(
+        "smallcap", iterations, rng, progress_position,
+        label="小盘",
+        factors=SMALLCAP_FACTORS,
+        broad_cfg=broad_smallcap_candidate_config(),
+        universe_codes_fn=smallcap_optimizer_universe_codes,
+        build_candidates_fn=build_smallcap_candidates,
+        score_prepared_fn=score_prepared_smallcap_candidates,
+        suggest_fn=_suggest_smallcap_config,
+        default_params=_default_smallcap_params(),
+        random_config_fn=random_smallcap_config,
+        strategy_notes=[
+            "小盘股票池严格复用短线/游资雷达当前 is_hot_money=1 成员；当前成员回看历史存在幸存者偏差。",
+            "小盘不展示、不评分、不搜索 csi300_current、csi300_persistence、market_cap、size_reversal，也不使用沪深300或总市值硬约束。",
+            "行业规模地位沿用长线 optimizer 口径，权重固定为0。",
+        ],
+    )
+
+
+def optimize_short(iterations: int, rng: random.Random, progress_position: int = 2) -> Dict[str, Any]:
     broad_cfg = copy.deepcopy(DEFAULT_CONFIG["short"])
     broad_cfg.update({
         "min_lhb_count": 0,
@@ -1782,6 +1980,7 @@ def write_long_fold_paths_svg(
     hold_td: int,
     holding_top_n: Optional[int] = None,
     title: str = "长线最优参数各折走势小图矩阵",
+    fold_interval_td: int = LONG_FOLD_STEP_TD,
 ) -> Dict[str, Any]:
     if not paths:
         raise ValueError("没有可用于画图的有效长线回测折。")
@@ -1923,7 +2122,7 @@ def write_long_fold_paths_svg(
             72,
             (
                 f"{fold_count_text} · 持有 {hold_td} 个交易日 · "
-                f"每 {LONG_FOLD_STEP_TD} 个交易日取一个起点 · "
+                f"每 {fold_interval_td} 个交易日取一个起点 · "
                 "每个小图独立纵轴 · "
                 f"生成 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
             ),
@@ -2163,7 +2362,7 @@ def write_long_fold_paths_svg(
         "partial_folds": len(partial_paths),
         "displayed_folds": len(paths),
         "hold_td": hold_td,
-        "fold_interval_td": LONG_FOLD_STEP_TD,
+        "fold_interval_td": fold_interval_td,
         "replacement_top_n": replacement_top_n,
         "latest_topn_replaced_count": topn_replacement_counts[-1]["replaced_count"] if topn_replacement_counts else None,
         "topn_replacement_counts": topn_replacement_counts,
@@ -2184,24 +2383,36 @@ def write_long_fold_paths_svg(
     }
 
 
-def create_long_fold_path_chart(
+def _create_long_style_fold_path_chart(
     cfg: Dict[str, Any],
     output_file: Path,
     hold_td: Optional[int] = None,
     *,
     title: str = "长线当前参数各折走势小图矩阵",
+    strategy: str = "long",
 ) -> Dict[str, Any]:
-    hold_td = int(hold_td or LONG_HOLD_CHOICES[0])
+    if strategy not in {"long", "smallcap"}:
+        raise ValueError(f"不支持的长线风格策略: {strategy}")
+    is_smallcap = strategy == "smallcap"
+    hold_choices = SMALLCAP_HOLD_CHOICES if is_smallcap else LONG_HOLD_CHOICES
+    hold_td = int(hold_td or hold_choices[0])
     series = full_series_map()
     cal = fold_calendar(series)
     benchmark_series, _ = load_benchmark_series()
     if not benchmark_series:
         raise RuntimeError(f"缺少{BENCHMARK_NAME}ETF基准序列，无法生成走势图。")
 
-    broad_cfg = broad_long_candidate_config()
-    deep_codes, _ = long_optimizer_universe_codes(series, broad_cfg)
-    fold_dates = [cal[-off] for off in long_anchor_offsets(hold_td) if off <= len(cal)]
-    partial_fold_dates = [cal[-off] for off in long_partial_anchor_offsets(hold_td) if off <= len(cal)]
+    broad_cfg = broad_smallcap_candidate_config() if is_smallcap else broad_long_candidate_config()
+    universe_fn = smallcap_optimizer_universe_codes if is_smallcap else long_optimizer_universe_codes
+    build_fn = build_smallcap_candidates if is_smallcap else build_long_candidates
+    factors = SMALLCAP_FACTORS if is_smallcap else LONG_FACTORS
+    score_fn = score_prepared_smallcap_candidates if is_smallcap else score_prepared_long_candidates
+    deep_codes, _ = universe_fn(series, broad_cfg)
+    anchor_fn = smallcap_anchor_offsets if is_smallcap else long_anchor_offsets
+    partial_anchor_fn = smallcap_partial_anchor_offsets if is_smallcap else long_partial_anchor_offsets
+    fold_interval_td = SMALLCAP_FOLD_STEP_TD if is_smallcap else LONG_FOLD_STEP_TD
+    fold_dates = [cal[-off] for off in anchor_fn(hold_td) if off <= len(cal)]
+    partial_fold_dates = [cal[-off] for off in partial_anchor_fn(hold_td) if off <= len(cal)]
     paths: List[Dict[str, Any]] = []
 
     def attach_holdings(path: Dict[str, Any], picks: List[Dict[str, Any]]) -> Dict[str, Any]:
@@ -2216,18 +2427,18 @@ def create_long_fold_path_chart(
         return path
 
     for as_of in fold_dates:
-        cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
-        prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-        picks = score_prepared_long_candidates(prepared, cfg, entry_series=series, as_of=as_of)
+        cands, _ = build_fn(broad_cfg, as_of=as_of, universe=deep_codes)
+        prepared = prepare_candidate_factor_scores(cands, factors)
+        picks = score_fn(prepared, cfg, entry_series=series, as_of=as_of)
         path = portfolio_fold_path(picks, series, benchmark_series, as_of, hold_td)
         if path is None:
             continue
         paths.append(attach_holdings(path, picks))
 
     for as_of in partial_fold_dates:
-        cands, _ = build_long_candidates(broad_cfg, as_of=as_of, universe=deep_codes)
-        prepared = prepare_candidate_factor_scores(cands, LONG_FACTORS)
-        picks = score_prepared_long_candidates(prepared, cfg, entry_series=series, as_of=as_of)
+        cands, _ = build_fn(broad_cfg, as_of=as_of, universe=deep_codes)
+        prepared = prepare_candidate_factor_scores(cands, factors)
+        picks = score_fn(prepared, cfg, entry_series=series, as_of=as_of)
         path = portfolio_fold_path(
             picks, series, benchmark_series, as_of, hold_td, allow_partial=True
         )
@@ -2236,12 +2447,50 @@ def create_long_fold_path_chart(
         path["partial"] = True
         paths.append(attach_holdings(path, picks))
 
-    return write_long_fold_paths_svg(
+    chart = write_long_fold_paths_svg(
         paths,
         output_file,
         hold_td,
         holding_top_n=cfg.get("top_n"),
         title=title,
+        fold_interval_td=fold_interval_td,
+    )
+    holding_codes = {
+        str(holding.get("code") or "").zfill(6)
+        for path in paths
+        for holding in path.get("holdings", [])
+        if holding.get("code")
+    }
+    invalid_holdings = holding_codes - deep_codes
+    if invalid_holdings:
+        raise RuntimeError(
+            f"{strategy} 回测持仓越出候选池: {sorted(invalid_holdings)[:10]}"
+        )
+    chart.update({
+        "strategy": strategy,
+        "universe": "is_hot_money=1" if is_smallcap else "is_leader=1",
+        "eligible_universe_count": len(deep_codes),
+        "holding_code_count": len(holding_codes),
+        "holding_pool_audit_passed": True,
+    })
+    return chart
+
+
+def create_long_fold_path_chart(
+    cfg: Dict[str, Any], output_file: Path, hold_td: Optional[int] = None, *,
+    title: str = "长线当前参数各折走势小图矩阵",
+) -> Dict[str, Any]:
+    return _create_long_style_fold_path_chart(
+        cfg, output_file, hold_td, title=title, strategy="long"
+    )
+
+
+def create_smallcap_fold_path_chart(
+    cfg: Dict[str, Any], output_file: Path, hold_td: Optional[int] = None, *,
+    title: str = "小盘当前参数各折走势小图矩阵",
+) -> Dict[str, Any]:
+    return _create_long_style_fold_path_chart(
+        cfg, output_file, hold_td, title=title, strategy="smallcap"
     )
 
 
@@ -2252,6 +2501,16 @@ def create_best_long_fold_path_chart(long_result: Dict[str, Any]) -> Dict[str, A
         LONG_FOLD_PATH_CHART_FILE,
         int(best["hold_td"]),
         title="长线最优参数各折走势小图矩阵",
+    )
+
+
+def create_best_smallcap_fold_path_chart(smallcap_result: Dict[str, Any]) -> Dict[str, Any]:
+    best = smallcap_result["best"]
+    return create_smallcap_fold_path_chart(
+        best["config"],
+        SMALLCAP_FOLD_PATH_CHART_FILE,
+        int(best["hold_td"]),
+        title="小盘最优参数各折走势小图矩阵",
     )
 
 
@@ -2282,6 +2541,8 @@ def _run_strategy_optimizer(
     rng = random.Random(seed)
     if strategy == "long":
         return optimize_long(iterations, rng, progress_position)
+    if strategy == "smallcap":
+        return optimize_smallcap(iterations, rng, progress_position)
     if strategy == "short":
         return optimize_short(iterations, rng, progress_position)
     raise ValueError(f"unknown strategy: {strategy}")
@@ -2293,20 +2554,22 @@ def run_optimization(
     persist: bool = True,
     strategies: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
-    strategy_names = tuple(dict.fromkeys(strategies or ("long", "short")))
-    invalid = [name for name in strategy_names if name not in {"long", "short"}]
+    strategy_names = tuple(dict.fromkeys(strategies or ("long", "smallcap", "short")))
+    invalid = [name for name in strategy_names if name not in {"long", "smallcap", "short"}]
     if invalid or not strategy_names:
         raise ValueError(f"unsupported strategies: {invalid or strategy_names}")
     master_rng = random.Random(seed)
     strategy_seeds = {
         "long": master_rng.randrange(2 ** 31),
+        "smallcap": master_rng.randrange(2 ** 31),
         "short": master_rng.randrange(2 ** 31),
     }
     started = datetime.now()
     strategy_results: Dict[str, Dict[str, Any]] = {}
     all_jobs = {
         "long": (strategy_seeds["long"], 0),
-        "short": (strategy_seeds["short"], 1),
+        "smallcap": (strategy_seeds["smallcap"], 1),
+        "short": (strategy_seeds["short"], 2),
     }
     jobs = {name: all_jobs[name] for name in strategy_names}
     if len(jobs) == 1:
@@ -2350,46 +2613,95 @@ def run_optimization(
             result["long"].setdefault("notes", []).append(
                 f"最优参数每折走势图生成失败：{exc}"
             )
+    if persist and "smallcap" in strategy_results:
+        try:
+            chart = create_best_smallcap_fold_path_chart(result["smallcap"])
+            result["smallcap"]["best_fold_path_chart"] = chart
+            result["smallcap"].setdefault("notes", []).append(
+                f"最优参数每折走势图已生成：{chart['file']}。"
+            )
+        except Exception as exc:
+            result["smallcap"].setdefault("notes", []).append(
+                f"最优参数每折走势图生成失败：{exc}"
+            )
     result["elapsed_seconds"] = round((datetime.now() - started).total_seconds(), 3)
     if persist:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
-        persisted_result: Dict[str, Any] = {}
-        if len(strategy_names) == 1 and OUTPUT_FILE.exists():
-            try:
-                previous = json.loads(OUTPUT_FILE.read_text(encoding="utf-8"))
-                if isinstance(previous, dict):
-                    persisted_result.update(previous)
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-        persisted_result.update(result)
-        with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
-            json.dump(persisted_result, fp, ensure_ascii=False, indent=2)
+        standard_names = [name for name in strategy_names if name in {"long", "short"}]
+        if standard_names:
+            persisted_result: Dict[str, Any] = {}
+            if len(standard_names) == 1 and OUTPUT_FILE.exists():
+                try:
+                    previous = json.loads(OUTPUT_FILE.read_text(encoding="utf-8"))
+                    if isinstance(previous, dict):
+                        persisted_result.update(previous)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            standard_payload = {
+                key: value for key, value in result.items() if key != "smallcap"
+            }
+            standard_payload["optimized_strategies"] = standard_names
+            standard_payload["strategy_seeds"] = {
+                name: strategy_seeds[name] for name in standard_names
+            }
+            persisted_result.update(standard_payload)
+            with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
+                json.dump(persisted_result, fp, ensure_ascii=False, indent=2)
 
-        optimized_config: Dict[str, Any] = {}
-        if len(strategy_names) == 1 and OPTIMIZED_CONFIG_FILE.exists():
-            try:
-                previous = json.loads(OPTIMIZED_CONFIG_FILE.read_text(encoding="utf-8"))
-                if isinstance(previous, dict):
-                    optimized_config.update(previous)
-            except (OSError, ValueError, json.JSONDecodeError):
-                pass
-        optimized_config.update({
-            "generated_at": result["generated_at"],
-            "iterations_per_strategy": iterations,
-            "optimized_strategies": list(strategy_names),
-            "seed": seed,
-            "strategy_seeds": result.get("strategy_seeds", {}),
-            "caveat": "基于当前可用的本地/代理数据优化；刷新历史价格或短线信号快照后建议重新运行。",
-        })
-        if "short" in strategy_results:
-            optimized_config["short_universe_version"] = SHORT_UNIVERSE_VERSION
-        saved_config = optimized_config.setdefault("config", {})
-        saved_scores = optimized_config.setdefault("scores", {})
-        for name, section in strategy_results.items():
-            saved_config[name] = section["best"]["config"]
-            saved_scores[f"{name}_objective"] = section["best"]["objective"]
-        with open(OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
-            json.dump(optimized_config, fp, ensure_ascii=False, indent=2)
+            optimized_config: Dict[str, Any] = {}
+            if len(standard_names) == 1 and OPTIMIZED_CONFIG_FILE.exists():
+                try:
+                    previous = json.loads(OPTIMIZED_CONFIG_FILE.read_text(encoding="utf-8"))
+                    if isinstance(previous, dict):
+                        optimized_config.update(previous)
+                except (OSError, ValueError, json.JSONDecodeError):
+                    pass
+            optimized_config.update({
+                "generated_at": result["generated_at"],
+                "iterations_per_strategy": iterations,
+                "optimized_strategies": standard_names,
+                "seed": seed,
+                "strategy_seeds": {
+                    name: strategy_seeds[name] for name in standard_names
+                },
+                "caveat": "基于当前可用的本地/代理数据优化；刷新历史价格或短线信号快照后建议重新运行。",
+            })
+            if "short" in strategy_results:
+                optimized_config["short_universe_version"] = SHORT_UNIVERSE_VERSION
+            saved_config = optimized_config.setdefault("config", {})
+            saved_scores = optimized_config.setdefault("scores", {})
+            for name in standard_names:
+                section = strategy_results[name]
+                saved_config[name] = section["best"]["config"]
+                saved_scores[f"{name}_objective"] = section["best"]["objective"]
+            with open(OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
+                json.dump(optimized_config, fp, ensure_ascii=False, indent=2)
+
+        if "smallcap" in strategy_results:
+            smallcap_section = strategy_results["smallcap"]
+            smallcap_report = {
+                key: value for key, value in result.items()
+                if key not in {"long", "short"}
+            }
+            smallcap_report["optimized_strategies"] = ["smallcap"]
+            smallcap_report["strategy_seeds"] = {
+                "smallcap": strategy_seeds["smallcap"]
+            }
+            with open(SMALLCAP_OUTPUT_FILE, "w", encoding="utf-8") as fp:
+                json.dump(smallcap_report, fp, ensure_ascii=False, indent=2)
+            smallcap_config = {
+                "generated_at": result["generated_at"],
+                "iterations": iterations,
+                "optimized_strategies": ["smallcap"],
+                "seed": seed,
+                "strategy_seed": strategy_seeds["smallcap"],
+                "smallcap_universe_version": SMALLCAP_UNIVERSE_VERSION,
+                "caveat": "复用长线PIT回测框架；股票池为当前游资小盘成员，存在当前成员回看历史的幸存者偏差。",
+                "config": {"smallcap": smallcap_section["best"]["config"]},
+                "scores": {"smallcap_objective": smallcap_section["best"]["objective"]},
+            }
+            with open(SMALLCAP_OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
+                json.dump(smallcap_config, fp, ensure_ascii=False, indent=2)
     return result
 
 
@@ -2451,10 +2763,11 @@ def print_summary(result: Dict[str, Any]) -> None:
     )
     strategy_labels = {
         "long": "长线策略",
+        "smallcap": "小盘策略",
         "short": "短线策略",
     }
     strategy_names = result.get("optimized_strategies") or [
-        key for key in ("long", "short") if result.get(key)
+        key for key in ("long", "smallcap", "short") if result.get(key)
     ]
     for key in strategy_names:
         section = result.get(key)
@@ -2472,7 +2785,7 @@ def print_summary(result: Dict[str, Any]) -> None:
         for note in section.get("notes", []):
             print(f"[说明] {note}")
         print(f"代表代码: {' '.join(best.get('top_codes', []))}")
-        if key == "long":
+        if key in {"long", "smallcap"}:
             print_metric_block("回测摘要", best["summary"], LONG_SUMMARY_FIELDS)
             chart = section.get("best_fold_path_chart")
             if chart:
@@ -2498,13 +2811,13 @@ def print_summary(result: Dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="搜索股票策略因子权重和参数")
-    parser.add_argument("--strategy", choices=["all", "long", "short"], default="all",
+    parser.add_argument("--strategy", choices=["all", "long", "smallcap", "short"], default="all",
                         help="选择要重跑的策略；单策略模式保留另一策略已有优化配置")
     parser.add_argument("--iterations", type=int, default=DEFAULT_OPTIMIZATION_ITERATIONS, help="每个策略的搜索迭代次数")
     parser.add_argument("--seed", type=int, default=2333, help="随机种子")
     parser.add_argument("--no-persist", action="store_true", help="只打印结果，不写入结果文件")
     args = parser.parse_args()
-    strategies = ("long", "short") if args.strategy == "all" else (args.strategy,)
+    strategies = ("long", "smallcap", "short") if args.strategy == "all" else (args.strategy,)
     try:
         result = run_optimization(
             args.iterations,
@@ -2519,6 +2832,9 @@ def main() -> None:
     if not args.no_persist:
         print(f"\n已保存优化结果: {OUTPUT_FILE}")
         print(f"已保存优化默认配置: {OPTIMIZED_CONFIG_FILE}")
+        if "smallcap" in strategies:
+            print(f"已保存小盘优化结果: {SMALLCAP_OUTPUT_FILE}")
+            print(f"已保存小盘独立优化配置: {SMALLCAP_OPTIMIZED_CONFIG_FILE}")
 
 
 if __name__ == "__main__":

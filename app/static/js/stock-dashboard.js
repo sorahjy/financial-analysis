@@ -93,6 +93,7 @@
         button.onclick = () => setMobileView(button.dataset.stockView);
       });
       $("tab-long").onclick = () => switchStrategy("long");
+      $("tab-smallcap").onclick = () => switchStrategy("smallcap");
       $("tab-short").onclick = () => switchStrategy("short");
       $("run").onclick = runNow;
       $("save").onclick = () => {
@@ -248,9 +249,9 @@
     }
 
     async function startOptimize() {
-      const msg = "将对长线/短线各运行 1500 次 Optuna/TPE 参数搜索回测"
+      const msg = "将对长线/小盘/短线各运行 1500 次 Optuna/TPE 参数搜索回测"
         + "（相当于 python stock_strategy_optimizer.py --iterations 1500），"
-        + "长线和短线会以独立进程并行搜索，约需 10 分钟左右，期间页面将锁定。确定开始吗？";
+        + "三个策略会以独立进程并行搜索，约需 10 分钟左右，期间页面将锁定。确定开始吗？";
       if (!window.confirm(msg)) return;
       try {
         const resp = await fetch("/api/optimize", {method: "POST"});
@@ -328,6 +329,7 @@
       exactStockSearch = "";
       $("factor-search").value = "";
       $("tab-long").classList.toggle("active", name === "long");
+      $("tab-smallcap").classList.toggle("active", name === "smallcap");
       $("tab-short").classList.toggle("active", name === "short");
       renderControls();
       renderResults();
@@ -348,7 +350,9 @@
     function renderControls() {
       renderParams();
       renderFactors();
-      $("title").textContent = active === "long" ? "长线大盘股策略" : "短线游资小盘策略";
+      $("title").textContent = active === "long"
+        ? "长线大盘股策略"
+        : (active === "smallcap" ? "小盘中线因子策略" : "短线游资小盘策略");
       updateLongChartButton();
       updateExportButton();
     }
@@ -356,7 +360,7 @@
     function updateLongChartButton() {
       const button = $("long-chart-show");
       if (!button) return;
-      const visible = active === "long";
+      const visible = active === "long" || active === "smallcap";
       button.hidden = !visible;
       button.disabled = !visible || chartInFlight;
     }
@@ -375,6 +379,15 @@
           ["min_score", "最低分", "number", 0, 100, 1],
           ["min_market_cap_yi", "市值下限(亿)", "number", 0, 5000, 50],
           ["require_csi300", "必须当前沪深300", "checkbox"],
+          ["require_high_drawdown", "高点回撤过滤", "checkbox"],
+          ["min_high_drawdown_pct", "高点至今跌幅下限(%)", "number", 0, 95, 1, "require_high_drawdown"],
+          ["exclude_st", "排除ST", "checkbox"]
+        ];
+      }
+      if (active === "smallcap") {
+        return [
+          ["top_n", "输出数量", "number", 1, 10, 1],
+          ["min_score", "最低分", "number", 0, 100, 1],
           ["require_high_drawdown", "高点回撤过滤", "checkbox"],
           ["min_high_drawdown_pct", "高点至今跌幅下限(%)", "number", 0, 95, 1, "require_high_drawdown"],
           ["exclude_st", "排除ST", "checkbox"]
@@ -437,7 +450,8 @@
         const matches = !factorSearch || haystack.includes(factorSearch);
         return inGroup && matches;
       });
-      $("factor-count").textContent = `${active === "long" ? "长线" : "短线"} ${visibleFactors.length}/${allFactors.length}`;
+      const strategyLabel = {long: "长线", smallcap: "小盘", short: "短线"}[active] || active;
+      $("factor-count").textContent = `${strategyLabel} ${visibleFactors.length}/${allFactors.length}`;
       if (!visibleFactors.length) {
         box.innerHTML = `<div class="empty">没有匹配的因子</div>`;
         return;
@@ -663,7 +677,7 @@
       const cards = [
         ["候选", section.candidate_count],
         ["入选", section.selected_count],
-        [active === "long" ? "长线因子" : "短线因子", section.factor_count],
+        [{long: "长线因子", smallcap: "小盘因子", short: "短线因子"}[active], section.factor_count],
         ["均分", diag.avg_score ?? "--"],
         ["分数区间", `${range[0]} / ${range[1]}`],
         ["数据覆盖", diag.avg_data_quality === undefined ? "--" : `${fmt(diag.avg_data_quality * 100, 1)}%`]
@@ -683,7 +697,8 @@
     }
 
     async function showLongBacktestChart() {
-      if (active !== "long" || chartInFlight) return;
+      if (!(["long", "smallcap"].includes(active)) || chartInFlight) return;
+      const chartStrategy = active;
       chartInFlight = true;
       updateLongChartButton();
       status("生成策略走势");
@@ -692,7 +707,7 @@
         const resp = await fetch("/api/stock/long-backtest-chart", {
           method: "POST",
           headers: {"Content-Type": "application/json"},
-          body: JSON.stringify({config})
+          body: JSON.stringify({config, strategy: chartStrategy})
         });
         const payload = await resp.json();
         if (disposed) return;
@@ -709,7 +724,7 @@
     }
 
     function showLongChartStatus(message, isError = false) {
-      $("long-chart-title").textContent = "长线历史回测走势";
+      $("long-chart-title").textContent = `${active === "smallcap" ? "小盘" : "长线"}历史回测走势`;
       $("long-chart-meta").textContent = "";
       $("long-chart-status").textContent = message;
       $("long-chart-status").hidden = false;
@@ -724,8 +739,10 @@
     function renderLongBacktestChart(payload) {
       const chart = payload.chart || {};
       const url = `${payload.url}${payload.url.includes("?") ? "&" : "?"}t=${Date.now()}`;
-      $("long-chart-title").textContent = payload.is_default ? "默认参数历史回测走势" : "当前参数历史回测走势";
+      const label = payload.strategy === "smallcap" ? "小盘" : "长线";
+      $("long-chart-title").textContent = `${label}${payload.is_default ? "默认" : "当前"}参数历史回测走势`;
       $("long-chart-meta").textContent = [
+        chart.eligible_universe_count ? `${chart.eligible_universe_count} 只历史可用候选` : "",
         chart.folds ? `${chart.folds} 个完整折` : "",
         chart.partial_folds ? `${chart.partial_folds} 个未满折` : "",
         chart.full_path_start_date && chart.full_path_end_date ? `${chart.full_path_start_date} ~ ${chart.full_path_end_date}` : "",
@@ -841,10 +858,13 @@
     }
 
     function renderPoolRules(section) {
-      const rules = active === "long" ? longPoolRules() : shortPoolRules();
+      const rules = active === "long"
+        ? longPoolRules()
+        : (active === "smallcap" ? smallcapPoolRules() : shortPoolRules());
+      const poolLabel = {long: "长线", smallcap: "小盘", short: "短线"}[active] || active;
       $("pool-rules").innerHTML = `
         <div class="pool-rules-head">
-          <strong>${active === "long" ? "长线股票池筛选" : "短线股票池筛选"}</strong>
+          <strong>${poolLabel}股票池筛选</strong>
           <span class="count-pill">候选 ${esc(section.candidate_count ?? "--")} / 入选 ${esc(section.selected_count ?? "--")}</span>
         </div>
         <div class="rule-list">
@@ -880,6 +900,18 @@
         ["连板过滤", `连续涨停不超过 ${fmt(cfg.max_consecutive_limit_up, 0)} 板`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
         ["交易约束", "可交易性、过热、机构分歧和风险控制不做硬剔除，进入短线因子权重"],
+      ];
+    }
+
+    function smallcapPoolRules() {
+      const cfg = config.smallcap;
+      return [
+        ["基础范围", "股票池与短线/游资雷达共用 is_hot_money=1 游资小盘成员，因子与回测框架复用长线"],
+        ["ST过滤", cfg.exclude_st ? "剔除名称包含 ST、*ST 或 S 前缀的股票" : "不过滤ST股票，风险只进入结果提示"],
+        ["指数约束", "不要求当前沪深300；两个指数约束因子均不展示、不评分"],
+        ["市值因子", "不使用总市值、小市值因子或总市值硬门槛；小盘属性由共享股票池保证"],
+        ["历史回撤", cfg.require_high_drawdown ? `已启用：历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `未启用：勾选「高点回撤过滤」后，才会按跌幅下限 ${fmt(cfg.min_high_drawdown_pct, 0)}% 硬过滤`],
+        ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
       ];
     }
 

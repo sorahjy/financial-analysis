@@ -14,18 +14,10 @@
       </div>
       <span id="radar-status" class="status" role="status" aria-live="polite">读取中…</span>
     </div>
-    <aside class="radar-score-guide" aria-labelledby="radar-score-guide-title">
-      <div class="radar-score-guide-head">
-        <strong id="radar-score-guide-title">机会分怎么算</strong>
-        <span>范围 0–100</span>
-      </div>
-      <p class="radar-score-formula">机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）</p>
-      <div class="radar-score-breakdown">
-        <p><b>吸筹原始分</b>：筹码集中×0.30、价格位置×0.20；CMF有效值、P3缩量打压、股东户数变化、近90日回购各×0.10。</p>
-        <p><b>出货原始分</b>：高位涨幅放量、P11突破、近90日龙虎榜、量价背离各×0.20；P19巨阴、P20破位各×0.10。</p>
-      </div>
-      <p class="radar-score-note">两项先按当前候选池换算为横截面百分位；出货越高折扣越大，最多扣掉吸筹强度的50%。例：吸筹90、出货40 → 机会72。游资小盘池主排序使用反转分，机会分仅作辅助。</p>
-    </aside>
+    <div class="radar-help-actions" aria-label="雷达计算说明">
+      <button id="radar-score-help" class="radar-help-button" type="button" aria-haspopup="dialog"><span class="radar-help-icon" aria-hidden="true">ƒ</span><span><strong>机会分规则</strong><small>查看计算方法</small></span><span class="radar-help-arrow" aria-hidden="true">›</span></button>
+      <button id="radar-factor-help" class="radar-help-button" type="button" aria-haspopup="dialog"><span class="radar-help-icon factor" aria-hidden="true">◎</span><span><strong>因子解读</strong><small>理解每项信号</small></span><span class="radar-help-arrow" aria-hidden="true">›</span></button>
+    </div>
     <div class="radar-actions">
       <label class="toggle">池&nbsp;<select id="radar-pool" aria-label="候选池">
         <option value="leader">细分龙头</option>
@@ -37,6 +29,36 @@
       <button id="radar-run" class="btn primary" type="button">运行 · 刷新结果</button>
       <button id="radar-refresh-data" class="btn" type="button">刷新数据</button>
     </div>
+  </div>
+
+  <div id="radar-score-modal" class="radar-insight-modal" hidden>
+    <section class="radar-insight-dialog" role="dialog" aria-modal="true" aria-labelledby="radar-score-modal-title" tabindex="-1">
+      <header class="radar-insight-head"><div><span class="radar-insight-kicker">Scoring model</span><h2 id="radar-score-modal-title">机会分，衡量值得关注的程度</h2></div><button class="radar-insight-close" type="button" data-radar-modal-close aria-label="关闭">×</button></header>
+      <div class="radar-insight-body">
+        <div class="radar-formula-hero"><span>范围 0–100</span><strong>机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）</strong><p>先在当前候选池内比较吸筹分和出货分的相对排名，再让出货风险最多折掉一半吸筹强度。</p></div>
+        <div class="radar-score-example" aria-label="机会分计算示例"><div><small>吸筹百分位</small><strong>90</strong></div><span>×</span><div><small>风险保留系数</small><strong>0.80</strong></div><span>=</span><div class="result"><small>机会分</small><strong>72</strong></div></div>
+        <div class="radar-insight-grid">
+          <article class="radar-insight-card accent-green"><div class="radar-card-title"><span>01</span><div><h3>先算吸筹原始分</h3><p>寻找低位、结构改善与资金沉淀</p></div></div><div class="radar-weight-list"><p><b>25%</b><span>P3 缩量打压首次收复</span></p><p><b>25%</b><span>P24 OBV 底背离</span></p><p><b>20%</b><span>股东户数下降</span></p><p><b>10%</b><span>价格位置</span></p><p><b>10%</b><span>CMF 反向分</span></p><p><b>10%</b><span>近 90 日回购</span></p></div></article>
+          <article class="radar-insight-card accent-red"><div class="radar-card-title"><span>02</span><div><h3>再算出货原始分</h3><p>识别拥挤、破位与资金异动风险</p></div></div><div class="radar-weight-list"><p><b>20%</b><span>技术派发</span></p><p><b>20%</b><span>P11 放量突破</span></p><p><b>20%</b><span>近90日龙虎榜</span></p><p><b>20%</b><span>原始量价背离</span></p><p><b>10%</b><span>P19 巨量大阴</span></p><p><b>10%</b><span>P20 放量破位</span></p></div></article>
+        </div>
+        <aside class="radar-insight-note"><strong>读分数时注意</strong><p>机会分表达的是候选池内的相对位置，不是上涨概率。细分龙头池以机会分排序；游资小盘池以三日平滑反转分为主排序，机会分仅作辅助观察。</p></aside>
+      </div>
+    </section>
+  </div>
+
+  <div id="radar-factor-modal" class="radar-insight-modal" hidden>
+    <section class="radar-insight-dialog radar-factor-dialog" role="dialog" aria-modal="true" aria-labelledby="radar-factor-modal-title" tabindex="-1">
+      <header class="radar-insight-head"><div><span class="radar-insight-kicker">Factor guide</span><h2 id="radar-factor-modal-title">因子解读</h2><p>它在观察什么，以及高分究竟意味着什么。</p></div><button class="radar-insight-close" type="button" data-radar-modal-close aria-label="关闭">×</button></header>
+      <div class="radar-insight-body">
+        <section class="radar-factor-section"><div class="radar-section-heading"><span class="green">吸筹</span><div><h3>机会的来源</h3><p>六项合成吸筹原始分；筹码集中保留展示，但已不参与总分。</p></div></div><div class="radar-factor-grid">
+          <article><b>P3</b><h4>缩量打压首次收复</h4><p>低位出现缩量大阴后，没有继续破底，并首次收回下跌前价格。观察“洗出去后重新站稳”。</p></article><article><b>P24</b><h4>OBV 底背离</h4><p>价格仍在低位，累计量能却持续走强。观察“价格没动，资金先动”，需连续确认。</p></article><article><b>户数</b><h4>股东户数下降</h4><p>最新可见披露中持有人减少，筹码可能向更少账户集中；缺失数据按中性处理。</p></article><article><b>位置</b><h4>价格位置</h4><p>当前价格在近 60 日区间越靠下，得分越高。它偏向低位反转，不等同于基本面低估。</p></article><article><b>CMF</b><h4>CMF 反向分</h4><p>高买压在历史中更像短期过热，因此这里只惩罚过高买压，不奖励完全没有成交活力。</p></article><article><b>回购</b><h4>近 90 日公司回购</h4><p>公司近期实施回购则加分，代表公司行为层面的支持；它是辅助证据，不是独立买点。</p></article>
+        </div></section>
+        <section class="radar-factor-section"><div class="radar-section-heading"><span class="red">出货</span><div><h3>需要折价的风险</h3><p>分数越高，机会分被折扣得越多。</p></div></div><div class="radar-factor-grid">
+          <article><b>技术</b><h4>技术派发</h4><p>综合高位、阶段涨幅和高位放量，识别上涨末段“量出来、价格却走不动”。</p></article><article><b>P11</b><h4>放量突破</h4><p>放量突破近 20 日高点看似强势，但全历史更偏追高风险，因此按出货维度处理。</p></article><article><b>P19</b><h4>灌压巨量大阴</h4><p>高位巨量长阴且收在日内低位，通常意味着抛压集中释放，是强风险信号。</p></article><article><b>P20</b><h4>均线放量破位</h4><p>此前仍在 MA20 上方，随后放量跌破，观察趋势结构是否已经损坏。</p></article><article><b>龙虎榜</b><h4>近 90 日上榜</h4><p>上榜常伴随剧烈异动和拥挤交易。这里把它视作追高与反转风险，而不是机构背书。</p></article><article><b>背离</b><h4>原始量价背离</h4><p>成交投入很大、价格反馈很弱，说明资金推动效率下降；出货侧使用原始背离分。</p></article>
+        </div></section>
+        <section class="radar-factor-section"><div class="radar-section-heading"><span class="blue">反转</span><div><h3>游资小盘池的主排序</h3><p>五项“过热”因子先做横截面排名，再反向加权并对近三日做 EMA 平滑。</p></div></div><div class="radar-reversal-strip"><div><b>30%</b><span>换手分位</span><small>越拥挤越扣分</small></div><div><b>20%</b><span>当日振幅</span><small>波动越大越扣分</small></div><div><b>20%</b><span>近 5 日涨停</span><small>连续过热越扣分</small></div><div><b>15%</b><span>量比</span><small>突发放量越扣分</small></div><div><b>15%</b><span>近 5 日动量</span><small>追涨越强越扣分</small></div></div><aside class="radar-insight-note compact"><strong>直白理解</strong><p>反转分高，不是“最强的股票”，而是“当前最不拥挤、最不过热，较可能出现短线反弹”的股票。纯做多仍应结合大盘是否站上 MA20。</p></aside></section>
+      </div>
+    </section>
   </div>
 
   <div id="radar-meta" class="radar-meta">—</div>

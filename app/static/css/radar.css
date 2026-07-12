@@ -4,6 +4,7 @@
   padding: 20px 28px 60px;
   color: var(--ink);
 }
+body.radar-modal-open { overflow: hidden; }
 
 .radar h1 { margin: 0; font-size: 20px; }
 .radar .status { font-size: 12px; color: var(--muted); }
@@ -19,27 +20,26 @@
 .radar-head { display: flex; align-items: baseline; gap: 12px; }
 .radar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
-.radar-score-guide {
-  flex: 1 1 500px;
-  min-width: 360px;
-  max-width: 720px;
-  padding: 10px 12px;
-  border: 1px solid var(--line);
-  border-radius: 10px;
-  background: var(--panel);
-  color: var(--muted);
-  font-size: 11px;
-  line-height: 1.45;
-}
-.radar-score-guide-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
-.radar-score-guide-head strong { color: var(--ink); font-size: 12px; }
-.radar-score-guide-head span { white-space: nowrap; }
-.radar-score-formula { margin: 5px 0; color: var(--blue); font-weight: 700; }
-.radar-score-breakdown { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
-.radar-score-breakdown p,
-.radar-score-note { margin: 0; }
-.radar-score-breakdown b { color: var(--ink); }
-.radar-score-note { margin-top: 5px; }
+.radar-help-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+.radar-help-button { min-width: 154px; display: grid; grid-template-columns: 32px 1fr 14px; align-items: center; gap: 9px; padding: 8px 10px; border: 1px solid rgba(15,23,42,.1); border-radius: 12px; background: rgba(255,255,255,.78); color: var(--ink); text-align: left; cursor: pointer; box-shadow: 0 1px 2px rgba(15,23,42,.04); transition: transform .18s ease, box-shadow .18s ease, border-color .18s ease; }
+.radar-help-button:hover { transform: translateY(-1px); border-color: rgba(0,113,227,.35); box-shadow: 0 7px 20px rgba(15,23,42,.08); }
+.radar-help-button strong, .radar-help-button small { display: block; }.radar-help-button strong { font-size: 12px; line-height: 1.3; }.radar-help-button small { margin-top: 2px; color: var(--muted); font-size: 10px; }
+.radar-help-icon { display: grid; place-items: center; width: 32px; height: 32px; border-radius: 9px; background: #eaf3ff; color: #0674e7; font-size: 17px; font-weight: 700; }.radar-help-icon.factor { background: #f0edff; color: #6750c9; }.radar-help-arrow { color: #a0a5ae; font-size: 20px; font-weight: 300; }
+.radar-insight-modal { position: fixed; inset: 0; z-index: 1000; display: grid; place-items: center; padding: 28px; background: rgba(17,24,39,.30); backdrop-filter: blur(14px) saturate(120%); }
+.radar-insight-modal[hidden] { display: none; }
+.radar-insight-dialog { width: min(860px,100%); max-height: min(840px,calc(100vh - 56px)); overflow: hidden; border: 1px solid rgba(255,255,255,.72); border-radius: 24px; background: rgba(250,250,252,.97); box-shadow: 0 30px 90px rgba(15,23,42,.24),0 2px 8px rgba(15,23,42,.08); outline: none; }.radar-factor-dialog { width: min(1040px,100%); }
+.radar-insight-head { display: flex; justify-content: space-between; gap: 24px; padding: 25px 28px 20px; border-bottom: 1px solid rgba(15,23,42,.08); }.radar-insight-head h2 { margin: 3px 0 0; color: #111827; font-size: 24px; letter-spacing: -.035em; }.radar-insight-head p { margin: 6px 0 0; color: #737983; font-size: 12px; }.radar-insight-kicker { color: #0879e8; font-size: 10px; font-weight: 750; letter-spacing: .14em; text-transform: uppercase; }
+.radar-insight-close { flex: 0 0 auto; width: 30px; height: 30px; border: 0; border-radius: 50%; background: #e8e8ed; color: #646a73; font-size: 21px; line-height: 1; cursor: pointer; }.radar-insight-close:hover { background: #dcdce2; color: #111827; }
+.radar-insight-body { max-height: calc(100vh - 168px); overflow-y: auto; padding: 24px 28px 28px; }.radar-formula-hero { padding: 22px; border-radius: 18px; background: linear-gradient(135deg,#0879e8,#315bd6); color: #fff; box-shadow: inset 0 1px rgba(255,255,255,.25); }.radar-formula-hero span { font-size: 10px; opacity: .75; letter-spacing: .08em; }.radar-formula-hero strong { display: block; margin: 8px 0 7px; font-size: clamp(17px,2.2vw,23px); letter-spacing: -.025em; }.radar-formula-hero p { margin: 0; max-width: 680px; color: rgba(255,255,255,.78); font-size: 12px; line-height: 1.6; }
+.radar-score-example { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; align-items: center; gap: 14px; margin: 16px 0; }.radar-score-example div { padding: 14px 16px; border: 1px solid rgba(15,23,42,.08); border-radius: 14px; background: #fff; }.radar-score-example div.result { background: #ecf6ff; border-color: #b9dcff; }.radar-score-example small,.radar-score-example strong { display: block; }.radar-score-example small { color: #7b818b; font-size: 10px; }.radar-score-example strong { margin-top: 3px; color: #111827; font-size: 22px; }.radar-score-example > span { color: #a0a5ae; font-size: 18px; }
+.radar-insight-grid { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }.radar-insight-card { padding: 18px; border: 1px solid rgba(15,23,42,.08); border-radius: 17px; background: #fff; }.radar-card-title { display: flex; gap: 11px; align-items: flex-start; }.radar-card-title > span { display: grid; place-items: center; width: 28px; height: 28px; border-radius: 9px; background: #eef2f7; color: #68707d; font-size: 10px; font-weight: 750; }.accent-green .radar-card-title > span { background: #e8f7ef; color: #16804a; }.accent-red .radar-card-title > span { background: #fff0ed; color: #c43e2f; }
+.radar-card-title h3,.radar-section-heading h3 { margin: 0; color: #17191d; font-size: 14px; }.radar-card-title p,.radar-section-heading p { margin: 3px 0 0; color: #838892; font-size: 10px; }.radar-weight-list { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 8px; margin-top: 15px; }.radar-weight-list p { display: flex; gap: 7px; margin: 0; color: #525862; font-size: 11px; }.radar-weight-list b { min-width: 28px; color: #111827; font-variant-numeric: tabular-nums; }
+.radar-insight-note { display: flex; gap: 14px; margin-top: 15px; padding: 14px 16px; border-radius: 14px; background: #f0f1f4; }.radar-insight-note strong { flex: 0 0 auto; color: #30343a; font-size: 11px; }.radar-insight-note p { margin: 0; color: #676d77; font-size: 11px; line-height: 1.6; }
+.radar-factor-section + .radar-factor-section { margin-top: 28px; padding-top: 26px; border-top: 1px solid rgba(15,23,42,.08); }.radar-section-heading { display: flex; align-items: center; gap: 12px; margin-bottom: 14px; }.radar-section-heading > span { padding: 5px 9px; border-radius: 999px; font-size: 10px; font-weight: 750; }.radar-section-heading .green { background: #e7f7ee; color: #16804a; }.radar-section-heading .red { background: #ffedeb; color: #c23c2e; }.radar-section-heading .blue { background: #eaf3ff; color: #0879e8; }
+.radar-factor-grid { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: 10px; }.radar-factor-grid article { min-height: 118px; padding: 15px; border: 1px solid rgba(15,23,42,.075); border-radius: 15px; background: #fff; }.radar-factor-grid article > b { display: inline-block; margin-bottom: 9px; padding: 3px 6px; border-radius: 6px; background: #f0f2f5; color: #59606b; font-size: 9px; }.radar-factor-grid h4 { margin: 0; color: #22252a; font-size: 12px; }.radar-factor-grid p { margin: 6px 0 0; color: #737983; font-size: 10px; line-height: 1.55; }
+.radar-reversal-strip { display: grid; grid-template-columns: repeat(5,minmax(0,1fr)); gap: 8px; }.radar-reversal-strip div { padding: 14px 10px; border: 1px solid #cfe3ff; border-radius: 14px; background: #f2f7ff; text-align: center; }.radar-reversal-strip b,.radar-reversal-strip span,.radar-reversal-strip small { display: block; }.radar-reversal-strip b { color: #0879e8; font-size: 16px; }.radar-reversal-strip span { margin-top: 4px; color: #30343a; font-size: 11px; font-weight: 650; }.radar-reversal-strip small { margin-top: 3px; color: #858b95; font-size: 9px; }.radar-insight-note.compact { margin-top: 10px; }
+@media (max-width: 900px) { .radar-help-actions { width: 100%; margin-left: 0; }.radar-help-button { flex: 1; }.radar-factor-grid { grid-template-columns: repeat(2,minmax(0,1fr)); }.radar-reversal-strip { grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (max-width: 620px) { .radar-insight-modal { padding: 10px; }.radar-insight-dialog { max-height: calc(100vh - 20px); border-radius: 19px; }.radar-insight-head { padding: 20px 18px 16px; }.radar-insight-head h2 { font-size: 20px; }.radar-insight-body { padding: 18px; max-height: calc(100vh - 128px); }.radar-insight-grid,.radar-factor-grid { grid-template-columns: 1fr; }.radar-weight-list { grid-template-columns: 1fr; }.radar-score-example { gap: 6px; }.radar-score-example div { padding: 10px; }.radar-score-example strong { font-size: 18px; } }
 
 .radar .btn {
   border: 1px solid var(--line);

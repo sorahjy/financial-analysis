@@ -13,6 +13,7 @@ from stock_data_refresh import REFRESH_REPORT_FILE
 
 from app.services.stock_strategy_service import (
     build_long_backtest_chart,
+    build_strategy_backtest_chart,
     optimizer_state_snapshot,
     resolve_long_backtest_chart_file,
     run_stock_strategies,
@@ -102,7 +103,8 @@ def stock_kline():
 def stock_long_backtest_chart():
     try:
         payload = request.get_json(silent=True) or {}
-        return jsonify(build_long_backtest_chart(payload.get("config", {})))
+        strategy = payload.get("strategy", "long")
+        return jsonify(build_strategy_backtest_chart(payload.get("config", {}), strategy=strategy))
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 

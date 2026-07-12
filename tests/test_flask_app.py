@@ -114,9 +114,9 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("if (!disposed && data.refresh && data.refresh.running)", fund_script)
         self.assertIn("FinancialAnalysisPages.stock = initStockDashboard", stock_script)
         self.assertIn("dataset.stockDashboardInitialized", stock_script)
-        self.assertIn("将对长线/短线各运行 1500 次 Optuna/TPE 参数搜索回测", stock_script)
+        self.assertIn("将对长线/小盘/短线各运行 1500 次 Optuna/TPE 参数搜索回测", stock_script)
         self.assertIn("python stock_strategy_optimizer.py --iterations 1500", stock_script)
-        self.assertIn("长线和短线会以独立进程并行搜索", stock_script)
+        self.assertIn("三个策略会以独立进程并行搜索", stock_script)
         self.assertIn("约需 10 分钟左右", stock_script)
         self.assertNotIn("约需 2 分钟左右", stock_script)
         self.assertIn("clearTimeout(runTimer)", stock_script)
@@ -124,8 +124,8 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("clearInterval(refreshTimer)", stock_script)
 
         stock_html = self.client.get("/stock").get_data(as_text=True)
-        self.assertIn("长线/短线各 1500 次 Optuna/TPE 参数搜索回测", stock_html)
-        self.assertIn("两个独立进程并行", stock_html)
+        self.assertIn("长线/小盘/短线各 1500 次 Optuna/TPE 参数搜索回测", stock_html)
+        self.assertIn("三个独立进程并行", stock_html)
         self.assertIn("约需 10 分钟左右", stock_html)
 
     def test_radar_script_shows_market_cap_and_watch_label(self):
@@ -306,19 +306,23 @@ class FlaskAppTest(unittest.TestCase):
             r"max-height:\s*none;[\s\S]*?overflow-y:\s*visible;",
         )
 
-    def test_radar_header_explains_opportunity_score_formula(self):
+    def test_radar_header_uses_score_and_factor_help_modals(self):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
         css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
 
-        self.assertIn('class="radar-score-guide"', body)
-        self.assertIn('id="radar-score-guide-title"', body)
+        self.assertIn('id="radar-score-help"', body)
+        self.assertIn('id="radar-factor-help"', body)
+        self.assertIn('id="radar-score-modal"', body)
+        self.assertIn('id="radar-factor-modal"', body)
         self.assertIn("机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）", body)
-        self.assertIn("筹码集中×0.30", body)
+        self.assertIn("P3 缩量打压首次收复", body)
+        self.assertIn("P24 OBV 底背离", body)
+        self.assertIn("股东户数下降", body)
+        self.assertIn("筹码集中保留展示，但已不参与总分", body)
         self.assertIn("近90日龙虎榜", body)
-        self.assertIn("吸筹90、出货40 → 机会72", body)
-        self.assertIn("游资小盘池主排序使用反转分", body)
-        self.assertIn("font-size: 11px", css)
-        self.assertIn(".radar-score-breakdown", css)
+        self.assertIn("游资小盘池以三日平滑反转分为主排序", body)
+        self.assertIn(".radar-insight-modal[hidden]", css)
+        self.assertIn(".radar-factor-grid", css)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -370,6 +374,8 @@ class FlaskAppTest(unittest.TestCase):
         payload = response.get_json()
         self.assertIn("config", payload)
         self.assertIn("factors", payload)
+        self.assertIn("smallcap", payload["config"])
+        self.assertIn("smallcap", payload["factors"])
 
     def test_stock_health_reports_refresh_state(self):
         response = self.client.get("/api/stock/health")
@@ -412,12 +418,31 @@ class FlaskAppTest(unittest.TestCase):
             "url": "/api/stock/long-backtest-chart/file/stock_strategy_best_fold_paths.svg",
             "chart": {"chart_type": "existing_default"},
         }
-        with patch("app.routes.stock.build_long_backtest_chart", return_value=payload) as build_chart:
+        with patch("app.routes.stock.build_strategy_backtest_chart", return_value=payload) as build_chart:
             response = self.client.post("/api/stock/long-backtest-chart", json={"config": {"long": {"top_n": 10}}})
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.get_json(), payload)
-        build_chart.assert_called_once_with({"long": {"top_n": 10}})
+        build_chart.assert_called_once_with({"long": {"top_n": 10}}, strategy="long")
+
+    def test_stock_smallcap_backtest_chart_endpoint_uses_smallcap_strategy(self):
+        payload = {
+            "strategy": "smallcap",
+            "is_default": False,
+            "url": "/api/stock/long-backtest-chart/file/stock_strategy_smallcap_fold_paths_custom_test.svg",
+            "chart": {"chart_type": "small_multiples"},
+        }
+        with patch("app.routes.stock.build_strategy_backtest_chart", return_value=payload) as build_chart:
+            response = self.client.post(
+                "/api/stock/long-backtest-chart",
+                json={"strategy": "smallcap", "config": {"smallcap": {"top_n": 12}}},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json(), payload)
+        build_chart.assert_called_once_with(
+            {"smallcap": {"top_n": 12}}, strategy="smallcap"
+        )
 
     def test_stock_config_endpoint_falls_back_to_backup_optimized_config(self):
         payload = {
@@ -477,6 +502,11 @@ class FlaskAppTest(unittest.TestCase):
 
         self.assertIn('id="long-chart-modal"', body)
         self.assertIn('id="long-chart-show"', body)
+        self.assertIn('id="tab-smallcap"', body)
+        self.assertIn('id="tab-long" class="tab active" type="button">大盘</button>', body)
+        self.assertIn('"小盘中线因子策略"', script)
+        self.assertLess(body.index('id="tab-long"'), body.index('id="tab-smallcap"'))
+        self.assertLess(body.index('id="tab-smallcap"'), body.index('id="tab-short"'))
         self.assertIn('id="long-chart-status"', body)
         self.assertIn(">策略走势</button>", body)
         self.assertIn('id="export-picks"', body)
@@ -491,7 +521,11 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn(".chart-modal-actions a[hidden]", css)
         self.assertIn('$("long-chart-status").textContent = "";', script)
         self.assertIn("button.hidden = !visible", script)
-        self.assertIn('const visible = active === "long"', script)
+        self.assertIn('const visible = active === "long" || active === "smallcap"', script)
+        self.assertIn('body: JSON.stringify({config, strategy: chartStrategy})', script)
+        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", css)
+        self.assertIn('switchStrategy("smallcap")', script)
+        self.assertIn("function smallcapPoolRules()", script)
         self.assertIn("function exportCurrentPicks()", script)
         self.assertIn("text/plain;charset=utf-8", script)
         self.assertIn("anchor.download", script)

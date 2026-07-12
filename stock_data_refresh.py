@@ -306,6 +306,7 @@ def collect_data_health() -> Dict[str, Any]:
     strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
     candidate_cache = load_json_file(DATA_DIR / "stock_strategy_candidate_cache.json", {})
     long_cache = candidate_cache.get("long") if isinstance(candidate_cache, dict) else {}
+    smallcap_cache = candidate_cache.get("smallcap") if isinstance(candidate_cache, dict) else {}
     short_cache = candidate_cache.get("short") if isinstance(candidate_cache, dict) else {}
     return {
         "stock_data_files": stock_data_count,
@@ -324,6 +325,8 @@ def collect_data_health() -> Dict[str, Any]:
         "strategy_candidate_cache_version": candidate_cache.get("version") if isinstance(candidate_cache, dict) else None,
         "strategy_long_cache_generated_at": long_cache.get("generated_at") if isinstance(long_cache, dict) else None,
         "strategy_long_cache_candidates": long_cache.get("candidate_count") if isinstance(long_cache, dict) else None,
+        "strategy_smallcap_cache_generated_at": smallcap_cache.get("generated_at") if isinstance(smallcap_cache, dict) else None,
+        "strategy_smallcap_cache_candidates": smallcap_cache.get("candidate_count") if isinstance(smallcap_cache, dict) else None,
         "strategy_short_cache_generated_at": short_cache.get("generated_at") if isinstance(short_cache, dict) else None,
         "strategy_short_cache_candidates": short_cache.get("candidate_count") if isinstance(short_cache, dict) else None,
         "benchmark_nav": benchmark_nav,
