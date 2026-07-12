@@ -89,37 +89,7 @@ class StockBenchmarkEtfTest(unittest.TestCase):
         self.assertIn(("510580", "csi500_etf_nav.json", "中证500", "2012-01-01", None), calls)
 
 
-class DataRefreshMirrorTest(unittest.TestCase):
-    def test_mirror_capital_outputs_preserves_source_generated_at(self):
-        import json
-        import stock_data_refresh as refresh
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            root = Path(tmpdir)
-            data_dir = root / "data"
-            capital_dir = data_dir / "capital"
-            candidates_file = capital_dir / "hot_money_candidates.json"
-            candidates_file.parent.mkdir(parents=True)
-            candidates_file.write_text(json.dumps({
-                "generated_at": "2026-06-01 10:00:00",
-                "as_of_date": "2026-06-01",
-                "stocks": [{"code": "123", "name": "测试股", "followers": ["席位A"]}],
-            }, ensure_ascii=False), encoding="utf-8")
-
-            with patch.object(refresh, "DATA_DIR", data_dir), \
-                 patch.object(refresh, "CAPITAL_DIR", capital_dir), \
-                 patch.object(refresh, "HOT_MONEY_CANDIDATES_FILE", candidates_file), \
-                 patch.object(refresh, "ROOT", root):
-                meta = refresh.mirror_capital_outputs()
-
-            picks = json.loads((data_dir / "main_capital_picks.json").read_text(encoding="utf-8"))
-            self.assertEqual(picks["generated_at"], "2026-06-01 10:00:00")
-            self.assertEqual(picks["source_generated_at"], "2026-06-01 10:00:00")
-            self.assertIn("mirrored_at", picks)
-            self.assertEqual(picks["picks"][0]["code"], "000123")
-            self.assertTrue((capital_dir / "snapshots" / "hot_money_candidates_2026-06-01.json").exists())
-            self.assertTrue(meta["capital_snapshot"].endswith("hot_money_candidates_2026-06-01.json"))
-
+class DataRefreshPipelineTest(unittest.TestCase):
     def test_full_refresh_runs_segment_leader_history_before_fundamentals(self):
         import stock_data_refresh as refresh
 
@@ -148,6 +118,63 @@ class DataRefreshMirrorTest(unittest.TestCase):
             run_steps.index("segment_leader_fundamentals"),
         )
         self.assertEqual(step_commands["segment_leader_fundamentals"][-2:], ["--segment-refresh-slice", "0"])
+        self.assertLess(run_steps.index("long_capital_events"), run_steps.index("hot_money_small_cap_universe"))
+        self.assertLess(run_steps.index("hot_money_small_cap_universe"), run_steps.index("short_signal_enrichment"))
+        self.assertLess(run_steps.index("short_signal_enrichment"), run_steps.index("strategy_results"))
+        self.assertEqual(
+            step_commands["short_signal_enrichment"][-4:],
+            ["--days", "14", "--top-yyb", "30"],
+        )
+
+
+class HotMoneyHistoryRefreshTest(unittest.TestCase):
+    def test_universe_reuses_shared_history_refresher_before_filtering(self):
+        import stock_crawl_hot_money_universe as universe
+
+        result = {"requested": 2, "processed": 2, "write_enqueued": 1,
+                  "write_completed": 1, "failed": []}
+        with patch.object(universe, "refresh_stock_histories", return_value=result) as refresh_mock:
+            actual = universe.refresh_seed_histories(
+                ["000001", "000002"],
+                {"000001": "平安银行", "000002": "万科A"},
+                years=4.0,
+                workers=6,
+            )
+
+        self.assertEqual(actual, result)
+        refresh_mock.assert_called_once_with(
+            {"000001": "平安银行", "000002": "万科A"},
+            max_years=4.0,
+            workers=6,
+            refresh_valuation=False,
+            label="游资初筛",
+        )
+
+    def test_history_freshness_uses_actual_latest_bar_date(self):
+        import stock_crawl_hot_money_universe as universe
+
+        self.assertTrue(universe.history_is_fresh("2026-07-10", "2026-07-10"))
+        self.assertTrue(universe.history_is_fresh("2026-07-03", "2026-07-10"))
+        self.assertFalse(universe.history_is_fresh("2026-06-22", "2026-07-10"))
+        self.assertFalse(universe.history_is_fresh(None, "2026-07-10"))
+
+    def test_short_signal_layer_rejects_stale_local_history_without_refetching(self):
+        import stock_crawl_hot_money as short_signal
+
+        records = [{"date": f"2026-06-{day:02d}"} for day in range(1, 23)]
+        records = ([{"date": f"2026-05-{day:02d}"} for day in range(1, 32)] + records)[-60:]
+        with patch.object(short_signal, "load_local_kline_records", return_value=records):
+            self.assertIsNone(
+                short_signal.fetch_stock_data("002150", "正泰电源", reference_date="2026-07-10")
+            )
+
+        fresh = [{"date": f"2026-07-{day:02d}"} for day in range(1, 11)]
+        fresh = ([{"date": f"2026-06-{day:02d}"} for day in range(1, 31)] * 2 + fresh)[-60:]
+        with patch.object(short_signal, "load_local_kline_records", return_value=fresh):
+            data = short_signal.fetch_stock_data(
+                "002150", "正泰电源", reference_date="2026-07-10"
+            )
+        self.assertEqual(data["as_of_date"], "2026-07-10")
 
 
 class StockShortStrategyTest(unittest.TestCase):
@@ -752,7 +779,58 @@ class StockHistorySchemaTest(unittest.TestCase):
                 conn.close()
 
         self.assertIn("official_market_cap_ratio", cols)
+        self.assertIn("is_hot_money", cols)
         self.assertEqual(user_version, ss.SCHEMA_VERSION)
+
+    def test_short_signal_snapshot_does_not_define_hot_money_membership(self):
+        import stock_storage as ss
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            conn = ss.connect(Path(tmpdir) / "stock.sqlite3")
+            try:
+                ss.save_sw3_membership(conn, {
+                    "segments": [{
+                        "segment_code": "850111",
+                        "segment_name": "测试行业",
+                        "parent_segment": "测试一级",
+                        "members": [
+                            {"code": "000001", "name": "成员甲"},
+                            {"code": "000002", "name": "成员乙"},
+                        ],
+                    }],
+                    "errors": [],
+                })
+                conn.execute("UPDATE sw3_member SET is_hot_money = 1")
+                conn.commit()
+
+                saved = ss.replace_short_signals(
+                    conn,
+                    {"000001": {"name": "成员甲", "signals": {"lhb": {"count": 3}}}},
+                    generated_at="2026-07-10 10:00:00",
+                    as_of_date="2026-07-10",
+                )
+
+                self.assertEqual(saved, 1)
+                self.assertEqual(
+                    {row["code"] for row in ss.pool_members(conn, "hotmoney")},
+                    {"000001", "000002"},
+                )
+                self.assertEqual(set(ss.load_short_signals(conn)), {"000001"})
+                self.assertEqual(ss.short_signal_status(conn)["count"], 1)
+
+                ss.replace_short_signals(
+                    conn,
+                    {"000002": {"name": "成员乙", "signals": {}}},
+                    generated_at="2026-07-10 11:00:00",
+                    as_of_date="2026-07-10",
+                )
+                self.assertEqual(set(ss.load_short_signals(conn)), {"000002"})
+                self.assertEqual(
+                    {row["code"] for row in ss.pool_members(conn, "hotmoney")},
+                    {"000001", "000002"},
+                )
+            finally:
+                conn.close()
 
     def test_sw3_membership_persists_official_market_cap_ratio(self):
         import stock_storage as ss

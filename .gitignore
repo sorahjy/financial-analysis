@@ -5,6 +5,7 @@
 data/*
 data_back
 .claude
+research_*.py
 
 # Generated reports (HTML is built from data/, never edited by hand)
 /fund_report.html

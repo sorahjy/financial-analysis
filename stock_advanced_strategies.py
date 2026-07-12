@@ -3,12 +3,12 @@
 Advanced A-share strategy engine.
 
 This module is intentionally self-contained and read-only against existing
-project files. It loads the JSON data already produced by the stock_* scripts,
-scores two strategy families, and can be used by both CLI and the dashboard:
+project data, scores two strategy families, and can be used by both CLI and
+the dashboard:
 
 1. Long horizon: quality compounders, intended for 2-5 years.
-2. Short horizon: non-ST Dragon Tiger List / hot-money tracking, intended for
-   1-5 trading days.
+2. Short horizon: the radar's stable hot-money small-cap universe enriched by
+   Dragon Tiger List / seat signals, intended for 1-5 trading days.
 """
 
 from __future__ import annotations
@@ -37,13 +37,12 @@ ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 META_DATA_BACKUP_DIR = ROOT / "meta_data_backup"
 CAPITAL_DIR = DATA_DIR / "capital"
-HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
-LEGACY_HOT_MONEY_SCORED_FILE = CAPITAL_DIR / "scored_stocks.json"
 OUTPUT_FILE = DATA_DIR / "stock_advanced_strategy_results.json"
 OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_optimized_config.json"
 OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
-LIVE_CANDIDATE_CACHE_VERSION = 2
+LIVE_CANDIDATE_CACHE_VERSION = 3
+SHORT_UNIVERSE_VERSION = "hotmoney_small_cap_v1"
 LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
 LONG_CAPITAL_EVENT_DAYS = 90
 HOLDER_TABLE = "shareholder_count"
@@ -205,7 +204,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "hold_days_min": 1,
         "hold_days_max": 5,
         "exclude_st": True,
-        "min_lhb_count": 1,
+        "min_lhb_count": 0,
         "min_hot_money_concurrent": 0,
         "max_consecutive_limit_up": 3,
         "weights": {spec.key: spec.default_weight for spec in SHORT_FACTORS},
@@ -1869,42 +1868,51 @@ def long_warnings(raw: Dict[str, Any]) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def load_short_pool() -> Dict[str, Dict[str, Any]]:
+def load_short_universe() -> Dict[str, Dict[str, Any]]:
+    """加载与游资雷达完全相同的固定小盘池，信号缺失不影响成员资格。"""
+    conn = stock_storage.connect()
+    try:
+        members = stock_storage.pool_members(conn, "hotmoney")
+        signals = stock_storage.load_short_signals(
+            conn, [str(member.get("code") or "") for member in members]
+        )
+    finally:
+        conn.close()
+
     pool: Dict[str, Dict[str, Any]] = {}
-    candidates = load_json_optional(HOT_MONEY_CANDIDATES_FILE, {})
-    source_name = "capital_candidates"
-    if not isinstance(candidates, dict) or not candidates.get("stocks"):
-        candidates = load_json_optional(LEGACY_HOT_MONEY_SCORED_FILE, {})
-        source_name = "capital_scored_legacy"
-
-    for stock in candidates.get("stocks", []) if isinstance(candidates, dict) else []:
-        code = str(stock.get("code", "")).zfill(6)
+    for member in members:
+        code = str(member.get("code") or "").zfill(6)
         if not code:
             continue
-        entry = pool.setdefault(code, {"code": code, "name": stock.get("name", ""), "sources": []})
-        entry["sources"].append(source_name)
-        entry["capital"] = stock
-        entry["as_of_date"] = candidates.get("as_of_date") or candidates.get("generated_at")
-
-    picks = load_json_optional(DATA_DIR / "main_capital_picks.json", {})
-    for pick in picks.get("picks", []) if isinstance(picks, dict) else []:
-        code = str(pick.get("code", "")).zfill(6)
-        if not code:
-            continue
-        entry = pool.setdefault(code, {"code": code, "name": pick.get("name", ""), "sources": []})
-        entry["sources"].append("main_capital_picks")
-        entry["name"] = entry.get("name") or pick.get("name", "")
-        entry["pick"] = pick
-        entry["as_of_date"] = picks.get("generated_at")
+        signal = signals.get(code) or {}
+        sources = ["hotmoney_universe"]
+        if signal:
+            sources.append("short_signal_snapshot")
+        pool[code] = {
+            "code": code,
+            "name": str(member.get("name") or signal.get("name") or code),
+            "sources": sources,
+            "capital": signal,
+            "as_of_date": signal.get("as_of_date") or signal.get("generated_at"),
+        }
     return pool
 
 
 def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
-    pool = load_short_pool()
+    pool = load_short_universe()
     sw3_segments = load_sw3_segment_map()
     notes = []
     if not pool:
-        notes.append("No Dragon Tiger List pool found. Run stock_crawl_hot_money.py or main-capital script first.")
+        notes.append("Hot-money small-cap universe is empty. Run stock_crawl_hot_money_universe.py first.")
+    else:
+        signal_count = sum(
+            1 for data in pool.values() if "short_signal_snapshot" in data.get("sources", [])
+        )
+        if signal_count < len(pool):
+            notes.append(
+                f"Short signal snapshot coverage: {signal_count}/{len(pool)}; "
+                "missing signals remain eligible and score as unavailable."
+            )
 
     exclude_st = bool(config.get("exclude_st", True))
     min_lhb_count = int(safe_float(config.get("min_lhb_count")) or 0)
@@ -2347,26 +2355,24 @@ def _build_live_long_candidates_cached(
 
 def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], List[str]]:
     key = stable_config_key(config, ignore=("weights", "min_score", "top_n", "enabled"))
-    hot_money_signature = _file_signature(HOT_MONEY_CANDIDATES_FILE)
-    legacy_hot_money_signature = _file_signature(LEGACY_HOT_MONEY_SCORED_FILE)
-    main_capital_signature = _file_signature(DATA_DIR / "main_capital_picks.json")
-    sw3_signature = stock_storage.sw3_signature()
+    conn = stock_storage.connect()
+    try:
+        hot_money_pool_signature = stock_storage.pool_signature(conn, "hotmoney")
+    finally:
+        conn.close()
+    signal_signature = stock_storage.short_signal_signature()
     meta = {
         "config_key": key,
-        "hot_money_candidates": list(hot_money_signature),
-        "legacy_hot_money_scored": list(legacy_hot_money_signature),
-        "main_capital_picks": list(main_capital_signature),
-        "sw3": sw3_signature,
+        "hot_money_pool": hot_money_pool_signature,
+        "short_signals": signal_signature,
     }
     cached = read_live_candidate_cache("short", meta)
     if cached is not None:
         return cached
 
     candidates, notes = _build_live_short_candidates_cached(
-        hot_money_signature,
-        legacy_hot_money_signature,
-        main_capital_signature,
-        _signature_key(sw3_signature),
+        _signature_key(hot_money_pool_signature),
+        _signature_key(signal_signature),
         key,
     )
     write_live_candidate_cache("short", meta, candidates, notes)
@@ -2375,13 +2381,11 @@ def live_short_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, An
 
 @lru_cache(maxsize=8)
 def _build_live_short_candidates_cached(
-        hot_money_signature: Tuple[int, int],
-        legacy_hot_money_signature: Tuple[int, int],
-        main_capital_signature: Tuple[int, int],
-        sw3_signature: Tuple[Tuple[str, Any], ...],
+        hot_money_pool_signature: Tuple[Tuple[str, Any], ...],
+        signal_signature: Tuple[Tuple[str, Any], ...],
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
-    _ = (hot_money_signature, legacy_hot_money_signature, main_capital_signature, sw3_signature)
+    _ = (hot_money_pool_signature, signal_signature)
     return build_short_candidates(config_from_key(config_key))
 
 
@@ -2471,7 +2475,7 @@ def run_short_strategy(
     selected = selected[: max(0, int(first_not_none(merged.get("top_n"), 30)))]
     payload = {
         "strategy": "short",
-        "title": "Short horizon Dragon Tiger List hot-money strategy",
+        "title": "Short horizon hot-money small-cap universe strategy",
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "config": merged,
         "factor_count": len(SHORT_FACTORS),
@@ -2516,13 +2520,21 @@ def run_strategies(
     }
     optimized_meta = merged.get("_optimized_defaults")
     if isinstance(optimized_meta, dict):
-        note = (
+        optimized_note = (
             f"默认参数来自 {optimized_meta.get('generated_at') or '未知时间'} 的本地参数搜索"
             f"（代理回测，存在过拟合/前视风险）：{optimized_meta.get('caveat') or ''}"
         ).rstrip("：")
         for key in ("long", "short"):
             if payload.get(key):
-                payload[key]["notes"].append(note)
+                if (
+                    key == "short"
+                    and optimized_meta.get("short_universe_version") != SHORT_UNIVERSE_VERSION
+                ):
+                    payload[key]["notes"].append(
+                        "旧短线优化参数基于已停用的候选池，已忽略并回退游资小盘池默认参数。"
+                    )
+                else:
+                    payload[key]["notes"].append(optimized_note)
     if persist:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
@@ -2534,13 +2546,19 @@ def get_default_config() -> Dict[str, Any]:
     config = copy.deepcopy(DEFAULT_CONFIG)
     optimized, optimized_source = load_optimized_config_payload()
     if optimized.get("config"):
-        config = deep_merge(config, optimized["config"])
+        optimized_config = copy.deepcopy(optimized["config"])
+        # 旧优化结果基于“席位共振 JSON 候选池”，不能跨池沿用短线硬过滤与权重；
+        # 长线配置仍可安全复用。新版 optimizer 会写入明确的 universe 版本。
+        if optimized.get("short_universe_version") != SHORT_UNIVERSE_VERSION:
+            optimized_config.pop("short", None)
+        config = deep_merge(config, optimized_config)
         config["_optimized_defaults"] = {
             "source": str(optimized_source),
             "generated_at": optimized.get("generated_at"),
             "iterations_per_strategy": optimized.get("iterations_per_strategy"),
             "seed": optimized.get("seed"),
             "caveat": optimized.get("caveat"),
+            "short_universe_version": optimized.get("short_universe_version"),
         }
     return config
 
@@ -2626,7 +2644,7 @@ def short_data_notes(candidates: List[Dict[str, Any]]) -> List[str]:
     notes = []
     if candidates and all("缺少席位级followers明细" in item.get("warnings", []) for item in candidates[:5]):
         notes.append \
-            ("Top short picks mainly come from aggregate capital picks; run capital snapshots for finer seat tracking.")
+            ("Top short picks lack seat-level detail; run stock_crawl_hot_money.py to refresh short signals.")
     return notes
 
 
@@ -2640,7 +2658,7 @@ def self_review_summary() -> Dict[str, Any]:
         "known_limits": [
             "Historical CSI300 membership is exact only if historical constituent files are later supplied.",
             "Long-horizon excess-return validation needs multi-year daily prices; current local fundamental files mostly contain recent daily samples.",
-            "Short strategy uses the latest saved Dragon Tiger List snapshots; refresh those files before live trading.",
+            "Short strategy uses the latest SQLite short-signal snapshot; refresh it before live trading.",
         ],
     }
 

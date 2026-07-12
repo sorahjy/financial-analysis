@@ -11,12 +11,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -32,10 +31,9 @@ from stock_crawl_common import (
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
-CAPITAL_DIR = DATA_DIR / "capital"
-HOT_MONEY_CANDIDATES_FILE = CAPITAL_DIR / "hot_money_candidates.json"
 REFRESH_REPORT_FILE = DATA_DIR / "stock_data_refresh_report.json"
 UNIVERSE_CACHE_MIN_RATIO = 0.98
+HOT_MONEY_MAX_HISTORY_LAG_DAYS = 7
 
 
 @dataclass
@@ -173,86 +171,6 @@ def local_step_result(name: str, command: str, func) -> StepResult:
         return StepResult(name, command, False, 1, elapsed, error=str(exc))
 
 
-def _date_from_text(value: Any) -> Optional[str]:
-    text = str(value or "").strip()
-    if not text:
-        return None
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
-        try:
-            return datetime.strptime(text, fmt).strftime("%Y-%m-%d")
-        except ValueError:
-            continue
-    return None
-
-
-def _hot_money_source_generated_at(candidates: Any) -> Optional[str]:
-    if isinstance(candidates, dict):
-        generated_at = str(candidates.get("generated_at") or "").strip()
-        if generated_at:
-            return generated_at
-        as_of_date = str(candidates.get("as_of_date") or "").strip()
-        if as_of_date:
-            return as_of_date
-    if HOT_MONEY_CANDIDATES_FILE.exists():
-        mtime = datetime.fromtimestamp(HOT_MONEY_CANDIDATES_FILE.stat().st_mtime)
-        return mtime.strftime("%Y-%m-%d %H:%M:%S")
-    return None
-
-
-def mirror_capital_outputs() -> Dict[str, Any]:
-    candidates = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
-    stocks = candidates.get("stocks", []) if isinstance(candidates, dict) else []
-    mirrored_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    source_generated_at = _hot_money_source_generated_at(candidates)
-    source_as_of_date = candidates.get("as_of_date") if isinstance(candidates, dict) else None
-    snapshot_date = (
-        _date_from_text(source_as_of_date)
-        or _date_from_text(source_generated_at)
-        or datetime.now().strftime("%Y-%m-%d")
-    )
-
-    snapshot_path = CAPITAL_DIR / "snapshots" / f"hot_money_candidates_{snapshot_date}.json"
-    if HOT_MONEY_CANDIDATES_FILE.exists():
-        snapshot_path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(HOT_MONEY_CANDIDATES_FILE, snapshot_path)
-
-    picks = []
-    for item in stocks:
-        picks.append(
-            {
-                "code": str(item.get("code", "")).zfill(6),
-                "name": item.get("name", ""),
-                "followers": item.get("followers", []),
-                "concurrent_count": item.get("concurrent_count"),
-                "total_buyers": item.get("total_buyers"),
-                "buy_amount_total": item.get("buy_amount_total"),
-                "weighted_score": item.get("weighted_score"),
-                "best_window": item.get("best_window"),
-                "known_seat_count": item.get("known_seat_count"),
-                "signals": item.get("signals"),
-            }
-        )
-    write_json_file(
-        DATA_DIR / "main_capital_picks.json",
-        {
-            "generated_at": source_generated_at,
-            "mirrored_at": mirrored_at,
-            "source": "data/capital/hot_money_candidates.json",
-            "source_generated_at": source_generated_at,
-            "source_as_of_date": source_as_of_date,
-            "count": len(picks),
-            "picks": picks,
-        },
-    )
-    return {
-        "capital_candidate_count": len(stocks),
-        "capital_snapshot": str(snapshot_path.relative_to(ROOT)),
-        "capital_source_generated_at": source_generated_at,
-        "capital_mirrored_at": mirrored_at,
-        "main_capital_picks_count": len(picks),
-    }
-
-
 def _relative_display_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(ROOT))
@@ -363,9 +281,28 @@ def collect_data_health() -> Dict[str, Any]:
                 "start_date": entry.get("start_date") if isinstance(entry, dict) else None,
                 "end_date": entry.get("end_date") if isinstance(entry, dict) else None,
             }
+        hot_money_pool = ss.pool_signature(conn, "hotmoney")
+        short_signals = ss.short_signal_status(conn)
+        history_rows = conn.execute(
+            "SELECT m.code, MAX(h.date) AS latest_date FROM sw3_member m "
+            "LEFT JOIN stock_history h ON h.code=m.code "
+            "WHERE m.is_hot_money=1 GROUP BY m.code ORDER BY m.code"
+        ).fetchall()
+        history_reference_date = max(
+            (str(row["latest_date"]) for row in history_rows if row["latest_date"]),
+            default=None,
+        )
+        history_cutoff = (
+            datetime.strptime(history_reference_date, "%Y-%m-%d")
+            - timedelta(days=HOT_MONEY_MAX_HISTORY_LAG_DAYS)
+        ).strftime("%Y-%m-%d") if history_reference_date else None
+        stale_history_codes = [
+            str(row["code"]).zfill(6)
+            for row in history_rows
+            if not row["latest_date"] or not history_cutoff or str(row["latest_date"]) < history_cutoff
+        ]
     finally:
         conn.close()
-    capital = load_json_file(HOT_MONEY_CANDIDATES_FILE, {})
     strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
     candidate_cache = load_json_file(DATA_DIR / "stock_strategy_candidate_cache.json", {})
     long_cache = candidate_cache.get("long") if isinstance(candidate_cache, dict) else {}
@@ -373,8 +310,16 @@ def collect_data_health() -> Dict[str, Any]:
     return {
         "stock_data_files": stock_data_count,
         "stock_history_files": stock_history_count,
-        "capital_candidate_count": capital.get("count") if isinstance(capital, dict) else None,
-        "capital_generated_at": capital.get("generated_at") if isinstance(capital, dict) else None,
+        "hot_money_pool_count": hot_money_pool.get("count"),
+        "hot_money_pool_digest": hot_money_pool.get("code_digest"),
+        "hot_money_history_reference_date": history_reference_date,
+        "hot_money_history_cutoff": history_cutoff,
+        "hot_money_history_fresh_count": len(history_rows) - len(stale_history_codes),
+        "hot_money_history_stale_count": len(stale_history_codes),
+        "hot_money_history_stale_sample": stale_history_codes[:20],
+        "short_signal_count": short_signals.get("count"),
+        "short_signal_generated_at": short_signals.get("generated_at"),
+        "short_signal_as_of_date": short_signals.get("as_of_date"),
         "strategy_generated_at": strategy.get("generated_at") if isinstance(strategy, dict) else None,
         "strategy_candidate_cache_version": candidate_cache.get("version") if isinstance(candidate_cache, dict) else None,
         "strategy_long_cache_generated_at": long_cache.get("generated_at") if isinstance(long_cache, dict) else None,
@@ -477,17 +422,6 @@ def refresh_before_server(
 
     steps.append(
         run_step(
-            "dragon_tiger_capital",
-            # 龙虎榜阈值固定为刷新口径(覆盖 hot_money 自身默认 20/2/20)；要调改这里或单独跑 stock_crawl_hot_money.py
-            [python_bin, "-B", "stock_crawl_hot_money.py",
-             "--days", "14", "--top-yyb", "30", "--min-followers", "1", "--score-top", "100"],
-            timeout=timeout,
-            env=env,
-        )
-    )
-
-    steps.append(
-        run_step(
             "shareholder_count_history",
             [python_bin, "-B", "stock_crawl_holders.py", "--no-proxy"],
             timeout=timeout,
@@ -505,13 +439,24 @@ def refresh_before_server(
         )
     )
 
-    mirror_step = local_step_result(
-        "mirror_capital_outputs",
-        "mirror data/capital/hot_money_candidates.json -> data/main_capital_picks.json",
-        mirror_capital_outputs,
+    hot_money_universe_step = run_step(
+        "hot_money_small_cap_universe",
+        [python_bin, "-B", "stock_crawl_hot_money_universe.py"],
+        timeout=timeout,
+        env=env,
     )
-    steps.append(mirror_step)
-    mirror_meta = mirror_step.meta
+    steps.append(hot_money_universe_step)
+
+    steps.append(
+        run_step(
+            "short_signal_enrichment",
+            [python_bin, "-B", "stock_crawl_hot_money.py",
+             "--days", "14", "--top-yyb", "30"],
+            timeout=timeout,
+            env=env,
+            skip=not hot_money_universe_step.ok,
+        )
+    )
 
     steps.append(
         run_step(
@@ -524,7 +469,7 @@ def refresh_before_server(
 
     finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     health = collect_data_health()
-    ok = all(step.ok for step in steps)
+    ok = all(step.ok for step in steps) and not health.get("hot_money_history_stale_count")
     report = {
         "started_at": started_at,
         "finished_at": finished_at,
@@ -532,7 +477,6 @@ def refresh_before_server(
         "python": python_bin,
         "ok": ok,
         "steps": [step.to_dict() for step in steps],
-        "mirror": mirror_meta,
         "health": health,
     }
     write_json_file(REFRESH_REPORT_FILE, report)

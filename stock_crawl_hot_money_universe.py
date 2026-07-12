@@ -1,8 +1,8 @@
 """游资小盘 universe 选股 + 建池。
 
-目标：产出一个【稳定的小盘题材/游资活跃股票池】，供 stock_hot_money_radar.py 做截面打分
-和多年 verify 回测——区别于 stock_crawl_hot_money.py（基于龙虎榜席位共振的【每日 T+1 交易信号】、
-只爬 60 日 K 线、不做 PIT 回测）。
+目标：产出一个【稳定的小盘题材/游资活跃股票池】，同时供 stock_hot_money_radar.py
+和 stock_advanced_strategies.py 做截面打分。stock_crawl_hot_money.py 只为本池刷新
+龙虎榜席位与技术面补充信号，不再另建候选池。
 
 口径（用户确定）：
   · 游资活跃度主筛 = 近 1 年龙虎榜上榜 ≥ N 次（N 默认 5；龙虎榜高频 = 游资活跃 + 题材热门二合一）。
@@ -18,19 +18,14 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 os.environ.setdefault("STOCK_CRAWL_NO_PROXY", "1")
 
 import stock_storage
-from stock_crawl_common import (
-    fetch_qfq_daily_records,
-    latest_weekday_date,
-    retry_fetch_or_none as _retry,
-    strip_proxy_env,
-)
+from stock_crawl_common import strip_proxy_env
+from stock_crawl_price_valuation import refresh_stock_histories
 
 strip_proxy_env()
 
@@ -40,10 +35,7 @@ DEFAULT_MAX_CAP_YI = 100.0
 DEFAULT_WORKERS = 6          # 别调高：>6 易把龙虎榜/K线接口跑挂(限流)
 DEFAULT_YEARS = 4.0         # 覆盖 verify 的 LOOKBACK(90)+WINDOW(750)+前向(40) ≈ 880 交易日
 MIN_BARS = 250              # 上市/数据不足(次新)门槛：有效日线 < 250 视为次新剔除
-
-
-def _lookback_start(years: float) -> str:
-    return (datetime.now() - timedelta(days=int(years * 365))).strftime("%Y-%m-%d")
+MAX_HISTORY_LAG_DAYS = 7    # 停牌容忍；超过则不进入需要即时交易的游资小盘池
 
 
 def select_seed(conn, min_lhb: int, since: str) -> Dict[str, List[str]]:
@@ -73,17 +65,46 @@ def _bars_count(conn, code: str) -> int:
     ).fetchone()[0]
 
 
-def crawl_one(code: str, name: str, start: str, end: str) -> tuple:
-    """爬单只 ≥start K 线(含量额换手)并 upsert。返回 (code, status, bars)。"""
+def latest_history_dates(conn, codes: List[str]) -> Dict[str, str]:
+    """批量读取每只候选的实际最新K线日。"""
+    out: Dict[str, str] = {}
+    for start in range(0, len(codes), 500):
+        chunk = codes[start:start + 500]
+        if not chunk:
+            continue
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT code, MAX(date) AS latest_date FROM stock_history "
+            f"WHERE code IN ({placeholders}) GROUP BY code",
+            chunk,
+        ).fetchall()
+        out.update({
+            str(row["code"]).zfill(6): str(row["latest_date"])
+            for row in rows if row["latest_date"]
+        })
+    return out
+
+
+def history_is_fresh(latest_date: Optional[str], reference_date: Optional[str],
+                     max_lag_days: int = MAX_HISTORY_LAG_DAYS) -> bool:
+    if not latest_date or not reference_date:
+        return False
     try:
-        recs = _retry(fetch_qfq_daily_records, code, start, end, include_trading_value=True)
-    except Exception as e:
-        return (code, f"ERR:{type(e).__name__}", 0)
-    if not recs:
-        return (code, "EMPTY", 0)
-    conn = stock_storage.thread_conn()
-    stock_storage.upsert_history_records(conn, code, name, recs, source="hot_money_universe")
-    return (code, "OK", len(recs))
+        lag = datetime.strptime(reference_date, "%Y-%m-%d") - datetime.strptime(latest_date, "%Y-%m-%d")
+    except ValueError:
+        return False
+    return lag.days <= max_lag_days
+
+
+def refresh_seed_histories(codes: List[str], names: Dict[str, str], *, years: float, workers: int):
+    """初筛候选统一复用龙头历史更新器；最终市值过滤必须在它完成后执行。"""
+    return refresh_stock_histories(
+        {code: names.get(code, "") for code in codes},
+        max_years=years,
+        workers=workers,
+        refresh_valuation=False,
+        label="游资初筛",
+    )
 
 
 def float_cap_yi(conn, code: str) -> Optional[float]:
@@ -109,7 +130,6 @@ def main() -> None:
     args = ap.parse_args()
 
     since = args.since or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
-    start, end = _lookback_start(args.years), latest_weekday_date()
     conn = stock_storage.connect()
     seed = select_seed(conn, args.min_lhb, since)
     in_member, not_member, names = seed["in_member"], seed["not_member"], seed["names"]
@@ -117,8 +137,13 @@ def main() -> None:
     print(f"  在 sw3_member(可建池): {len(in_member)}  ·  不在 sw3_member(TODO后补): {len(not_member)}")
 
     if args.dry_run:
-        need = [c for c in in_member if _bars_count(conn, c) < MIN_BARS]
-        print(f"  [dry-run] 其中需补 K 线(<{MIN_BARS}日): {len(need)}  ·  已够: {len(in_member)-len(need)}")
+        latest_map = latest_history_dates(conn, in_member)
+        reference = conn.execute("SELECT MAX(date) FROM stock_history").fetchone()[0]
+        need = [
+            c for c in in_member
+            if _bars_count(conn, c) < MIN_BARS or not history_is_fresh(latest_map.get(c), reference)
+        ]
+        print(f"  [dry-run] 需补/刷新 K 线: {len(need)}  ·  已足量且新鲜: {len(in_member)-len(need)}")
         if not_member[:10]:
             print(f"  [dry-run] 不在册样本: {' '.join(not_member[:10])}")
         conn.close()
@@ -126,32 +151,28 @@ def main() -> None:
 
     # 1) 加 is_hot_money 列
     stock_storage._ensure_table_columns(conn, "sw3_member", {"is_hot_money": "INTEGER NOT NULL DEFAULT 0"})
+    conn.commit()
 
-    # 2) 爬缺/不足历史的 K 线
-    need = [c for c in in_member if _bars_count(conn, c) < MIN_BARS or _bars_count(conn, c) < args.years * 200]
-    print(f"\n爬 K 线：{len(need)} 只待补 / {args.workers} 线程 / 历史 {start}..{end}")
-    ok = fail = 0
-    with ThreadPoolExecutor(max_workers=args.workers) as ex:
-        futs = {ex.submit(crawl_one, c, names.get(c, ""), start, end): c for c in need}
-        for i, fut in enumerate(as_completed(futs), 1):
-            code, status, n = fut.result()
-            if status == "OK":
-                ok += 1
-            else:
-                fail += 1
-                if fail <= 8:
-                    print(f"  [FAIL] {code}: {status}")
-            if i % 50 == 0:
-                print(f"  进度 {i}/{len(need)}  ok={ok} fail={fail}")
-    print(f"爬取完成 ok={ok} fail={fail}")
+    # 2) 初筛完成后，复用龙头池的统一增量更新器。必须先刷新再算流通市值，避免旧行情误筛。
+    refresh_result = refresh_seed_histories(
+        in_member, names, years=args.years, workers=args.workers
+    )
+    if refresh_result["failed"]:
+        print(f"  [WARN] 历史刷新失败 {len(refresh_result['failed'])} 只；新鲜度门槛会阻止旧数据入池")
+
+    latest_map = latest_history_dates(conn, in_member)
+    reference_date = conn.execute("SELECT MAX(date) FROM stock_history").fetchone()[0]
 
     # 3) 流通市值过滤 + 次新过滤 → 标记 is_hot_money
     conn.execute("UPDATE sw3_member SET is_hot_money = 0 WHERE is_hot_money = 1")
-    selected, skip_cap, skip_new, skip_nocap = [], 0, 0, 0
+    selected, skip_cap, skip_new, skip_nocap, skip_stale = [], 0, 0, 0, 0
     for c in in_member:
         bars = _bars_count(conn, c)
         if bars < MIN_BARS:
             skip_new += 1
+            continue
+        if not history_is_fresh(latest_map.get(c), reference_date):
+            skip_stale += 1
             continue
         cap = float_cap_yi(conn, c)
         if cap is None:
@@ -166,7 +187,10 @@ def main() -> None:
     conn.commit()
     print(f"\n=== 建池完成 ===")
     print(f"  入池(is_hot_money=1): {len(selected)}")
-    print(f"  剔除: 流通市值>{args.max_cap}亿 {skip_cap} · 次新(<{MIN_BARS}日) {skip_new} · 无市值数据 {skip_nocap}")
+    print(
+        f"  剔除: 流通市值>{args.max_cap}亿 {skip_cap} · 次新(<{MIN_BARS}日) {skip_new} "
+        f"· K线落后>{MAX_HISTORY_LAG_DAYS}天 {skip_stale} · 无市值数据 {skip_nocap}"
+    )
     print(f"  不在 sw3_member 未处理(TODO): {len(not_member)}")
     conn.close()
 

@@ -19,6 +19,28 @@
 .radar-head { display: flex; align-items: baseline; gap: 12px; }
 .radar-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 
+.radar-score-guide {
+  flex: 1 1 500px;
+  min-width: 360px;
+  max-width: 720px;
+  padding: 10px 12px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+.radar-score-guide-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; }
+.radar-score-guide-head strong { color: var(--ink); font-size: 12px; }
+.radar-score-guide-head span { white-space: nowrap; }
+.radar-score-formula { margin: 5px 0; color: var(--blue); font-weight: 700; }
+.radar-score-breakdown { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 14px; }
+.radar-score-breakdown p,
+.radar-score-note { margin: 0; }
+.radar-score-breakdown b { color: var(--ink); }
+.radar-score-note { margin-top: 5px; }
+
 .radar .btn {
   border: 1px solid var(--line);
   background: var(--panel);
@@ -269,6 +291,11 @@
 }
 
 @media (max-width: 720px) {
+  .radar-score-guide {
+    min-width: 0;
+    max-width: none;
+  }
+  .radar-score-breakdown { grid-template-columns: 1fr; }
   .industry-filter-panel {
     position: fixed;
     left: 14px;
@@ -334,10 +361,10 @@ table.radar-grid td.pats { white-space: nowrap; }
   background: var(--panel-soft);
   color: var(--muted);
 }
-.pat.pg { background: #eaf7ef; color: #14804a; font-weight: 700; }   /* P3 绿 */
+.pat.pg { background: #eaf7ef; color: #14804a; font-weight: 700; }   /* 有效吸筹买点 */
 .pat.py { background: #fbf3df; color: #8a6d1f; font-weight: 700; }   /* 黄(备用) */
-.pat.po { background: #fdeede; color: #b4530e; font-weight: 700; }   /* P11 橙(突破) */
-.pat.pr { background: #fdebe4; color: #b3340f; font-weight: 700; }   /* P19/P20 红 */
+.pat.po { background: #fdeede; color: #b4530e; font-weight: 700; }   /* 有效超短动量 */
+.pat.pr { background: #fdebe4; color: #b3340f; font-weight: 700; }   /* 有效负向风险/出货风控 */
 .pat.pd { background: var(--panel-soft); color: var(--muted); }
 
 table.radar-grid td.ev-cell { white-space: normal; min-width: 200px; max-width: 320px; }

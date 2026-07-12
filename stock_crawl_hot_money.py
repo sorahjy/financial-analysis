@@ -1,6 +1,7 @@
-"""
-爬取龙虎榜数据：活跃营业部（主力席位）、每日明细、机构买卖统计、个股上榜统计，
-按共振席位聚合候选池，并落盘短线策略需要的原始 signals（龙虎榜/机构/统计/技术面）。
+"""刷新 A 股短线策略的龙虎榜/席位/技术面补充信号。
+
+短线池成员资格只来自 ``sw3_member.is_hot_money=1``（与游资雷达的小盘池一致）。
+本脚本不会再筛选、扩充或缩减候选池，只为固定成员写入可缺省的 signals。
 
 数据来源（东方财富网 - 数据中心 - 龙虎榜单）:
     akshare.stock_lhb_hyyyb_em            每日活跃营业部（席位 → 买入股票）
@@ -11,29 +12,23 @@
 """
 
 import argparse
-import json
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
-from pathlib import Path
 
 import akshare as ak
 
 import stock_storage
 from stock_crawl_common import (
     analysis_records_from_history_records,
-    fetch_qfq_daily_records,
-    latest_weekday_date,
     retry_fetch_or_none as _retry,
     safe_num as _num,
     strip_proxy_env,
 )
 
 KLINE_LOOKBACK = 60      # 取最近 60 个交易日（足够算 MA20 / RSI / 距高点）
-KLINE_FETCH_CALENDAR_DAYS = 140  # 首次补 K 线取约半年自然日，覆盖 60 个交易日和长假
+MAX_HISTORY_LAG_DAYS = 7  # 与建池层一致；短线信号不接受长期停滞的本地K线
 THREAD_COUNT = 6         # 不要调高：>6 易被龙虎榜/K线接口限流甚至跑挂
-DATA_DIR = Path("data/capital")
-CANDIDATES_FILE = DATA_DIR / "hot_money_candidates.json"
 KNOWN_SEAT_TOP_N = 100   # 营业部排行前 N 标记为高活跃/知名席位
 
 
@@ -305,23 +300,6 @@ def summarize_followers(flist):
     }
 
 
-# ─── 股票名 → 代码映射（带缓存）─────────────────────────────────
-
-_name_code_cache = None
-
-
-def get_name_code_map():
-    """全 A 股 股票名称 → 6 位代码 映射，进程内缓存一次。"""
-    global _name_code_cache
-    if _name_code_cache is None:
-        df = ak.stock_info_a_code_name()  # 列: code, name
-        _name_code_cache = {
-            str(row["name"]): str(row["code"]).zfill(6)
-            for _, row in df.iterrows()
-        }
-    return _name_code_cache
-
-
 # ─── 单只股票数据爬取（K 线）────────────────────────────────────
 
 def _has_complete_ohlcv(records):
@@ -350,43 +328,24 @@ def load_local_kline_records(code, name=None, *, lookback=None, start_date=None)
     return analysis_records if _has_complete_ohlcv(analysis_records) else []
 
 
-def fetch_stock_data(code, name):
-    """拉取最近 `KLINE_LOOKBACK` 个交易日的前复权日 K 线。
+def fetch_stock_data(code, name, *, reference_date=None):
+    """只读取统一刷新后的主库K线，并验证实际最后交易日。
 
-    Returns:
-        dict | None: {code, name, records: [{date,open,high,low,close,volume,
-            amount,change_pct,turnover_rate}, ...]}；失败返回 None。
+    K线抓取和增量合并统一由 ``stock_crawl_price_valuation.refresh_stock_histories``
+    负责；本层不再维护第二套“够60根就算新鲜”的抓取逻辑。
     """
     local_records = load_local_kline_records(code, name, lookback=KLINE_LOOKBACK)
-    if local_records:
-        return {"code": code, "name": name, "records": local_records}
-
-    end_date = latest_weekday_date()
-    start_date = (datetime.strptime(end_date, "%Y-%m-%d") - timedelta(
-        days=KLINE_FETCH_CALENDAR_DAYS
-    )).strftime("%Y-%m-%d")
-    fetched = _retry(
-        fetch_qfq_daily_records,
-        str(code).zfill(6),
-        start_date,
-        end_date,
-        include_trading_value=True,
-    )
-    if not fetched:
+    if not local_records:
         return None
-
-    conn = stock_storage.thread_conn()
-    stock_storage.upsert_history_records(
-        conn,
-        str(code).zfill(6),
-        name,
-        fetched,
-        source="stock_crawl_hot_money",
-    )
-    records = analysis_records_from_history_records(fetched)[-KLINE_LOOKBACK:]
-    if len(records) < KLINE_LOOKBACK or not _has_complete_ohlcv(records):
-        return None
-    return {"code": code, "name": name, "records": records}
+    actual_date = str(local_records[-1].get("date") or "")[:10]
+    if reference_date:
+        try:
+            lag = datetime.strptime(reference_date, "%Y-%m-%d") - datetime.strptime(actual_date, "%Y-%m-%d")
+        except ValueError:
+            return None
+        if lag.days > MAX_HISTORY_LAG_DAYS:
+            return None
+    return {"code": code, "name": name, "records": local_records, "as_of_date": actual_date}
 
 
 # ─── 打分模型 ───────────────────────────────────────────────────
@@ -483,106 +442,38 @@ def compute_tech_signals(records, code):
     }
 
 
-# ─── 候选排序 / 输出 / 落盘 ─────────────────────────────────────
+# ─── 编排：固定游资小盘池 → 补充信号 ─────────────────────────────
 
-def _candidate_sort_key(stock):
-    """仅用于 CLI 展示和落盘稳定排序，不作为策略分数。"""
-    return (
-        -(stock.get("weighted_score") or 0.0),
-        -(stock.get("concurrent_count") or 0),
-        -(stock.get("buy_amount_total") or 0.0),
-        stock.get("code") or "",
-    )
+def refresh_short_signals(days=14, top_n_yyb=20, sort_by="appearances"):
+    """为 ``is_hot_money=1`` 的全部成员刷新短线补充信号。
 
-
-def sort_candidates(stocks):
-    """按席位聚合强度做稳定排序；正式分数由 stock_advanced_strategies 计算。"""
-    return sorted(stocks, key=_candidate_sort_key)
-
-
-def print_candidates(stocks, top_n=20):
-    """打印游资候选池 Top N，不输出策略总分。"""
-    ranked = sort_candidates(stocks)
-
-    print("\n" + "=" * 110)
-    print(f"  游资候选池 Top {top_n}（仅按席位聚合强度展示，非策略评分）")
-    print("=" * 110)
-    header = (
-        _pad_visual("代码", 8)
-        + _pad_visual("名称", 14)
-        + _pad_visual("席位加权", 12)
-        + _pad_visual("共振", 8)
-        + _pad_visual("席位数", 8)
-        + _pad_visual("知名席位", 10)
-        + _pad_visual("估算买入(亿)", 14)
-        + _pad_visual("窗口", 22)
-    )
-    print(header)
-    print("-" * 110)
-    for s in ranked[:top_n]:
-        window = s.get("best_window") or []
-        window_text = "~".join(window) if len(window) >= 2 else ""
-        print(
-            _pad_visual(s["code"], 8)
-            + _pad_visual(s["name"], 14)
-            + _pad_visual(f"{(s.get('weighted_score') or 0):.1f}", 12)
-            + _pad_visual(str(s.get("concurrent_count") or 0), 8)
-            + _pad_visual(str(s.get("total_buyers") or len(s.get("followers") or [])), 8)
-            + _pad_visual(str(s.get("known_seat_count") or 0), 10)
-            + _pad_visual(f"{(s.get('buy_amount_total') or 0)/1e8:.2f}", 14)
-            + _pad_visual(window_text, 22)
-        )
-    print("=" * 110)
-    print("注: 这里不再预打分；短线最终分数由 stock_advanced_strategies.py 统一计算。")
-    return ranked
-
-
-def persist_candidates(stocks, fp=None):
-    """落盘游资候选池与原始 signals。"""
-    fp = Path(fp) if fp is not None else CANDIDATES_FILE
-    fp.parent.mkdir(parents=True, exist_ok=True)
-    ranked = sort_candidates(stocks)
-    payload = {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "as_of_date": datetime.now().strftime("%Y-%m-%d"),
-        "schema": "hot_money_candidates.v1",
-        "count": len(ranked),
-        "stocks": [
-            {
-                "code": s["code"],
-                "name": s["name"],
-                "followers": s["followers"],
-                "concurrent_count": s.get("concurrent_count"),
-                "total_buyers": s.get("total_buyers"),
-                "buy_amount_total": s.get("buy_amount_total"),
-                "weighted_score": s.get("weighted_score"),
-                "best_window": s.get("best_window"),
-                "known_seat_count": s.get("known_seat_count"),
-                "signals": s.get("signals"),
-                # 不落 records 防止文件过大
-            }
-            for s in ranked
-        ],
-    }
-    with open(fp, "w", encoding="utf-8") as f:
-        json.dump(payload, f, ensure_ascii=False, indent=2)
-    print(f"  → 已落盘 {fp} (共 {len(ranked)} 条)")
-
-
-# ─── 编排：席位 → 股票 → 数据爬取 ───────────────────────────────
-
-def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
-                              min_followers=2, score_top=20):
-    """主流程：龙虎榜 → 共振股票池 → 并发拉 K 线 → 原始信号落盘。
-
-    Args:
-        min_followers: 至少被多少个 Top 席位共买才纳入候选池，默认 2（更聚焦共振）。
-        score_top:     终端候选池展示前 N 条；保留参数名兼容原 CLI。
-
-    Returns:
-        list[dict]: 候选股票列表（已按席位聚合强度排序）。
+    活跃席位接口整体失败或固定池为空时直接报错且不改旧快照；单只技术面失败只会让
+    该字段缺失，不会改变成员资格，也不会导致股票从策略候选池消失。
     """
-    df = fetch_active_yyb(days=days)
+    conn = stock_storage.connect()
+    members = stock_storage.pool_members(conn, "hotmoney")
+    if not members:
+        conn.close()
+        raise RuntimeError(
+            "游资小盘池为空；请先运行 stock_crawl_hot_money_universe.py 建立 is_hot_money 标记"
+        )
+    row = conn.execute(
+        "SELECT MAX(h.date) AS latest_date FROM stock_history h "
+        "JOIN sw3_member m ON m.code=h.code WHERE m.is_hot_money=1"
+    ).fetchone()
+    history_reference_date = str(row["latest_date"]) if row and row["latest_date"] else None
+    if not history_reference_date:
+        conn.close()
+        raise RuntimeError("游资小盘池没有可用K线；请先运行统一历史刷新")
+
+    try:
+        df = fetch_active_yyb(days=days)
+    except Exception:
+        conn.close()
+        raise
+    if df is None or df.empty:
+        conn.close()
+        raise RuntimeError("活跃营业部数据为空；保留上一轮信号快照")
     print(f"共 {len(df)} 条上榜记录 · {df['营业部名称'].nunique()} 个不同营业部 · "
           f"{df['上榜日'].nunique()} 个交易日")
 
@@ -609,40 +500,41 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
     follower_map = collect_followers_from_top_yyb(
         df, agg, top_n=top_n_yyb, sort_by=sort_by, known_seats=known_seats
     )
-    pool = {
-        s: flist for s, flist in follower_map.items()
-        if len(set(f["seat"] for f in flist)) >= min_followers
-    }
-    print(f"\nTop {top_n_yyb} 席位共买入 {len(follower_map)} 只去重股票"
-          f"（≥{min_followers} 个席位共买：{len(pool)} 只）")
+    print(f"\n固定游资小盘池 {len(members)} 只；Top {top_n_yyb} 席位近期买入"
+          f" {len(follower_map)} 只去重股票（仅补充信号，不参与成员筛选）")
 
-    name_map = get_name_code_map()
-    tasks, missing = [], []
-    for stock_name in sorted(pool, key=lambda s: -len(set(f["seat"] for f in pool[s]))):
-        code = name_map.get(stock_name)
-        if not code:
-            missing.append(stock_name)
-            continue
-        tasks.append((code, stock_name, sorted(pool[stock_name], key=lambda f: f["date"])))
+    tasks = [
+        (
+            str(member["code"]).zfill(6),
+            str(member.get("name") or member["code"]),
+            sorted(follower_map.get(str(member.get("name") or ""), []), key=lambda f: f["date"]),
+        )
+        for member in members
+    ]
 
     print(f"\n开始并发拉 K 线 + 生成原始信号（{len(tasks)} 只 / {THREAD_COUNT} 线程）...")
-    results, failed = [], []
+    results, tech_failed, history_failed = [], [], []
     completed = 0
 
     def worker(code, name, followers):
-        data = fetch_stock_data(code, name)
-        if not data or not data.get("records"):
-            return ("FAIL", code, name, "empty kline")
-        data["followers"] = followers
-        data.update(summarize_followers(followers))
-        tech = compute_tech_signals(data["records"], code)
-        data["signals"] = {
+        data = fetch_stock_data(code, name, reference_date=history_reference_date)
+        records = data.get("records", []) if data else []
+        payload = {"code": code, "name": name}
+        payload["kline_as_of_date"] = data.get("as_of_date") if data else None
+        payload["followers"] = followers
+        payload.update(summarize_followers(followers))
+        tech = compute_tech_signals(records, code) if records else None
+        payload["signals"] = {
             "lhb": lhb_map.get(code),
             "inst": inst_map.get(code),
             "stat": stat_map.get(code),
             "tech": tech or None,
         }
-        return ("OK", data)
+        if not records:
+            return ("STALE_HISTORY", payload)
+        if tech is None:
+            return ("NO_TECH", payload)
+        return ("OK", payload)
 
     with ThreadPoolExecutor(max_workers=THREAD_COUNT) as ex:
         futures = [ex.submit(worker, c, n, f) for c, n, f in tasks]
@@ -650,36 +542,63 @@ def crawl_main_capital_stocks(days=14, top_n_yyb=20, sort_by="appearances",
             try:
                 res = fut.result()
             except Exception as e:
-                failed.append(("?", "?", str(e)))
+                tech_failed.append(("?", "?", str(e)))
                 res = None
             if res and res[0] == "OK":
                 results.append(res[1])
+            elif res and res[0] == "NO_TECH":
+                results.append(res[1])
+                tech_failed.append((res[1]["code"], res[1]["name"], "empty kline"))
+            elif res and res[0] == "STALE_HISTORY":
+                results.append(res[1])
+                history_failed.append((res[1]["code"], res[1]["name"]))
             elif res:
-                failed.append((res[1], res[2], res[3]))
+                tech_failed.append((res[1], res[2], res[3]))
             completed += 1
             if completed % 50 == 0:
                 print(f"  进度 {completed}/{len(tasks)}")
 
-    print(f"\n已生成候选 {len(results)} 只 · 跳过(无代码) {len(missing)} · 失败 {len(failed)}")
-    if missing:
-        sample = missing[:10]
-        more = f" ...+{len(missing) - 10}" if len(missing) > 10 else ""
-        print(f"  无代码样本: {' '.join(sample)}{more}")
-    if failed:
-        for code, name, err in failed[:5]:
-            print(f"  [FAIL] {code} {name}: {err}")
+    if len(results) != len(members):
+        conn.close()
+        raise RuntimeError(
+            f"信号快照不完整（{len(results)}/{len(members)}）；保留上一轮快照"
+        )
+    if history_failed:
+        conn.close()
+        sample = " ".join(code for code, _name in history_failed[:8])
+        raise RuntimeError(
+            f"游资池K线不新鲜/不足（{len(history_failed)}/{len(members)}，样本 {sample}）；"
+            "请先重跑 stock_crawl_hot_money_universe.py，保留上一轮信号快照"
+        )
 
-    if not results:
-        return []
-
-    ranked = print_candidates(results, top_n=score_top)
-    persist_candidates(ranked)
-    return ranked
+    generated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    actual_dates = [item.get("kline_as_of_date") for item in results if item.get("kline_as_of_date")]
+    as_of_date = min(actual_dates) if actual_dates else history_reference_date
+    try:
+        saved = stock_storage.replace_short_signals(
+            conn,
+            {item["code"]: item for item in results},
+            generated_at=generated_at,
+            as_of_date=as_of_date,
+        )
+    finally:
+        conn.close()
+    print(f"\n已刷新短线补充信号 {saved}/{len(members)} 只 · 技术面缺失 {len(tech_failed)}")
+    if tech_failed:
+        for code, name, err in tech_failed[:5]:
+            print(f"  [WARN] {code} {name}: {err}")
+    return {
+        "pool_count": len(members),
+        "signal_count": saved,
+        "tech_missing": len(tech_failed),
+        "generated_at": generated_at,
+        "as_of_date": as_of_date,
+    }
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="主力席位龙虎榜 → 共振股票池 → 原始信号候选池")
+        description="为固定游资小盘池刷新龙虎榜/席位/技术面补充信号")
     parser.add_argument("--days", type=int, default=14,
                         help="拉取最近多少自然日的龙虎榜数据，默认 14")
     parser.add_argument("--top-yyb", type=int, default=20,
@@ -687,19 +606,13 @@ def main():
     parser.add_argument("--sort", choices=["appearances", "net", "buy"],
                         default="appearances",
                         help="席位排序依据：上榜次数/净买入/买入金额")
-    parser.add_argument("--min-followers", type=int, default=2,
-                        help="股票至少被多少个 Top 席位共买才纳入候选池，默认 2")
-    parser.add_argument("--score-top", type=int, default=20,
-                        help="候选池展示前 N 条，默认 20；参数名保留兼容原命令")
     args = parser.parse_args()
 
-    print(f"拉取最近 {args.days} 天的活跃营业部数据...")
-    crawl_main_capital_stocks(
+    print(f"拉取最近 {args.days} 天的活跃营业部数据并刷新固定池信号...")
+    refresh_short_signals(
         days=args.days,
         top_n_yyb=args.top_yyb,
         sort_by=args.sort,
-        min_followers=args.min_followers,
-        score_top=args.score_top,
     )
 
 

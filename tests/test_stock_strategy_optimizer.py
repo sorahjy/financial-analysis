@@ -1,6 +1,9 @@
 import random
+import json
+import tempfile
 import unittest
 from concurrent.futures import Future
+from pathlib import Path
 from unittest.mock import patch
 
 import stock_strategy_optimizer as optimizer
@@ -97,8 +100,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             self.assertIn(f"w_{factor.key}", trial.float_names)
         for name in (
             "min_score",
-            "min_lhb_count",
-            "min_hot_money_concurrent",
             "max_consecutive_limit_up",
             "hold_days_min",
             "hold_days_max",
@@ -107,6 +108,10 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             self.assertIn(name, trial.categorical_names)
         self.assertIn(hold_days, optimizer.SHORT_HOLD_DAYS_CHOICES)
         self.assertIn("weights", cfg)
+        self.assertEqual(cfg["min_lhb_count"], 0)
+        self.assertEqual(cfg["min_hot_money_concurrent"], 0)
+        self.assertNotIn("min_lhb_count", trial.categorical_names)
+        self.assertNotIn("min_hot_money_concurrent", trial.categorical_names)
 
     def test_prepared_short_scoring_matches_scalar_scoring(self):
         broad = []
@@ -186,6 +191,64 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertEqual(submitted_by_strategy["short"][3], 1)
         self.assertNotEqual(submitted_by_strategy["long"][2], submitted_by_strategy["short"][2])
         self.assertIn("strategy_seeds", result)
+
+    def test_short_only_optimization_preserves_existing_long_config(self):
+        executor_workers = []
+
+        class FakeProcessPoolExecutor:
+            def __init__(self, max_workers=None, **_kwargs):
+                executor_workers.append(max_workers)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc, tb):
+                return False
+
+            def submit(self, fn, *args):
+                future = Future()
+                future.set_result(fn(*args))
+                return future
+
+        def fake_strategy(strategy, iterations, seed, progress_position):
+            return {
+                "strategy": strategy,
+                "iterations": iterations,
+                "best": {"config": {"kind": strategy}, "objective": 2.0},
+                "progress_position": progress_position,
+                "seed": seed,
+            }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            output_file = Path(tmpdir) / "optimization.json"
+            config_file = Path(tmpdir) / "optimized_config.json"
+            config_file.write_text(json.dumps({
+                "config": {"long": {"kept": True}, "short": {"legacy": True}},
+                "scores": {"long_objective": 9.0, "short_objective": -1.0},
+                "short_universe_version": "legacy",
+            }), encoding="utf-8")
+
+            with patch.object(optimizer, "ProcessPoolExecutor", FakeProcessPoolExecutor), \
+                 patch.object(optimizer, "_process_pool_kwargs", return_value={}), \
+                 patch.object(optimizer, "_run_strategy_optimizer", side_effect=fake_strategy), \
+                 patch.object(optimizer, "OUTPUT_FILE", output_file), \
+                 patch.object(optimizer, "OPTIMIZED_CONFIG_FILE", config_file):
+                result = optimizer.run_optimization(
+                    iterations=3,
+                    seed=123,
+                    persist=True,
+                    strategies=("short",),
+                )
+
+            saved = json.loads(config_file.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["optimized_strategies"], ["short"])
+        self.assertNotIn("long", result)
+        self.assertEqual(executor_workers, [])
+        self.assertEqual(saved["config"]["long"], {"kept": True})
+        self.assertEqual(saved["config"]["short"], {"kind": "short"})
+        self.assertEqual(saved["scores"]["long_objective"], 9.0)
+        self.assertEqual(saved["short_universe_version"], optimizer.SHORT_UNIVERSE_VERSION)
 
     def test_pit_long_scoring_requires_entry_day_trade(self):
         weights = {factor.key: 0.0 for factor in optimizer.LONG_FACTORS}

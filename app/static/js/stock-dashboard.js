@@ -348,7 +348,7 @@
     function renderControls() {
       renderParams();
       renderFactors();
-      $("title").textContent = active === "long" ? "长线大盘股策略" : "短线龙虎榜策略";
+      $("title").textContent = active === "long" ? "长线大盘股策略" : "短线游资小盘策略";
       updateLongChartButton();
       updateExportButton();
     }
@@ -873,9 +873,9 @@
     function shortPoolRules() {
       const cfg = config.short;
       return [
-        ["基础范围", "龙虎榜与资金榜股票池，优先使用本地席位、净买入、游资跟随与连板数据"],
+        ["基础范围", "与游资雷达共用游资小盘池：近一年龙虎榜活跃、非ST、日线充足且流通市值不高于100亿元"],
         ["ST过滤", cfg.exclude_st ? "剔除名称包含 ST、*ST 或 S 前缀的股票" : "不过滤ST股票，风险只进入结果提示"],
-        ["上榜次数", `近期龙虎榜上榜次数不低于 ${fmt(cfg.min_lhb_count, 0)} 次`],
+        ["上榜次数", Number(cfg.min_lhb_count || 0) > 0 ? `近期龙虎榜上榜次数不低于 ${fmt(cfg.min_lhb_count, 0)} 次` : "不做二次上榜次数过滤，龙虎榜数据只参与因子打分"],
         ["游资共振", Number(cfg.min_hot_money_concurrent || 0) > 0 ? `活跃游资/买方席位共振不低于 ${fmt(cfg.min_hot_money_concurrent, 0)} 个` : "不设置最低共振席位，交给游资网络因子打分"],
         ["连板过滤", `连续涨停不超过 ${fmt(cfg.max_consecutive_limit_up, 0)} 板`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],

@@ -91,6 +91,7 @@ class StockAdvancedStrategyTest(unittest.TestCase):
             "generated_at": "2026-06-25 14:00:00",
             "iterations_per_strategy": 1500,
             "seed": 42,
+            "short_universe_version": "hotmoney_small_cap_v1",
             "config": {
                 "long": {"top_n": 33},
                 "short": {"top_n": 6},
@@ -111,6 +112,27 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(config["short"]["top_n"], 6)
         self.assertEqual(config["_optimized_defaults"]["source"], str(backup))
         self.assertEqual(config["_optimized_defaults"]["iterations_per_strategy"], 1500)
+
+    def test_default_config_ignores_short_config_from_legacy_universe(self):
+        payload = {
+            "generated_at": "2026-06-25 14:00:00",
+            "config": {
+                "long": {"top_n": 33},
+                "short": {"top_n": 6, "min_lhb_count": 4},
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "stock_strategy_optimized_config.json"
+            backup = Path(tmpdir) / "missing_backup.json"
+            primary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+            with patch("stock_advanced_strategies.OPTIMIZED_CONFIG_FILE", primary), \
+                 patch("stock_advanced_strategies.OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                config = get_default_config()
+
+        self.assertEqual(config["long"]["top_n"], 33)
+        self.assertEqual(config["short"]["top_n"], 10)
+        self.assertEqual(config["short"]["min_lhb_count"], 0)
 
     def test_csi300_persistence_proxy_rewards_current_member(self):
         current_member = csi300_persistence_proxy(True, True)

@@ -13,6 +13,9 @@ The optimizer deliberately separates two layers:
 
 Run 1500 Optuna/TPE trials per strategy (long and short run in separate worker processes):
     python3 -B stock_strategy_optimizer.py --iterations 1500
+
+Only re-optimize the short strategy after its universe changes:
+    python3 -B stock_strategy_optimizer.py --strategy short --iterations 1500
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ from html import escape as html_escape
 from datetime import datetime
 from pathlib import Path
 from statistics import mean, pstdev
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 try:
     import optuna
@@ -55,6 +58,7 @@ from stock_advanced_strategies import (
     DEFAULT_CONFIG,
     LONG_FACTORS,
     SHORT_FACTORS,
+    SHORT_UNIVERSE_VERSION,
     apply_scores,
     build_long_candidates,
     build_short_candidates,
@@ -1291,8 +1295,6 @@ def random_short_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
     if iteration > 0:
         # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
         cfg["min_score"] = rng.choice([35, 40, 45, 50, 55, 60, 65, 70])
-        cfg["min_lhb_count"] = rng.choice([1, 2, 3, 4])
-        cfg["min_hot_money_concurrent"] = rng.choice([0, 1, 2, 3])
         cfg["max_consecutive_limit_up"] = rng.choice([1, 2, 3, 4])
         cfg["hold_days_min"] = rng.choice([1, 2])
         cfg["hold_days_max"] = rng.choice([3, 4, 5])
@@ -1371,8 +1373,6 @@ def _suggest_short_config(trial) -> Tuple[Dict[str, Any], int]:
         f.key: round(trial.suggest_float(f"w_{f.key}", 0.0, 3.0), 3) for f in SHORT_FACTORS
     }
     cfg["min_score"] = trial.suggest_categorical("min_score", SHORT_MIN_SCORE_CHOICES)
-    cfg["min_lhb_count"] = trial.suggest_categorical("min_lhb_count", [1, 2, 3, 4])
-    cfg["min_hot_money_concurrent"] = trial.suggest_categorical("min_hot_money_concurrent", [0, 1, 2, 3])
     cfg["max_consecutive_limit_up"] = trial.suggest_categorical("max_consecutive_limit_up", [1, 2, 3, 4])
     cfg["hold_days_min"] = trial.suggest_categorical("hold_days_min", [1, 2])
     cfg["hold_days_max"] = trial.suggest_categorical("hold_days_max", [3, 4, 5])
@@ -1388,8 +1388,6 @@ def _default_short_params() -> Dict[str, Any]:
         for f in SHORT_FACTORS
     }
     params["min_score"] = _nearest_choice(base.get("min_score"), SHORT_MIN_SCORE_CHOICES)
-    params["min_lhb_count"] = _nearest_choice(base.get("min_lhb_count"), [1, 2, 3, 4])
-    params["min_hot_money_concurrent"] = _nearest_choice(base.get("min_hot_money_concurrent"), [0, 1, 2, 3])
     params["max_consecutive_limit_up"] = _nearest_choice(base.get("max_consecutive_limit_up"), [1, 2, 3, 4])
     params["hold_days_min"] = _nearest_choice(base.get("hold_days_min"), [1, 2])
     params["hold_days_max"] = _nearest_choice(base.get("hold_days_max"), [3, 4, 5])
@@ -1682,6 +1680,7 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
         "candidate_count": len(broad),
         "notes": [search_note] + notes + [
             "短线候选池因子分在 trial 前预转为 NumPy 矩阵，trial 阶段向量化完成硬过滤、打分和 topN 选择。",
+            "最少上榜与最少共振默认固定为0，不参与优化；页面仍可手动调高做二次筛选。",
             "短线真实前推收益回测仅在事件日之后存在本地价格数据时使用。",
             "当前本地快照中，龙虎榜事件多数晚于缓存价格行，因此大多需要使用代理评分。",
         ],
@@ -2292,7 +2291,12 @@ def run_optimization(
     iterations: int = DEFAULT_OPTIMIZATION_ITERATIONS,
     seed: int = 20260611,
     persist: bool = True,
+    strategies: Optional[Sequence[str]] = None,
 ) -> Dict[str, Any]:
+    strategy_names = tuple(dict.fromkeys(strategies or ("long", "short")))
+    invalid = [name for name in strategy_names if name not in {"long", "short"}]
+    if invalid or not strategy_names:
+        raise ValueError(f"unsupported strategies: {invalid or strategy_names}")
     master_rng = random.Random(seed)
     strategy_seeds = {
         "long": master_rng.randrange(2 ** 31),
@@ -2300,32 +2304,42 @@ def run_optimization(
     }
     started = datetime.now()
     strategy_results: Dict[str, Dict[str, Any]] = {}
-    jobs = {
+    all_jobs = {
         "long": (strategy_seeds["long"], 0),
         "short": (strategy_seeds["short"], 1),
     }
-    with ProcessPoolExecutor(max_workers=2, **_process_pool_kwargs()) as executor:
-        futures = {
-            executor.submit(_run_strategy_optimizer, key, iterations, child_seed, position): key
-            for key, (child_seed, position) in jobs.items()
-        }
-        for future in as_completed(futures):
-            key = futures[future]
-            try:
-                strategy_results[key] = future.result()
-            except Exception as exc:
-                raise RuntimeError(f"{key} 策略参数搜索失败：{exc}") from exc
+    jobs = {name: all_jobs[name] for name in strategy_names}
+    if len(jobs) == 1:
+        key, (child_seed, position) = next(iter(jobs.items()))
+        try:
+            strategy_results[key] = _run_strategy_optimizer(
+                key, iterations, child_seed, position
+            )
+        except Exception as exc:
+            raise RuntimeError(f"{key} 策略参数搜索失败：{exc}") from exc
+    else:
+        with ProcessPoolExecutor(max_workers=len(jobs), **_process_pool_kwargs()) as executor:
+            futures = {
+                executor.submit(_run_strategy_optimizer, key, iterations, child_seed, position): key
+                for key, (child_seed, position) in jobs.items()
+            }
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    strategy_results[key] = future.result()
+                except Exception as exc:
+                    raise RuntimeError(f"{key} 策略参数搜索失败：{exc}") from exc
 
-    result = {
+    result: Dict[str, Any] = {
         "generated_at": started.strftime("%Y-%m-%d %H:%M:%S"),
         "iterations_per_strategy": iterations,
+        "optimized_strategies": list(strategy_names),
         "seed": seed,
         "strategy_seeds": strategy_seeds,
         "research_basis": RESEARCH_BASIS,
-        "long": strategy_results["long"],
-        "short": strategy_results["short"],
     }
-    if persist:
+    result.update(strategy_results)
+    if persist and "long" in strategy_results:
         try:
             chart = create_best_long_fold_path_chart(result["long"])
             result["long"]["best_fold_path_chart"] = chart
@@ -2339,23 +2353,41 @@ def run_optimization(
     result["elapsed_seconds"] = round((datetime.now() - started).total_seconds(), 3)
     if persist:
         OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+        persisted_result: Dict[str, Any] = {}
+        if len(strategy_names) == 1 and OUTPUT_FILE.exists():
+            try:
+                previous = json.loads(OUTPUT_FILE.read_text(encoding="utf-8"))
+                if isinstance(previous, dict):
+                    persisted_result.update(previous)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        persisted_result.update(result)
         with open(OUTPUT_FILE, "w", encoding="utf-8") as fp:
-            json.dump(result, fp, ensure_ascii=False, indent=2)
-        optimized_config = {
+            json.dump(persisted_result, fp, ensure_ascii=False, indent=2)
+
+        optimized_config: Dict[str, Any] = {}
+        if len(strategy_names) == 1 and OPTIMIZED_CONFIG_FILE.exists():
+            try:
+                previous = json.loads(OPTIMIZED_CONFIG_FILE.read_text(encoding="utf-8"))
+                if isinstance(previous, dict):
+                    optimized_config.update(previous)
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+        optimized_config.update({
             "generated_at": result["generated_at"],
             "iterations_per_strategy": iterations,
+            "optimized_strategies": list(strategy_names),
             "seed": seed,
             "strategy_seeds": result.get("strategy_seeds", {}),
-            "config": {
-                "long": result["long"]["best"]["config"],
-                "short": result["short"]["best"]["config"],
-            },
-            "scores": {
-                "long_objective": result["long"]["best"]["objective"],
-                "short_objective": result["short"]["best"]["objective"],
-            },
-            "caveat": "基于当前可用的本地/代理数据优化；刷新历史价格与龙虎榜快照后建议重新运行。",
-        }
+            "caveat": "基于当前可用的本地/代理数据优化；刷新历史价格或短线信号快照后建议重新运行。",
+        })
+        if "short" in strategy_results:
+            optimized_config["short_universe_version"] = SHORT_UNIVERSE_VERSION
+        saved_config = optimized_config.setdefault("config", {})
+        saved_scores = optimized_config.setdefault("scores", {})
+        for name, section in strategy_results.items():
+            saved_config[name] = section["best"]["config"]
+            saved_scores[f"{name}_objective"] = section["best"]["objective"]
         with open(OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
             json.dump(optimized_config, fp, ensure_ascii=False, indent=2)
     return result
@@ -2421,8 +2453,13 @@ def print_summary(result: Dict[str, Any]) -> None:
         "long": "长线策略",
         "short": "短线策略",
     }
-    for key in ("long", "short"):
-        section = result[key]
+    strategy_names = result.get("optimized_strategies") or [
+        key for key in ("long", "short") if result.get(key)
+    ]
+    for key in strategy_names:
+        section = result.get(key)
+        if not section:
+            continue
         best = section["best"]
         label = strategy_labels.get(key, key)
         print()
@@ -2461,12 +2498,20 @@ def print_summary(result: Dict[str, Any]) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="搜索股票策略因子权重和参数")
+    parser.add_argument("--strategy", choices=["all", "long", "short"], default="all",
+                        help="选择要重跑的策略；单策略模式保留另一策略已有优化配置")
     parser.add_argument("--iterations", type=int, default=DEFAULT_OPTIMIZATION_ITERATIONS, help="每个策略的搜索迭代次数")
     parser.add_argument("--seed", type=int, default=2333, help="随机种子")
     parser.add_argument("--no-persist", action="store_true", help="只打印结果，不写入结果文件")
     args = parser.parse_args()
+    strategies = ("long", "short") if args.strategy == "all" else (args.strategy,)
     try:
-        result = run_optimization(args.iterations, args.seed, persist=not args.no_persist)
+        result = run_optimization(
+            args.iterations,
+            args.seed,
+            persist=not args.no_persist,
+            strategies=strategies,
+        )
     except RuntimeError as exc:
         print(f"[ERROR] {exc}")
         raise SystemExit(1) from None

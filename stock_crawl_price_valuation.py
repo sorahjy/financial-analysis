@@ -378,7 +378,13 @@ def _decide_valuation_period(records, today):
     return "近一年" if gap_days <= 300 else "近五年"
 
 
-def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_info=None, save_callback=None):
+def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_info=None,
+                  save_callback=None, max_years=MAX_YEARS, refresh_valuation=True):
+    """复用型单股历史刷新器。
+
+    龙头池使用默认的 10 年历史并刷新估值；其他股票池可传入较短 ``max_years`` 且关闭
+    ``refresh_valuation``，但日线的缺口判断、增量抓取、字段合并和 SQLite 写入完全共用。
+    """
     existing = load_stock_file(code, name)
     existing_records = existing.get("records", [])
     raw_count = len(existing_records)  # C: 增量快路用——现有行是否被 prune/未来日期过滤改动
@@ -404,7 +410,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             end_date = None
 
     max_start = (
-        datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * MAX_YEARS)
+        datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * float(max_years))
     ).strftime("%Y-%m-%d")
 
     hist_new_records = []
@@ -437,7 +443,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     val_period = None
     if merged:
         # 估值：按 merged（合并后最新状态）判断是否需要拉取及拉取哪个period
-        val_period = _decide_valuation_period(merged, today)
+        val_period = _decide_valuation_period(merged, today) if refresh_valuation else None
         if val_period is not None:
             val_by_date = fetch_valuation_data(code, period=val_period)
             if val_by_date:
@@ -491,6 +497,90 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         parts.append("财报已刷新")
     write_state = "已入写库队列" if queued_write else "已写库"
     safe_print(f"[{idx}/{total}] {code} {name}: {write_state} | " + " | ".join(parts))
+
+
+def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT,
+                            refresh_valuation=True, fundamentals_plan=None,
+                            pledge_map=None, label="股票池"):
+    """批量刷新任意股票池，统一复用龙头池的单股增量更新与单写线程。
+
+    ``stocks`` 为 ``{code: name}``。返回本轮抓取/写库统计和失败代码；调用方据此做池级
+    新鲜度检查，不能再仅凭历史条数判断数据已经更新。
+    """
+    items = list((stocks or {}).items())
+    total = len(items)
+    fundamentals_plan = fundamentals_plan or {}
+    pledge_map = pledge_map or {}
+    failed = []
+    completed = 0
+    counter_lock = threading.Lock()
+    db_writer = StockDbWriter()
+    db_writer.start()
+    safe_print(
+        f"[{label}] 统一历史刷新：{total} 只 / {workers} 线程 / "
+        f"近 {float(max_years):g} 年 / 估值={'开' if refresh_valuation else '关'}"
+    )
+
+    def worker(args):
+        nonlocal completed
+        idx_local, (code, name) = args
+        try:
+            process_stock(
+                code,
+                name,
+                idx_local,
+                total,
+                need_fundamentals=fundamentals_plan.get(code, False),
+                pledge_info=pledge_map.get(code),
+                save_callback=db_writer.enqueue,
+                max_years=max_years,
+                refresh_valuation=refresh_valuation,
+            )
+        except Exception as exc:
+            safe_print(f"[ERROR] {code} {name}: {exc}")
+            with counter_lock:
+                failed.append((code, name))
+        finally:
+            with counter_lock:
+                completed += 1
+                if completed % 100 == 0:
+                    safe_print(
+                        f"── {label}抓取进度 {completed}/{total}，"
+                        f"写库已排队 {db_writer.enqueued} / 已写 {db_writer.completed} "
+                        f"/ 队列 {db_writer.queue.qsize()} ──"
+                    )
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as executor:
+            futures = [executor.submit(worker, (i + 1, item)) for i, item in enumerate(items)]
+            for future in as_completed(futures):
+                future.result()
+    finally:
+        safe_print(
+            f"[{label}] 抓取线程完成，等待写库："
+            f"已排队 {db_writer.enqueued} / 已写 {db_writer.completed} / 队列 {db_writer.queue.qsize()}"
+        )
+        db_writer.wait()
+
+    try:
+        synced = ss.sync_sw3_member_market_caps(ss.thread_conn())
+        safe_print(f"[{label}] sw3 市值批量同步: {synced} 行")
+    except Exception as exc:
+        safe_print(f"[WARN] [{label}] sw3 市值批量同步失败: {exc}")
+
+    failed.extend(db_writer.failed)
+    result = {
+        "requested": total,
+        "processed": completed,
+        "write_enqueued": db_writer.enqueued,
+        "write_completed": db_writer.completed,
+        "failed": [code for code, _name in failed],
+    }
+    safe_print(
+        f"[{label}] 完成：处理 {completed}/{total}，写库 {db_writer.completed}/{db_writer.enqueued}，"
+        f"失败 {len(failed)}"
+    )
+    return result
 
 
 # ─── ETF 基准 ─────────────────────────────────────────────────
@@ -654,68 +744,16 @@ def _plan_fundamentals_refresh(codes):
 def main():
     stocks = get_segment_leader_stocks()
     needs_fund, pledge_map = _plan_fundamentals_refresh(set(stocks))
-
-    items = list(stocks.items())
-    total = len(items)
-    completed = 0
-    failed = []
-    counter_lock = threading.Lock()
-    db_writer = StockDbWriter()
-    db_writer.start()
-
-    def worker(args):
-        nonlocal completed
-        idx_local, (code, name) = args
-        try:
-            process_stock(code, name, idx_local, total,
-                          need_fundamentals=needs_fund.get(code, False),
-                          pledge_info=pledge_map.get(code),
-                          save_callback=db_writer.enqueue)
-        except Exception as e:
-            safe_print(f"[ERROR] {code} {name}: {e}")
-            with counter_lock:
-                failed.append((code, name))
-        finally:
-            with counter_lock:
-                completed += 1
-                if completed % 100 == 0:
-                    safe_print(
-                        f"── 抓取进度 {completed}/{total}，"
-                        f"写库已排队 {db_writer.enqueued} / 已写 {db_writer.completed} "
-                        f"/ 队列 {db_writer.queue.qsize()} ──"
-                    )
-
-    try:
-        with ThreadPoolExecutor(max_workers=THREAD_COUNT) as executor:
-            futures = [executor.submit(worker, (i + 1, item)) for i, item in enumerate(items)]
-            for f in as_completed(futures):
-                pass
-    finally:
-        safe_print(
-            f"抓取线程完成，等待写库队列清空："
-            f"已排队 {db_writer.enqueued} / 已写 {db_writer.completed} / 队列 {db_writer.queue.qsize()}"
-        )
-        db_writer.wait()
-
-    # 整轮写完后批量把最新总市值同步进 sw3_member（取代旧的每只 save 都查大表同步单只）。
-    try:
-        synced = ss.sync_sw3_member_market_caps(ss.thread_conn())
-        safe_print(f"sw3 市值批量同步: {synced} 行")
-    except Exception as exc:
-        safe_print(f"[WARN] sw3 市值批量同步失败: {exc}")
-
-    fetch_failed_count = len(failed)
-    failed.extend(db_writer.failed)
-    safe_print(
-        f"\n完成！抓取成功: {total - fetch_failed_count}/{total}；"
-        f"写库成功: {db_writer.completed}/{db_writer.enqueued}；"
-        f"写库失败: {len(db_writer.failed)}"
+    result = refresh_stock_histories(
+        stocks,
+        max_years=MAX_YEARS,
+        workers=THREAD_COUNT,
+        refresh_valuation=True,
+        fundamentals_plan=needs_fund,
+        pledge_map=pledge_map,
+        label="细分龙头",
     )
-    if failed:
-        safe_print(f"失败 {len(failed)} 只:")
-        for code, name in failed:
-            safe_print(f"  {code} {name}")
-    return failed
+    return [(code, stocks.get(code, "")) for code in result["failed"]]
 
 
 if __name__ == "__main__":

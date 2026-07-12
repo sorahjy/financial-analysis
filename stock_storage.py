@@ -13,6 +13,7 @@ load_stock() 把行重新拼回原 JSON dict，消费方(stock_advanced_strategi
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -34,7 +35,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 SQLITE_BUSY_TIMEOUT_MS = 120000
 # 批量刷新友好的连接级调优（均为连接局部或不写库文件，不扰动 user_version/mtime）：
 #   cache_size 负值=KB，每连接一块页缓存减少大表反复读盘（多线程下 N 连接各占一份，故默认偏保守 16MB）；
@@ -185,11 +186,26 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             profit_growth_pct  REAL,
             revenue_growth_pct REAL,
             is_leader          INTEGER NOT NULL DEFAULT 0,
+            is_hot_money       INTEGER NOT NULL DEFAULT 0,
             FOREIGN KEY (segment_code) REFERENCES sw3_segment (segment_code) ON DELETE CASCADE
         );
 
         CREATE INDEX IF NOT EXISTS idx_sw3_member_segment
         ON sw3_member (segment_code);
+
+        -- A股短线策略的龙虎榜/席位/技术面信号快照。池成员资格只由
+        -- sw3_member.is_hot_money 决定，本表仅提供可缺省的打分补充数据。
+        CREATE TABLE IF NOT EXISTS short_signal_snapshot (
+            code         TEXT PRIMARY KEY,
+            generated_at TEXT NOT NULL,
+            as_of_date   TEXT,
+            payload_json TEXT NOT NULL,
+            updated_at   TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (code) REFERENCES sw3_member (code) ON DELETE CASCADE
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_short_signal_generated_at
+        ON short_signal_snapshot (generated_at);
         """
     )
     _ensure_table_columns(conn, "sw3_member", {
@@ -197,6 +213,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         # 细分龙头标记：build_segment_leader_pool 选出龙头后回写(见 mark_sw3_leaders)，
         # 供主力雷达等模块直接 WHERE is_leader=1 取候选池，无需再解析 segment_leader_pool.json。
         "is_leader": "INTEGER NOT NULL DEFAULT 0",
+        # 游资小盘池是游资雷达与 A 股短线策略共用的唯一成员口径。
+        "is_hot_money": "INTEGER NOT NULL DEFAULT 0",
     })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -765,6 +783,134 @@ def pool_members(conn: sqlite3.Connection, pool: str = "leader") -> List[Dict[st
 def leader_members(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     """细分龙头(is_leader=1)成分——pool_members(pool='leader') 的兼容别名。"""
     return pool_members(conn, "leader")
+
+
+def pool_signature(conn: sqlite3.Connection, pool: str = "leader") -> Dict[str, Any]:
+    """返回池成员的稳定签名；标记变化会使候选缓存立即失效。"""
+    flag = _POOL_FLAG_COL.get(pool, "is_leader")
+    if not _sw3_has_column(conn, flag):
+        return {"pool": pool, "count": 0, "code_digest": None}
+    codes = [
+        str(row["code"]).zfill(6)
+        for row in conn.execute(
+            f"SELECT code FROM sw3_member WHERE {flag} = 1 ORDER BY code"
+        )
+    ]
+    digest = hashlib.sha256("\n".join(codes).encode("utf-8")).hexdigest()[:20]
+    return {"pool": pool, "count": len(codes), "code_digest": digest}
+
+
+def replace_short_signals(
+    conn: sqlite3.Connection,
+    signals: Mapping[str, Mapping[str, Any]],
+    *,
+    generated_at: Optional[str] = None,
+    as_of_date: Optional[str] = None,
+) -> int:
+    """原子替换短线信号快照；调用方必须先确认本轮数据源不是整体失败。
+
+    ``signals`` 只承载打分补充数据，不会写入或改变 ``is_hot_money`` 成员标记。
+    """
+    generated_at = generated_at or datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    rows = []
+    for raw_code, raw_payload in signals.items():
+        code = _normalize_code(raw_code)
+        if not code or not isinstance(raw_payload, Mapping):
+            continue
+        payload = dict(raw_payload)
+        payload["code"] = code
+        rows.append(
+            (
+                code,
+                generated_at,
+                as_of_date,
+                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
+            )
+        )
+    rows.sort(key=lambda row: row[0])
+    with _WRITE_LOCK:
+        with conn:
+            conn.execute("DELETE FROM short_signal_snapshot")
+            conn.executemany(
+                """
+                INSERT INTO short_signal_snapshot
+                    (code, generated_at, as_of_date, payload_json, updated_at)
+                VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+                """,
+                rows,
+            )
+    return len(rows)
+
+
+def load_short_signals(
+    conn: sqlite3.Connection,
+    codes: Optional[Sequence[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """读取短线补充信号，返回 ``{code: payload}``；坏行按缺失信号处理。"""
+    normalized = sorted({_normalize_code(code) for code in (codes or []) if _normalize_code(code)})
+    if codes is not None and not normalized:
+        return {}
+    if codes is None:
+        rows = conn.execute(
+            "SELECT code, generated_at, as_of_date, payload_json FROM short_signal_snapshot"
+        ).fetchall()
+    else:
+        rows = []
+        for start in range(0, len(normalized), 500):
+            chunk = normalized[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            rows.extend(
+                conn.execute(
+                    f"SELECT code, generated_at, as_of_date, payload_json "
+                    f"FROM short_signal_snapshot WHERE code IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+            )
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        try:
+            payload = json.loads(row["payload_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        code = str(row["code"]).zfill(6)
+        payload["code"] = code
+        payload.setdefault("generated_at", row["generated_at"])
+        payload.setdefault("as_of_date", row["as_of_date"])
+        out[code] = payload
+    return out
+
+
+def _short_signal_signature_from_conn(conn: sqlite3.Connection) -> Dict[str, Any]:
+    rows = conn.execute(
+        "SELECT code, generated_at, as_of_date, payload_json "
+        "FROM short_signal_snapshot ORDER BY code"
+    ).fetchall()
+    digest_source = "\n".join(
+        f"{row['code']}|{row['generated_at']}|{row['as_of_date'] or ''}|{row['payload_json']}"
+        for row in rows
+    )
+    return {
+        "count": len(rows),
+        "generated_at": max((row["generated_at"] for row in rows), default=None),
+        "as_of_date": max((row["as_of_date"] or "" for row in rows), default=None) or None,
+        "payload_digest": hashlib.sha256(digest_source.encode("utf-8")).hexdigest()[:20],
+    }
+
+
+def short_signal_status(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """复用现有连接读取短线信号覆盖与新鲜度。"""
+    return _short_signal_signature_from_conn(conn)
+
+
+def short_signal_signature(db_file: Path | str = DEFAULT_DB_FILE) -> Dict[str, Any]:
+    """短线补充信号的稳定内容签名，供策略候选缓存校验。"""
+    conn = connect(db_file)
+    try:
+        return _short_signal_signature_from_conn(conn)
+    finally:
+        conn.close()
 
 
 # ─── 读取 ──────────────────────────────────────────────────────

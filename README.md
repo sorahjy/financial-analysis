@@ -124,9 +124,9 @@ A 股模块分为长线和短线两套策略，统一由 `stock_advanced_strateg
 - 风险与稳健性：低波动、低负债、低质押、杠杆改善、资产扩张约束。
 - 价格行为：一月反转、12-1 月动量、52 周高点距离、长期反转、异常换手。
 
-### 5.2 短线龙虎榜策略
+### 5.2 短线游资小盘策略
 
-短线策略面向 1-5 个交易日，重点观察龙虎榜、机构席位、游资共振、资金强度、价量形态和交易可行性。典型因子包括：
+短线策略面向 1-5 个交易日，基础成员与游资雷达的游资小盘池完全一致：近一年龙虎榜上榜次数达到门槛、属于标准 A 股且非 ST、至少有 250 根有效日线，并按近 20 个有效交易日反推流通市值中位数不高于 100 亿元。`sw3_member.is_hot_money=1` 是唯一成员来源；龙虎榜席位、机构和技术面快照只补充打分，缺失时不会把成员移出股票池。典型因子包括：
 
 - 龙虎榜近期上榜次数、净买额、净买占成交、买方主导度、净买占流通市值。
 - 游资共振数、知名游资占比、席位多样性、席位持续性、席位平均买额。
@@ -142,7 +142,7 @@ v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作
 
 ### 5.4 参数搜索与可视化
 
-`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.3.0 当前口径为每 60 个交易日取一个折起点、固定持有 60 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并采用等权口径，最旧折到最新折均为 1.0x。选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。优化器会固定 `min_market_cap_yi=0`，并将 `csi300_current`、`csi300_persistence`、`market_cap`、`size_reversal`、`industry_leadership` 等市值/指数相关权重固定为 0，不参与搜索。
+`stock_strategy_optimizer.py` 会搜索策略权重和硬过滤参数。长线采用 **Point-in-Time (PIT) walk-forward 回测**消除前视偏差：每个历史折以全市场交易日历的某个时点为基准，财报按 A 股法定披露截止日（年报次年 4-30、季报 4-30/8-31/10-31）、价格/估值/分红按当时可见切片后重算因子再选股——绝不用未来数据选过去的股。v3.3.0 当前口径为每 60 个交易日取一个折起点、固定持有 60 个交易日；组合等权收益减成本后，对比 510310 沪深300ETF 与 510580 中证500ETF 按日等权再平衡的混合基准。折样本按确定性随机键切成约 60/40 的训练/验证集，并采用等权口径，最旧折到最新折均为 1.0x。选参同时看训练折和验证折，并惩罚 train/val 差距、最差单折超额、尾部 CVaR、持有期回撤、折数不足和验证折为负。高点回撤过滤开关参与搜索，开启时阈值搜索范围为 40%-70%。优化器会固定 `min_market_cap_yi=0`，并将 `csi300_current`、`csi300_persistence`、`market_cap`、`size_reversal`、`industry_leadership` 等市值/指数相关权重固定为 0，不参与搜索。游资小盘池变更后可用 `python -B stock_strategy_optimizer.py --strategy short --iterations 1500` 单独重跑短线参数，并保留已有长线配置。
 
 > 注意：受本地约 10 年日线与基准 ETF 覆盖区间所限，PIT 有效折数有限，超额数值是相对而非可直接兑现的收益；且沪深 300 成分与质押用的是当前快照（无历史数据），这两维仍有轻微残留前视。默认长线/短线各搜索 1500 次，两个独立进程并行运行；短线候选池会在 trial 前预转为 NumPy 矩阵以减少重复打分开销，整体运行时间仍取决于本地缓存规模。
 
@@ -201,7 +201,7 @@ python stock_strategy_optimizer.py --iterations 1500
 - `patterns`：把游资形态 playbook 落到股票与板块数据上，输出形态匹配与验证结果。
 - `verify`：复盘吸筹分与形态信号的后续收益、分层和 IC。
 - `distribution`：复盘出货分候选特征，做 0.1 步长权重网格搜索和消融实验。
-- `accumulation`：复盘 `chip / position / cmf_eff / P3 / 股东户数变化 / 公司回购` 六个吸筹候选特征，做 0.1 步长权重网格搜索和消融实验。
+- `accumulation`：复盘 `position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购` 六个吸筹候选特征，做 0.05 步长权重网格搜索和消融实验。
 - `watch`：预留盘中监控状态文件，当前仍以离线数据推断为主。
 
 ```bash
@@ -242,7 +242,7 @@ bash stock_radar_fresh_data.sh
 - 盘中没有席位级实时数据，雷达输出是行为推断，不是席位实锤。
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
 - `阶段·把握` 中的阶段来自命中形态；把握度会按阶段混合形态强度、吸筹分和出货分，观望表示“暂无明显阶段信号”的可信度，不再等同于吸筹分或简单形态计数。
-- 吸筹总分候选特征为 `chip / position / cmf_eff / P3 / 股东户数变化 / 公司回购`；当前线上权重为 `0.1*chip + 0.2*position + 0.1*cmf_eff + 0.2*P3 + 0.2*股东户数变化 + 0.2*公司回购`，缺股东户数变化按中性 50，近 90 日无回购按 0。
+- 吸筹总分候选特征为 `position / cmf_eff / P3 / P24 / 股东户数变化 / 公司回购`；当前线上权重为 `0.1*position + 0.1*cmf_eff + 0.25*P3 + 0.25*P24 + 0.2*股东户数变化 + 0.1*公司回购`。P3/P24 命中为 100、未命中为 0；缺股东户数变化按中性 50，近 90 日无回购按 0。筹码分及数据流继续保留用于展示和形态匹配，但不参与吸筹总分。
 - 出货分候选特征为 `technical / P11 / P19 / P20 / 近期龙虎榜 / divergence`；当前线上权重为 `0.2*technical + 0.2*P11 + 0.1*P19 + 0.1*P20 + 0.2*近期龙虎榜 + 0.2*divergence`，其中 `divergence` 使用原始 div 分，不使用吸筹侧反向后的 `div_eff`。
 - 调整出货权重前先跑 `python stock_hot_money_radar.py distribution` 查看 train、validation 与消融结果。
 - 调整吸筹总分权重前先跑 `python stock_hot_money_radar.py accumulation`，并同时检查 train、validation 与消融结果。
@@ -281,11 +281,10 @@ python industry_cycle_engine.py --write
 | `data/stock_strategy_optimized_config.json` | Dashboard 默认读取的优化参数；optimizer 只写入 data 路径，data 文件缺失时前端可兜底读取 `meta_data_backup/stock_strategy_optimized_config.json` |
 | `data/stock_strategy_best_fold_paths.svg` | 长线默认参数历史折走势小图矩阵 |
 | `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
-| `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member` 存申万三级成分和官方市值占比，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
+| `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
 | `data/plate_data.sqlite3` | 申万二级行业日线缓存，供题材热度、游资形态和行业周期使用 |
 | `data/stock_data/CN_*.json` | 旧版个股 JSON 缓存；v3.1.4 主流程不再依赖，可通过 `stock_storage.import_stock_data_dir()` 批量导入 SQLite |
 | `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时和失败信息 |
-| `data/capital/hot_money_candidates.json` | 龙虎榜/游资候选池原始信号，短线最终分数由 `stock_advanced_strategies.py` 计算 |
 | `data/capital/theme_candidates.json` | SW2 板块热度与个股题材跟踪关系 |
 | `data/capital/hot_money_ambush.json` | 主力资金吸筹分、出货分、阶段和形态输出 |
 | `data/capital/hot_money_patterns.json` / `.csv` | 游资形态匹配输出 |

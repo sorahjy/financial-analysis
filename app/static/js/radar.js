@@ -40,26 +40,16 @@
     return `${n.toFixed(2)}亿`;
   };
   const esc = (s) => String(s == null ? "" : s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-  // 命中形态标色(实测有效高亮)：P3 正向买入→绿；P11 追突破=接盘→橙(同突破阶段色)；P19/P20 出货→红；其余中性
-  const patTagClass = (code) =>
-    (code === "P3" ? "pg" : code === "P11" ? "po" : (code === "P19" || code === "P20") ? "pr" : "pd");
-  // 有效形态的悬停说明（与 PATTERN_EFFECTIVE 一致）
-  const PAT_TIP = {
-    P3: "★实测有效·吸筹买入：剔大盘各周期正、40日+4%",
-    P11: "★实测有效·追突破=接盘：全周期显著负、回避不宜追",
-    P19: "★实测有效·出货风控：巨量大阴，显著负",
-    P20: "★实测有效·出货风控：均线放量破位，显著负",
-  };
   const SIG_ACCENT = { buy: "sg", hold: "sh", sell: "ss" };
-  // 冲突：吸筹分仍高却命中出货预警 → 多为低位放量破位(P20)，结构似吸筹但已破位，仍偏空
-  const isBreakdownConflict = (s) =>
+  // 冲突：吸筹分仍高，但出货形态累计积分已达到预警门槛。
+  const isDistributionConflict = (s) =>
     String((s && s.pattern_phase) || "").includes("出货") && (Number(s && s.ambush_score) || 0) >= 50;
-  const CONFLICT_TIP = "吸筹分仍高却出货预警：多为低位放量破位(P20)，回测属下跌中继/失败反弹(40日约−1.4%,t−2.0)，非高位派发，仍偏空回避";
+  const CONFLICT_TIP = "吸筹分仍高，但出货形态累计积分已达到3分：P17/P19可单项触发，或由P14/P16/P20/P22组合触发，仍应优先防守";
   const KLINE_PERIOD_LABEL = { day: "日K", week: "周K", month: "月K" };
   const KLINE_DEFAULT_VISIBLE = { day: 140, week: 96, month: 72 };
   const KLINE_MIN_VISIBLE = { day: 24, week: 18, month: 12 };
   const KLINE_HISTORY_LIMIT = 3600;
-  const REALTIME_REFRESH_MS = 120000;
+  const REALTIME_REFRESH_MS = 180000;
   const REALTIME_SOURCE_LABEL = { tencent_batch: "腾讯", sina_batch: "新浪", eastmoney_a_spot: "东财" };
 
   function initRadar() {
@@ -90,6 +80,21 @@
     let sw2Options = [];
     let selectedSw2Industries = new Set();
     const $ = (id) => document.getElementById(id);
+
+    function patternTagClass(code) {
+      const meta = patternMap[code];
+      if (!meta || !meta.effective) return "pd";
+      if (meta.effective_style === "bullish") return "pg";
+      if (meta.effective_style === "momentum") return "po";
+      if (meta.effective_style === "risk") return "pr";
+      return "pd";
+    }
+
+    function patternTitle(code) {
+      const meta = patternMap[code];
+      if (!meta) return "";
+      return [meta.effective ? "★全历史实测有效" : "", meta.name, meta.desc].filter(Boolean).join(" · ");
+    }
 
     function normalizePayload(raw) {
       const out = raw || {};
@@ -326,7 +331,7 @@
         }
         const rt = payload.realtime_quote || {};
         const sourceLabel = REALTIME_SOURCE_LABEL[rt.source] || "实时";
-        if (rt.available) updateRealtimeStatus(`${sourceLabel} ${rt.updated_at || ""} · 2分钟`, "live");
+        if (rt.available) updateRealtimeStatus(`${sourceLabel} ${rt.updated_at || ""} · 3分钟`, "live");
         else updateRealtimeStatus(rt.error ? "实时失败" : "无实时数据", rt.error ? "error" : "");
       } catch (err) {
         if (!disposed) updateRealtimeStatus("实时失败", "error");
@@ -526,7 +531,10 @@
         const conf = (s.phase_confidence === null || s.phase_confidence === undefined) ? "" : ` <small>把握${Math.round(s.phase_confidence)}</small>`;
         const sel = s.code === selectedCode ? " is-selected" : "";
         const patCell = (s.patterns && s.patterns.length)
-          ? s.patterns.map((c) => `<span class="pat ${patTagClass(c)}"${PAT_TIP[c] ? ` title="${esc(PAT_TIP[c])}"` : ""}>${esc(c)}</span>`).join("")
+          ? s.patterns.map((c) => {
+              const title = patternTitle(c);
+              return `<span class="pat ${patternTagClass(c)}"${title ? ` title="${esc(title)}"` : ""}>${esc(c)}</span>`;
+            }).join("")
           : "<span class='dim'>-</span>";
         const evCell = (s.evidence && s.evidence.length)
           ? s.evidence.map((e) => {
@@ -545,7 +553,7 @@
           <td class="num strong">${fmt(s.opportunity_score, 1)}</td>
           <td class="num" title="当前价以下的估算筹码占比">${fmtRatioPct(sig.chip_winner)}</td>
           <td class="pats mono">${patCell}</td>
-          <td><span class="phase phase-${cls}">${esc(s.pattern_phase || "")}</span>${conf}${isBreakdownConflict(s) ? ` <span class="pi-warn" title="${esc(CONFLICT_TIP)}">⚠破位</span>` : ""}</td>
+          <td><span class="phase phase-${cls}">${esc(s.pattern_phase || "")}</span>${conf}${isDistributionConflict(s) ? ` <span class="pi-warn" title="${esc(CONFLICT_TIP)}">⚠风险</span>` : ""}</td>
           <td>${sw2Cell(s)}</td>
           <td class="ev-cell">${evCell}</td>
         </tr>`;
@@ -700,7 +708,7 @@
           const cat = [m.category, m.signal].filter(Boolean).join(" · ");
           return `<div class="pi-card ${acc}">
             <div class="pi-top">
-              <span class="pat ${patTagClass(c)}">${esc(c)}</span>
+              <span class="pat ${patternTagClass(c)}">${esc(c)}</span>
               <strong>${esc(m.name)}</strong>
               <span class="pi-cat">${esc(cat)}</span>${eff}
             </div>
@@ -708,9 +716,9 @@
           </div>`;
         }).join("");
       }
-      if (isBreakdownConflict(s)) {
+      if (isDistributionConflict(s)) {
         html = `<div class="pi-conflict">⚠ 结构似吸筹（吸筹分 ${fmt(s.ambush_score, 0)}）却触发出货预警——` +
-          `多为<strong>低位放量破位(P20)</strong>，回测属下跌中继/失败反弹（40日约 −1.4%，t−2.0），非高位派发，仍偏空回避。</div>` + html;
+          `出货形态累计积分已达到<strong>3分</strong>：P17/P19可单项触发，或由P14/P16/P20/P22组合触发，仍应优先防守。</div>` + html;
       }
       const inval = s.invalidations || [];
       if (inval.length) {
@@ -1122,8 +1130,7 @@
       window.addEventListener("resize", onResize);
       document.addEventListener("click", onDocumentClick);
       document.addEventListener("keydown", onDocumentKeyDown);
-      fetchPatternCatalog();
-      fetchData();
+      fetchPatternCatalog().finally(fetchData);
     }
 
     function onResize() { if (!disposed) drawKline(); }

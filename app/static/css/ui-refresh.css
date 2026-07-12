@@ -933,6 +933,34 @@ textarea::placeholder {
   font-size: 13px;
 }
 
+.radar-score-guide {
+  align-self: center;
+  padding: 11px 14px;
+  border-color: var(--line);
+  border-radius: var(--radius-md);
+  background: rgba(255, 255, 255, 0.72);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.045);
+}
+
+.radar-score-guide-head strong {
+  font-weight: 680;
+  letter-spacing: -0.01em;
+}
+
+.radar-score-guide-head span {
+  color: #86868b;
+  font-size: 10px;
+}
+
+.radar-score-formula {
+  color: var(--blue);
+  letter-spacing: -0.01em;
+}
+
+.radar-score-note {
+  color: #6e6e73;
+}
+
 #radar-status {
   display: inline-flex;
   align-items: center;
@@ -994,7 +1022,7 @@ textarea::placeholder {
 }
 
 .radar-filters {
-  position: static;
+  position: relative;
   z-index: 22;
   gap: 9px;
   margin: 14px 0 16px;
@@ -1069,6 +1097,9 @@ textarea::placeholder {
   position: sticky;
   align-self: start;
   top: calc(var(--topbar-height) + 16px);
+  max-height: calc(100vh - var(--topbar-height) - 32px);
+  overflow-y: auto;
+  scrollbar-gutter: stable;
   padding: 15px;
 }
 
@@ -1223,6 +1254,9 @@ table.radar-grid tbody tr.is-selected {
   .radar-kline {
     position: relative;
     top: auto;
+    max-height: none;
+    overflow-y: visible;
+    scrollbar-gutter: auto;
   }
 }
 
@@ -1393,6 +1427,12 @@ table.radar-grid tbody tr.is-selected {
   .radar-topbar {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .radar-score-guide {
+    width: 100%;
+    max-width: none;
+    min-width: 0;
   }
 
   .radar-head {

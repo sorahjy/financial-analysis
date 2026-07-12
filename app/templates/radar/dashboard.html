@@ -14,6 +14,18 @@
       </div>
       <span id="radar-status" class="status" role="status" aria-live="polite">读取中…</span>
     </div>
+    <aside class="radar-score-guide" aria-labelledby="radar-score-guide-title">
+      <div class="radar-score-guide-head">
+        <strong id="radar-score-guide-title">机会分怎么算</strong>
+        <span>范围 0–100</span>
+      </div>
+      <p class="radar-score-formula">机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）</p>
+      <div class="radar-score-breakdown">
+        <p><b>吸筹原始分</b>：筹码集中×0.30、价格位置×0.20；CMF有效值、P3缩量打压、股东户数变化、近90日回购各×0.10。</p>
+        <p><b>出货原始分</b>：高位涨幅放量、P11突破、近90日龙虎榜、量价背离各×0.20；P19巨阴、P20破位各×0.10。</p>
+      </div>
+      <p class="radar-score-note">两项先按当前候选池换算为横截面百分位；出货越高折扣越大，最多扣掉吸筹强度的50%。例：吸筹90、出货40 → 机会72。游资小盘池主排序使用反转分，机会分仅作辅助。</p>
+    </aside>
     <div class="radar-actions">
       <label class="toggle">池&nbsp;<select id="radar-pool" aria-label="候选池">
         <option value="leader">细分龙头</option>

@@ -78,7 +78,7 @@ class FlaskAppTest(unittest.TestCase):
     def test_radar_filter_bar_scrolls_with_content(self):
         refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
 
-        self.assertRegex(refresh_css, r"\.radar-filters\s*\{\s*position:\s*static;")
+        self.assertRegex(refresh_css, r"\.radar-filters\s*\{\s*position:\s*relative;")
         self.assertNotRegex(refresh_css, r"\.radar-filters\s*\{\s*position:\s*sticky;")
 
     def test_internal_navigation_replaces_main_without_reloading_shell(self):
@@ -189,7 +189,9 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("function exportTopOpportunityStocks()", script)
         self.assertIn('aria-sort="${ariaSort}"', script)
         self.assertIn('event.key !== "Enter" && event.key !== " "', script)
-        self.assertIn("REALTIME_REFRESH_MS = 120000", script)
+        self.assertIn("REALTIME_REFRESH_MS = 180000", script)
+        self.assertIn('· 3分钟`, "live"', script)
+        self.assertNotIn("REALTIME_REFRESH_MS = 120000", script)
         self.assertIn("REALTIME_SOURCE_LABEL", script)
         self.assertIn('tencent_batch: "腾讯"', script)
         self.assertIn('sina_batch: "新浪"', script)
@@ -233,6 +235,29 @@ class FlaskAppTest(unittest.TestCase):
         self.assertNotIn("三级行业", script)
         self.assertNotIn("跟踪二级行业", script)
 
+    def test_radar_pattern_colors_follow_backend_effectiveness_catalog(self):
+        response = self.client.get("/api/radar/patterns")
+        self.assertEqual(response.status_code, 200)
+        catalog = {item["code"]: item for item in response.get_json()["patterns"]}
+        self.assertEqual(catalog["P3"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P24"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P12"]["effective_style"], "momentum")
+        self.assertEqual(catalog["P11"]["effective_style"], "risk")
+        self.assertFalse(catalog["P6"]["effective"])
+        self.assertEqual(catalog["P6"]["effective_style"], "neutral")
+
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+        self.assertIn("if (!meta || !meta.effective) return \"pd\"", script)
+        self.assertIn('meta.effective_style === "bullish"', script)
+        self.assertIn('meta.effective_style === "momentum"', script)
+        self.assertIn('meta.effective_style === "risk"', script)
+        self.assertIn("fetchPatternCatalog().finally(fetchData)", script)
+        self.assertNotIn("EFFECTIVE_RISK_PATTERNS", script)
+        self.assertNotIn("PAT_TIP", script)
+        for css_class in (".pat.pg", ".pat.po", ".pat.pr", ".pat.pd"):
+            self.assertIn(css_class, css)
+
     def test_radar_kline_card_shows_selected_stock_basic_info(self):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
@@ -264,6 +289,36 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('klineDrag = { type: "range"', script)
         self.assertIn('klineDrag = { type: "start"', script)
         self.assertIn('klineDrag = { type: "end"', script)
+
+    def test_radar_kline_panel_scrolls_to_reveal_pattern_details(self):
+        refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
+
+        self.assertRegex(
+            refresh_css,
+            r"\.radar-kline\s*\{\s*position:\s*sticky;\s*align-self:\s*start;\s*"
+            r"top:\s*calc\(var\(--topbar-height\) \+ 16px\);\s*"
+            r"max-height:\s*calc\(100vh - var\(--topbar-height\) - 32px\);\s*"
+            r"overflow-y:\s*auto;",
+        )
+        self.assertRegex(
+            refresh_css,
+            r"@media \(max-width:\s*1050px\)[\s\S]*?\.radar-kline\s*\{[\s\S]*?"
+            r"max-height:\s*none;[\s\S]*?overflow-y:\s*visible;",
+        )
+
+    def test_radar_header_explains_opportunity_score_formula(self):
+        body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
+        css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+
+        self.assertIn('class="radar-score-guide"', body)
+        self.assertIn('id="radar-score-guide-title"', body)
+        self.assertIn("机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）", body)
+        self.assertIn("筹码集中×0.30", body)
+        self.assertIn("近90日龙虎榜", body)
+        self.assertIn("吸筹90、出货40 → 机会72", body)
+        self.assertIn("游资小盘池主排序使用反转分", body)
+        self.assertIn("font-size: 11px", css)
+        self.assertIn(".radar-score-breakdown", css)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -369,6 +424,7 @@ class FlaskAppTest(unittest.TestCase):
             "generated_at": "2026-06-25 14:00:00",
             "iterations_per_strategy": 1500,
             "seed": 42,
+            "short_universe_version": "hotmoney_small_cap_v1",
             "config": {
                 "long": {"top_n": 31},
                 "short": {"top_n": 8},
