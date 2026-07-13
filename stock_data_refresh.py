@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import stock_storage as ss
+from app.services.job_service import terminate_process_tree
 from stock_crawl_common import (
     daily_payload_from_history_records,
     history_payload_from_records,
@@ -92,22 +93,25 @@ def run_step(
 
     print(f"[refresh] start {name}: {text}", flush=True)
     try:
-        completed = subprocess.run(
+        process = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
             env=env,
-            timeout=timeout,
             text=True,
+            start_new_session=os.name != "nt",
         )
+        try:
+            returncode = process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            terminate_process_tree(process)
+            elapsed = time.time() - start
+            print(f"[refresh] timeout {name} after {elapsed:.1f}s", flush=True)
+            return StepResult(name, text, False, 124, elapsed, error=str(exc))
         elapsed = time.time() - start
-        ok = completed.returncode == 0
-        state = "ok" if ok else f"failed({completed.returncode})"
+        ok = returncode == 0
+        state = "ok" if ok else f"failed({returncode})"
         print(f"[refresh] {state} {name} in {elapsed:.1f}s", flush=True)
-        return StepResult(name, text, ok, completed.returncode, elapsed)
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.time() - start
-        print(f"[refresh] timeout {name} after {elapsed:.1f}s", flush=True)
-        return StepResult(name, text, False, 124, elapsed, error=str(exc))
+        return StepResult(name, text, ok, returncode, elapsed)
     except OSError as exc:
         elapsed = time.time() - start
         print(f"[refresh] error {name}: {exc}", flush=True)
@@ -461,12 +465,17 @@ def refresh_before_server(
         )
     )
 
+    # 策略结果只能建立在本轮所有应执行的数据步骤都成功的前提下。StepResult 对主动
+    # skip 的步骤保持 ok=True，因此 quick/capital-only 的模式跳过不会误阻断策略；真正
+    # 失败的抓取或本地整理则会留下旧策略产物，而不是写出一份新旧数据混合的快照。
+    strategy_dependencies_ok = all(step.ok for step in steps)
     steps.append(
         run_step(
             "strategy_results",
             [python_bin, "-B", "stock_advanced_strategies.py", "--persist", "--rebuild-cache"],
             timeout=timeout,
             env=env,
+            skip=not strategy_dependencies_ok,
         )
     )
 
@@ -500,6 +509,8 @@ def main() -> None:
         no_proxy=args.no_proxy,
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
+    if not report.get("ok"):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

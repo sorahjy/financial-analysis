@@ -62,6 +62,72 @@ MIN_COMPLETE_DAILY_ROWS = 200
 DAILY_FRESH_MAX_GAP_DAYS = 20
 
 
+def _json_mapping(value):
+    if isinstance(value, dict):
+        return value
+    if not isinstance(value, str) or not value:
+        return {}
+    try:
+        decoded = json.loads(value)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    return decoded if isinstance(decoded, dict) else {}
+
+
+def fundamentals_missing_families(payload):
+    """返回缺失或为空的基本面必需数据族。
+
+    三张财务报表与财务指标至少需要一条带报告日期的记录；分红记录允许为空（公司可能
+    从未分红），但其结构必须存在。抓取接口返回空 DataFrame 时不能据此盖成功时间戳。
+    """
+    payload = payload if isinstance(payload, dict) else {}
+    financials = payload.get("financials")
+    indicators = payload.get("indicators")
+    dividends = payload.get("dividends")
+    missing = []
+
+    required_fields = {
+        "income": ("revenue", "net_profit", "net_profit_parent"),
+        "balance": ("total_equity_parent", "total_equity", "total_assets_liabilities"),
+        "cashflow": ("operating_cashflow_net", "operating_cashflow_in", "operating_cashflow_out"),
+    }
+    financials = financials if isinstance(financials, dict) else {}
+    for family, fields in required_fields.items():
+        records = financials.get(family)
+        if not isinstance(records, list) or not any(
+            isinstance(row, dict)
+            and row.get("date")
+            and any(row.get(field) is not None for field in fields)
+            for row in records
+        ):
+            missing.append(f"financials.{family}")
+
+    indicator_records = indicators.get("records") if isinstance(indicators, dict) else None
+    indicator_fields = (
+        "roe", "roe_weighted", "eps_diluted", "bvps_adjusted", "ocfps",
+        "gross_margin", "net_margin", "revenue_growth", "net_profit_growth",
+        "total_assets", "asset_liability_ratio",
+    )
+    if not isinstance(indicator_records, list) or not any(
+        isinstance(row, dict)
+        and row.get("date")
+        and any(row.get(field) is not None for field in indicator_fields)
+        for row in indicator_records
+    ):
+        missing.append("indicators.records")
+
+    dividend_records = dividends.get("records") if isinstance(dividends, dict) else None
+    if not isinstance(dividend_records, list):
+        missing.append("dividends.records")
+    return missing
+
+
+def ensure_fundamentals_complete(payload, symbol):
+    missing = fundamentals_missing_families(payload)
+    if missing:
+        raise RuntimeError(f"{str(symbol).zfill(6)} 基本面数据不完整: {', '.join(missing)}")
+
+
 def _env_int(name: str, default: int, *, minimum: int | None = None, maximum: int | None = None) -> int:
     raw = os.getenv(name)
     try:
@@ -335,6 +401,7 @@ def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
     data["financials"] = _timed_call("financials", fetch_financial_reports, symbol)
     data["indicators"] = _timed_call("indicators", fetch_financial_indicators, symbol)
     data["dividends"] = _timed_call("dividends", fetch_dividend_history, symbol)
+    ensure_fundamentals_complete(data, symbol)
     data["daily_refetched_at"] = datetime.now().isoformat()
     data["financials_refetched_at"] = datetime.now().isoformat()
 
@@ -361,8 +428,9 @@ def fetch_fundamentals(symbol, pledge_info=None):
         "financials": fetch_financial_reports(symbol),
         "indicators": fetch_financial_indicators(symbol),
         "dividends": fetch_dividend_history(symbol),
-        "financials_refetched_at": datetime.now().isoformat(),
     }
+    ensure_fundamentals_complete(out, symbol)
+    out["financials_refetched_at"] = datetime.now().isoformat()
     if pledge_info is not None:
         out["pledge"] = pledge_info
     return out
@@ -444,6 +512,9 @@ def load_existing():
     rows = conn.execute(
         """
         SELECT m.code,
+               m.financials_json,
+               m.indicators_json,
+               m.dividends_json,
                SUM(CASE WHEN h.daily_open IS NOT NULL
                           AND h.daily_high IS NOT NULL
                           AND h.daily_low IS NOT NULL
@@ -468,6 +539,13 @@ def load_existing():
     ).fetchall()
     complete_codes = set()
     for row in rows:
+        payload = {
+            "financials": _json_mapping(row["financials_json"]),
+            "indicators": _json_mapping(row["indicators_json"]),
+            "dividends": _json_mapping(row["dividends_json"]),
+        }
+        if fundamentals_missing_families(payload):
+            continue
         complete_daily_rows = int(row["complete_daily_rows"] or 0)
         latest_daily_date = row["latest_daily_date"]
         if complete_daily_rows < MIN_COMPLETE_DAILY_ROWS:
@@ -614,6 +692,11 @@ def crawl_stocks(stocks, pledge_map, limit=0, workers=20):
 
     stock_count = ss.table_count(ss.thread_conn(), "stock_meta")
     print(f"\n数据库: {ss.DEFAULT_DB_FILE} ({stock_count} 只股票)")
+    return {
+        "target_count": len(todo),
+        "success_count": len(todo) - len(errors),
+        "errors": errors,
+    }
 
 
 # ═══════════════════════════════════════════════════════════
@@ -928,6 +1011,7 @@ def refetch_financials(codes=None, workers=8):
             data["financials"] = fetch_financial_reports(code)
             data["indicators"] = fetch_financial_indicators(code)
             data["dividends"] = fetch_dividend_history(code)
+            ensure_fundamentals_complete(data, code)
             data["financials_refetched_at"] = datetime.now().isoformat()
             # 只改财报/指标/分红，不重写 stock_history（187 万行无谓重写）
             ss.save_stock(conn, data, write_history=False)
@@ -1067,7 +1151,9 @@ def main():
         )
         stocks = get_segment_leader_universe(refresh_slice=max(args.segment_refresh_slice, 0))
         pledge_map = fetch_pledge_data_bulk()
-        crawl_stocks(stocks, pledge_map, limit=limit, workers=args.workers)
+        result = crawl_stocks(stocks, pledge_map, limit=limit, workers=args.workers)
+        if result and result.get("errors"):
+            raise SystemExit(1)
 
     elif args.mode == "staged":
         limit = args.limit
@@ -1092,7 +1178,9 @@ def main():
                     "trade_date": None,
                     "industry": info.get("pledge_industry"),
                 }
-        crawl_stocks(candidates, pledge_map, limit=limit, workers=args.workers)
+        result = crawl_stocks(candidates, pledge_map, limit=limit, workers=args.workers)
+        if result and result.get("errors"):
+            raise SystemExit(1)
 
 
 if __name__ == "__main__":

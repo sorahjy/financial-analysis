@@ -184,8 +184,45 @@ def save_realtime_estimates(
     conn: sqlite3.Connection,
     estimates: Mapping[str, Mapping[str, Any]],
     *,
-    replace: bool = True,
+    replace: bool = False,
+    expected_codes: Optional[Iterable[str]] = None,
 ) -> None:
+    existing = {
+        row["code"]: dict(row)
+        for row in conn.execute(
+            "SELECT code, gsz, gszzl, gztime, dwjz FROM fund_realtime_estimates"
+        )
+    }
+    rows = []
+    for code, estimate in estimates.items():
+        if not isinstance(estimate, Mapping):
+            continue
+        code = str(code)
+        incoming = {
+            field: _nonempty_text(estimate.get(field))
+            for field in ("gsz", "gszzl", "gztime", "dwjz")
+        }
+        # A syntactically valid JSONP response can contain only empty strings.
+        # It is not a successful observation and must not create/replace a row.
+        if not any(value is not None for value in incoming.values()):
+            continue
+        previous = existing.get(code, {})
+        rows.append(
+            (
+                code,
+                incoming["gsz"] or previous.get("gsz"),
+                incoming["gszzl"] or previous.get("gszzl"),
+                incoming["gztime"] or previous.get("gztime"),
+                incoming["dwjz"] or previous.get("dwjz"),
+            )
+        )
+    if replace:
+        _validate_complete_snapshot(
+            {row[0] for row in rows},
+            expected_codes,
+            snapshot_name="基金实时估值",
+        )
+
     with conn:
         if replace:
             conn.execute("DELETE FROM fund_realtime_estimates")
@@ -195,23 +232,13 @@ def save_realtime_estimates(
                 (code, gsz, gszzl, gztime, dwjz, updated_at)
             VALUES (?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
             ON CONFLICT(code) DO UPDATE SET
-                gsz = excluded.gsz,
-                gszzl = excluded.gszzl,
-                gztime = excluded.gztime,
-                dwjz = excluded.dwjz,
+                gsz = COALESCE(excluded.gsz, fund_realtime_estimates.gsz),
+                gszzl = COALESCE(excluded.gszzl, fund_realtime_estimates.gszzl),
+                gztime = COALESCE(excluded.gztime, fund_realtime_estimates.gztime),
+                dwjz = COALESCE(excluded.dwjz, fund_realtime_estimates.dwjz),
                 updated_at = CURRENT_TIMESTAMP
             """,
-            [
-                (
-                    str(code),
-                    _optional_text(estimate.get("gsz")),
-                    _optional_text(estimate.get("gszzl")),
-                    _optional_text(estimate.get("gztime")),
-                    _optional_text(estimate.get("dwjz")),
-                )
-                for code, estimate in estimates.items()
-                if isinstance(estimate, Mapping)
-            ],
+            rows,
         )
 
 
@@ -238,27 +265,47 @@ def save_profile_snapshots(
     conn: sqlite3.Connection,
     items: Iterable[Mapping[str, Any]],
     *,
-    replace: bool = True,
+    replace: bool = False,
+    expected_codes: Optional[Iterable[str]] = None,
     source_updated_at: Optional[str] = None,
 ) -> int:
     source_updated_at = source_updated_at or _now_text()
+    existing = {}
+    for row in conn.execute("SELECT code, raw_json FROM fund_profile_snapshots"):
+        try:
+            payload = json.loads(row["raw_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, Mapping):
+            existing[row["code"]] = dict(payload)
+
     rows = []
     for item in items:
         if not isinstance(item, Mapping) or not item.get("fundCode"):
             continue
+        code = str(item["fundCode"])
+        merged = _merge_nonblank_snapshot(existing.get(code, {}), dict(item))
+        merged["fundCode"] = code
         rows.append(
             (
-                str(item["fundCode"]),
-                str(item.get("name") or ""),
-                _optional_text(item.get("managerTrigger")),
-                _optional_text(item.get("fund_manager_total_asset")),
-                json.dumps(dict(item), ensure_ascii=False, separators=(",", ":")),
+                code,
+                str(merged.get("name") or ""),
+                _nonempty_text(merged.get("managerTrigger")),
+                _nonempty_text(merged.get("fund_manager_total_asset")),
+                json.dumps(merged, ensure_ascii=False, separators=(",", ":")),
                 source_updated_at,
             )
         )
 
+    if replace:
+        _validate_complete_snapshot(
+            {row[0] for row in rows},
+            expected_codes,
+            snapshot_name="基金概况",
+        )
+
     with conn:
-        if replace and rows:
+        if replace:
             conn.execute("DELETE FROM fund_profile_snapshots")
         conn.executemany(
             """
@@ -294,10 +341,63 @@ def _table_count(conn: sqlite3.Connection, table_name: str) -> int:
     return int(row["count"]) if row else 0
 
 
+def _validate_complete_snapshot(
+    actual_codes: set[str],
+    expected_codes: Optional[Iterable[str]],
+    *,
+    snapshot_name: str,
+) -> None:
+    if expected_codes is None:
+        raise ValueError(f"{snapshot_name}全量替换必须提供 expected_codes")
+
+    expected = {str(code) for code in expected_codes}
+    if actual_codes == expected:
+        return
+
+    missing = sorted(expected - actual_codes)
+    unexpected = sorted(actual_codes - expected)
+    details = []
+    if missing:
+        details.append(f"缺少 {len(missing)} 只: {', '.join(missing[:10])}")
+    if unexpected:
+        details.append(f"多出 {len(unexpected)} 只: {', '.join(unexpected[:10])}")
+    raise ValueError(f"{snapshot_name}数据不完整，拒绝全量替换（{'；'.join(details)}）")
+
+
 def _optional_text(value: Any) -> Optional[str]:
     if value is None:
         return None
     return str(value)
+
+
+def _nonempty_text(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _merge_nonblank_snapshot(
+    previous: Mapping[str, Any], incoming: Mapping[str, Any]
+) -> Dict[str, Any]:
+    """Merge a partial crawl result without erasing earlier successful fields."""
+    merged = dict(incoming)
+    for key, old_value in previous.items():
+        if key not in merged or _is_blank_snapshot_value(merged[key]):
+            merged[key] = old_value
+        elif isinstance(old_value, Mapping) and isinstance(merged[key], Mapping):
+            merged[key] = _merge_nonblank_snapshot(old_value, merged[key])
+    return merged
+
+
+def _is_blank_snapshot_value(value: Any) -> bool:
+    if value is None:
+        return True
+    if isinstance(value, str):
+        return not value.strip()
+    if isinstance(value, (list, tuple, dict, set)):
+        return not value
+    return False
 
 
 def _now_text() -> str:

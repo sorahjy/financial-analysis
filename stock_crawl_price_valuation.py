@@ -32,6 +32,7 @@ import akshare as ak
 
 import stock_storage as ss
 from stock_crawl_common import (
+    HISTORY_PRICE_FIELDS,
     strip_proxy_env,
     safe_print,
     safe_float as _safe_float,
@@ -123,14 +124,30 @@ def get_segment_leader_stocks():
 
 def load_stock_file(code, name):
     conn = ss.thread_conn()
-    records = ss.load_history_records(conn, str(code).zfill(6))
+    normalized_code = str(code).zfill(6)
+    records = ss.load_history_records(conn, normalized_code)
     if not records:
         return {}
     return {
         "records": records,
         "start_date": records[0]["date"],
         "end_date": records[-1]["date"],
+        "history_refetched_at": ss.history_refetched_at(conn, normalized_code),
     }
+
+
+def _history_snapshot_has_final_bar(end_date, history_refetched_at):
+    """Whether the latest stored bar was refreshed after that session settled."""
+    if not end_date or not history_refetched_at:
+        return False
+    try:
+        refreshed = datetime.fromisoformat(str(history_refetched_at).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    refreshed_date = refreshed.strftime("%Y-%m-%d")
+    if refreshed_date > str(end_date)[:10]:
+        return True
+    return refreshed_date == str(end_date)[:10] and (refreshed.hour, refreshed.minute) >= (15, 10)
 
 
 def save_stock_file(code, name, data):
@@ -314,8 +331,8 @@ def fetch_valuation_data(symbol, period="近五年"):
 
 
 def merge_records(existing, new_records):
-    """按日期字段级合并：同日期 dict 浅合并（新值覆盖同名字段、保留其他字段），按日期升序"""
-    return merge_records_by_date(existing, new_records, overwrite_none=True)
+    """按日期字段级合并：新非空日线覆盖同日旧值，缺失字段不擦除已有数据。"""
+    return merge_records_by_date(existing, new_records, overwrite_none=False)
 
 
 def attach_valuation(records, val_by_date):
@@ -487,8 +504,9 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             key=lambda row: str(row.get("date", "")),
         )
         if existing_records:
-            start_date = start_date or existing_records[0].get("date")
-            end_date = end_date or existing_records[-1].get("date")
+            # Metadata may still point at a future/corrupt row removed above.
+            start_date = existing_records[0].get("date")
+            end_date = existing_records[-1].get("date")
         else:
             start_date = None
             end_date = None
@@ -531,7 +549,10 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     if full_daily_backfill or qfq_rebased:
         pass
     elif end_date:
-        if end_date < today:
+        needs_overlap = end_date < today or not _history_snapshot_has_final_bar(
+            end_date, existing.get("history_refetched_at")
+        )
+        if needs_overlap:
             overlap_start = (
                 datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=QFQ_OVERLAP_DAYS)
             ).strftime("%Y-%m-%d")
@@ -549,10 +570,9 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
                 )
                 hist_new_records = fetch_daily_range(code, full_refetch_start, today)
             else:
-                hist_new_records.extend(
-                    row for row in overlap_records
-                    if str(row.get("date", ""))[:10] > end_date
-                )
+                # 重叠窗口不仅用于检测前复权尺度，也要用收盘后的完整 OHLCV 覆盖同日
+                # 旧值；否则曾在盘中写入的成交量/最高最低价会因日期相同被永久跳过。
+                hist_new_records.extend(overlap_records)
     else:
         safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {max_start} ~ {today}")
         hist_new_records.extend(fetch_daily_range(code, max_start, today))
@@ -565,6 +585,20 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         include_valuation=False,
         drop_future=False,
     )
+    existing_by_date = {
+        str(row.get("date", ""))[:10]: row
+        for row in existing_records
+        if isinstance(row, dict) and row.get("date")
+    }
+    changed_daily_dates = set()
+    for row in normalized_new_records:
+        date_text = row["date"]
+        old = existing_by_date.get(date_text)
+        if old is None or any(
+            row.get(field) is not None and row.get(field) != old.get(field)
+            for field in HISTORY_PRICE_FIELDS
+        ):
+            changed_daily_dates.add(date_text)
     merged = merge_records(existing_records, normalized_new_records)
 
     result = {"symbol": code, "name": name}
@@ -582,17 +616,16 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         # C: 增量 append 快路——估值未变(val_period=None)、现有行未被裁剪/过滤、且非全量回补
         # (全量回补会覆盖已有日期) 时，只 upsert 新增日期行，不 DELETE+重写整段 10 年历史。
         existing_unchanged = len(existing_records) == raw_count
-        existing_dates = {r["date"] for r in existing_records}
-        new_rows = [r for r in merged if r["date"] not in existing_dates]
+        changed_rows = [r for r in merged if r["date"] in changed_daily_dates]
         # 全无变化(估值新、无新交易日、未 prune、非回补、不刷财报)→ 重写会原样落回同样数据，
         # 直接跳过：免去对「已最新」股票的整段 DELETE+重插（重复跑/周末/停牌股尤其明显）。
         force_history_replace = full_daily_backfill or qfq_rebased
-        if (val_period is None and existing_unchanged and not new_rows
+        if (val_period is None and existing_unchanged and not changed_rows
                 and not force_history_replace and not need_fundamentals):
             safe_print(f"[{idx}/{total}] {code} {name}: 已最新({end_date})，跳过写库")
             return
-        if val_period is None and existing_unchanged and new_rows and not force_history_replace:
-            result["history_write_records"] = new_rows
+        if val_period is None and existing_unchanged and not force_history_replace:
+            result["history_write_records"] = changed_rows
             result["history_replace"] = False
         else:
             result["history_write_records"] = merged

@@ -113,17 +113,78 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         for name in (
             "min_score",
             "max_consecutive_limit_up",
-            "hold_days_min",
-            "hold_days_max",
             "hold_days",
         ):
             self.assertIn(name, trial.categorical_names)
+        self.assertNotIn("hold_days_min", trial.categorical_names)
+        self.assertNotIn("hold_days_max", trial.categorical_names)
         self.assertIn(hold_days, optimizer.SHORT_HOLD_DAYS_CHOICES)
+        self.assertEqual(cfg["hold_days"], hold_days)
+        self.assertEqual(cfg["hold_days_min"], hold_days)
+        self.assertEqual(cfg["hold_days_max"], hold_days)
         self.assertIn("weights", cfg)
         self.assertEqual(cfg["min_lhb_count"], 0)
         self.assertEqual(cfg["min_hot_money_concurrent"], 0)
         self.assertNotIn("min_lhb_count", trial.categorical_names)
         self.assertNotIn("min_hot_money_concurrent", trial.categorical_names)
+        self.assertNotIn("hold_days_min", optimizer._default_short_params())
+        self.assertNotIn("hold_days_max", optimizer._default_short_params())
+
+    def test_short_backtest_prefers_explicit_full_signal_event_date(self):
+        pick = {
+            "code": "000001",
+            "event_date": "2026-07-10",
+            # Legacy/truncated sample points to an earlier date and must not win.
+            "followers": [{"date": "2026-07-03"}],
+        }
+        series = {
+            "000001": [
+                {"date": "2026-07-04", "close": 5.0},
+                {"date": "2026-07-11", "close": 10.0},
+                {"date": "2026-07-12", "close": 11.0},
+            ]
+        }
+
+        self.assertEqual(optimizer.latest_pick_event_date(pick), "2026-07-10")
+        result = optimizer.short_actual_backtest([pick], series, hold_days=1)
+
+        self.assertEqual(result["samples"], 1)
+        self.assertAlmostEqual(result["avg_return"], 9.6, places=6)
+
+    def test_short_hold_config_uses_one_selected_horizon(self):
+        cfg = optimizer._short_config_with_hold_days(DEFAULT_CONFIG["short"], 3)
+
+        self.assertEqual(cfg["hold_days"], 3)
+        self.assertEqual(cfg["hold_days_min"], 3)
+        self.assertEqual(cfg["hold_days_max"], 3)
+        self.assertEqual(DEFAULT_CONFIG["short"]["hold_days_min"], 1)
+        self.assertEqual(DEFAULT_CONFIG["short"]["hold_days_max"], 5)
+
+    def test_short_horizon_without_samples_does_not_borrow_another_horizon(self):
+        picks = [{"code": "000001", "event_date": "2026-07-01"}]
+        series = {
+            "000001": [
+                {"date": "2026-07-02", "close": 10.0},
+                {"date": "2026-07-03", "close": 11.0},
+                {"date": "2026-07-04", "close": 12.0},
+            ]
+        }
+
+        hold_days, actual = optimizer._short_backtest_for_horizon(
+            picks, series, suggested_hold_days=5
+        )
+
+        self.assertEqual(hold_days, 5)
+        self.assertEqual(actual["samples"], 0)
+
+        finalized = optimizer._finalize_short_best({
+            "hold_days": 5,
+            "hold_days_validated": False,
+            "config": optimizer._short_config_with_hold_days(DEFAULT_CONFIG["short"], 5),
+        })
+        self.assertEqual(finalized["hold_days"], optimizer._default_short_params()["hold_days"])
+        self.assertEqual(finalized["config"]["hold_days"], finalized["hold_days"])
+        self.assertEqual(finalized["hold_days_fallback_reason"], "no_forward_price_samples")
 
     def test_prepared_short_scoring_matches_scalar_scoring(self):
         broad = []
@@ -253,7 +314,7 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertTrue(all(b - a == 20 for a, b in zip(offsets, offsets[1:])))
         self.assertLess(offsets[-1], 1250)
         self.assertEqual(optimizer._default_smallcap_params()["hold_td"], 20)
-        self.assertEqual(optimizer._default_long_params()["hold_td"], 60)
+        self.assertEqual(optimizer._default_long_params()["hold_td"], 40)
 
     def test_smallcap_optimizer_never_searches_or_enables_high_drawdown_filter(self):
         random_cfg = optimizer.random_smallcap_config(random.Random(7), iteration=5)
@@ -336,7 +397,11 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             return {
                 "strategy": strategy,
                 "iterations": iterations,
-                "best": {"config": {"kind": strategy}, "objective": 2.0},
+                "best": {
+                    "config": {"kind": strategy},
+                    "hold_days": 3,
+                    "objective": 2.0,
+                },
                 "progress_position": progress_position,
                 "seed": seed,
             }
@@ -368,7 +433,10 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertNotIn("long", result)
         self.assertEqual(executor_workers, [])
         self.assertEqual(saved["config"]["long"], {"kept": True})
-        self.assertEqual(saved["config"]["short"], {"kind": "short"})
+        self.assertEqual(saved["config"]["short"]["kind"], "short")
+        self.assertEqual(saved["config"]["short"]["hold_days"], 3)
+        self.assertEqual(saved["config"]["short"]["hold_days_min"], 3)
+        self.assertEqual(saved["config"]["short"]["hold_days_max"], 3)
         self.assertEqual(saved["scores"]["long_objective"], 9.0)
         self.assertEqual(saved["short_universe_version"], optimizer.SHORT_UNIVERSE_VERSION)
 

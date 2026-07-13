@@ -265,13 +265,20 @@ def _date_compact(value):
 
 
 def latest_weekday_date(value=None):
-    """返回不晚于 value 的最近工作日日期；避免周末刷新时补不存在的行情。"""
+    """返回不晚于 value 的最近一个已完成工作日。
+
+    默认当前时间或显式 datetime 在 A 股收盘数据稳定前（15:10）运行时回退一天，避免把
+    盘中 OHLCV 当成完整日线落库。显式日期字符串没有时刻信息，仍按该日期已完成处理。
+    """
+    has_clock = value is None or isinstance(value, datetime)
     if value is None:
         dt = datetime.now()
     elif isinstance(value, datetime):
         dt = value
     else:
         dt = datetime.strptime(_date_dash(value), "%Y-%m-%d")
+    if has_clock and dt.weekday() < 5 and (dt.hour, dt.minute) < (15, 10):
+        dt -= timedelta(days=1)
     while dt.weekday() >= 5:
         dt -= timedelta(days=1)
     return dt.strftime("%Y-%m-%d")
@@ -821,6 +828,7 @@ def _fetch_daily_source(source, symbol, start_date, end_date, include_trading_va
 def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=False, warn=None):
     """A 股前复权日线，change_pct 统一为 close-to-close 日涨跌幅。"""
     last_err = None
+    saw_empty_response = False
     for group in _enabled_daily_source_groups(include_trading_value=include_trading_value):
         for source in _ordered_daily_group_sources(group):
             try:
@@ -832,6 +840,11 @@ def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=
                     end_date,
                     include_trading_value=include_trading_value,
                 )
+                if not records:
+                    saw_empty_response = True
+                    if warn:
+                        warn(f"{symbol} {source}行情返回空数据，切换下一数据源")
+                    continue
                 _record_daily_source_success(source)
                 return records
             except Exception as exc:
@@ -841,7 +854,11 @@ def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=
                     warn(f"{symbol} {source}行情失败({exc})，切换下一数据源")
                     if disabled_now:
                         warn(f"{source}行情连续失败，当前进程后续请求将先跳过该源")
-    raise last_err
+    if last_err is not None:
+        raise last_err
+    if saw_empty_response:
+        return []
+    return []
 
 
 # ─── 通用 JSON 文件工具 ───────────────────────────────────────

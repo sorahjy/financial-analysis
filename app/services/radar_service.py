@@ -14,6 +14,7 @@ from stock_hot_money_radar import (
     AMBUSH_RESULT_FILE,
     fetch_realtime_a_quotes,
     pattern_catalog,
+    scoring_model_catalog,
     realtime_rescore_payload,
 )
 
@@ -82,6 +83,10 @@ def radar_pattern_catalog() -> List[Dict[str, Any]]:
     return pattern_catalog()
 
 
+def radar_scoring_model() -> Dict[str, Any]:
+    return scoring_model_catalog()
+
+
 def start_radar_run(include_large_cap: bool = True, pool: str = "leader") -> bool:
     """后台跑 `python stock_hot_money_radar.py ambush`（刷新吸筹分/反转分+形态结果）。
 
@@ -92,7 +97,15 @@ def start_radar_run(include_large_cap: bool = True, pool: str = "leader") -> boo
     cmd = ["python", "stock_hot_money_radar.py", "ambush",
            "--no-exclude-large-cap" if include_large_cap else "--exclude-large-cap",
            "--pool", pool]
-    return start_command_job(RADAR_RUN_JOB_ID, cmd, cwd=ROOT_DIR, timeout=1800)
+    return start_command_job(
+        RADAR_RUN_JOB_ID,
+        cmd,
+        cwd=ROOT_DIR,
+        timeout=1800,
+        # The full data-refresh script also rebuilds this same radar artifact.
+        # Share its lock so two differently named UI jobs cannot write it at once.
+        resource_key="stock-data-refresh",
+    )
 
 
 def radar_run_state() -> Dict[str, Any]:
@@ -106,6 +119,7 @@ def start_radar_data_refresh() -> bool:
         ["bash", RADAR_REFRESH_SCRIPT],
         cwd=ROOT_DIR,
         timeout=10800,                            # 全量爬取耗时长，给 3 小时上限
+        resource_key="stock-data-refresh",
     )
 
 

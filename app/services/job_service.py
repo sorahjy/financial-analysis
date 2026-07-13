@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import signal
 import shlex
 import subprocess
 import threading
@@ -29,6 +30,7 @@ def _empty_state(job_id: str) -> Dict[str, Any]:
         "elapsed_sec": None,
         "command": [],
         "command_text": "",
+        "resource_key": None,
         "log_lines": [],
     }
 
@@ -41,6 +43,16 @@ def get_job_state(job_id: str) -> Dict[str, Any]:
         return state
 
 
+def is_resource_running(resource_key: str) -> bool:
+    if not resource_key:
+        return False
+    with _LOCK:
+        return any(
+            state.get("running") and state.get("resource_key") == resource_key
+            for state in _STATES.values()
+        )
+
+
 def start_command_job(
     job_id: str,
     command: List[str],
@@ -48,10 +60,16 @@ def start_command_job(
     cwd: Path = ROOT_DIR,
     timeout: int = 1800,
     on_success: JobCallback = None,
+    resource_key: Optional[str] = None,
 ) -> bool:
     with _LOCK:
         current = _STATES.get(job_id)
         if current and current.get("running"):
+            return False
+        if resource_key and any(
+            state.get("running") and state.get("resource_key") == resource_key
+            for state in _STATES.values()
+        ):
             return False
         _STATES[job_id] = {
             **_empty_state(job_id),
@@ -59,6 +77,7 @@ def start_command_job(
             "started_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "command": list(command),
             "command_text": _format_command(command),
+            "resource_key": resource_key,
             "log_lines": [f"$ {_format_command(command)}"],
         }
 
@@ -95,6 +114,7 @@ def _run_command(
             errors="replace",
             bufsize=1,
             env=env,
+            start_new_session=os.name != "nt",
         )
         reader = threading.Thread(
             target=_stream_process_output,
@@ -107,8 +127,8 @@ def _run_command(
         except subprocess.TimeoutExpired:
             error = f"任务超时({timeout}秒)"
             _append_job_log(job_id, error)
-            process.kill()
-            return_code = process.wait()
+            terminate_process_tree(process)
+            return_code = process.returncode
         finally:
             reader.join(timeout=1)
             if process.stdout:
@@ -147,6 +167,41 @@ def _run_command(
 
 def _format_command(command: List[str]) -> str:
     return shlex.join(command)
+
+
+def terminate_process_tree(process: subprocess.Popen[Any], *, grace_seconds: float = 2.0) -> None:
+    """Stop a subprocess and every descendant in its process group.
+
+    Refresh commands often launch shell/Python grandchildren.  Killing only the
+    direct process lets those children keep writing SQLite/JSON after the UI has
+    already reported a timeout.
+    """
+    if process.poll() is not None:
+        return
+
+    def send(sig: int) -> None:
+        try:
+            if os.name != "nt":
+                os.killpg(process.pid, sig)
+            elif sig == signal.SIGTERM:
+                process.terminate()
+            else:
+                process.kill()
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    send(signal.SIGTERM)
+    try:
+        process.wait(timeout=max(0.0, grace_seconds))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+    send(signal.SIGKILL)
+    try:
+        process.wait(timeout=max(1.0, grace_seconds))
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
 
 
 def _stream_process_output(job_id: str, stream: Optional[TextIO]) -> None:

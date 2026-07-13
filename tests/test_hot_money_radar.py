@@ -57,6 +57,32 @@ def _p25_bars():
     return bars
 
 
+def _p1_low_base_bars():
+    """第178根起底盘状态连续成立，最终第180根恰好首次三日确认。"""
+    bars = []
+    closes = [14.0 - 3.5 * i / 119 for i in range(120)]
+    closes.extend(10.12 - 0.12 * i / 59 for i in range(60))
+    for i, close in enumerate(closes):
+        previous = closes[i - 1] if i else close
+        spread = 0.018 if i < 160 else 0.003
+        high = max(previous, close) * (1.0 + spread)
+        low = min(previous, close) * (1.0 - spread)
+        if i == 117:
+            high = 14.0  # 直到该异常高点移出60日窗口，底盘状态才成立。
+        bars.append({
+            "date": f"d{i:03d}",
+            "open": previous,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": 1000.0,
+            "amount": close * 1000.0,
+            "chg": (close / previous - 1.0) * 100.0 if previous else 0.0,
+            "turnover": 1.0,
+        })
+    return bars
+
+
 def _p2_bars(event_count, include_today=True):
     """最后10根中放入指定数量十字星，其余为普通实体K线。"""
     bars = []
@@ -166,6 +192,18 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(radar.build_parser().parse_args(["distribution"]).mode, "distribution")
         self.assertEqual(radar.build_parser().parse_args(["accumulation"]).mode, "accumulation")
 
+    def test_pattern_significance_uses_hac_and_bh_fdr(self):
+        positively_correlated = [0.02] * 10 + [-0.01] * 10
+        iid_t, _iid_p = radar._newey_west_mean_test(positively_correlated, 0)
+        hac_t, hac_p = radar._newey_west_mean_test(positively_correlated, 5)
+
+        self.assertLess(abs(hac_t), abs(iid_t))
+        self.assertGreater(hac_p, 0.05)
+        self.assertEqual(
+            radar._bh_fdr_threshold([0.001, 0.01, 0.04, 0.2], 0.10),
+            0.04,
+        )
+
     def test_pattern_effective_set_matches_latest_retest(self):
         expected = {"P3", "P11", "P12", "P13", "P14", "P16", "P17", "P19", "P20", "P22", "P24", "P26"}
         self.assertEqual(radar.PATTERN_EFFECTIVE, expected)
@@ -184,6 +222,10 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertFalse(catalog["P7"]["effective"])
         self.assertIn("P25", catalog)
         self.assertFalse(catalog["P25"]["effective"])
+        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P25"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P1"]["validation_label"], "仅小盘有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "仅小盘有效")
         self.assertIn("P26", catalog)
         self.assertTrue(catalog["P26"]["effective"])
         self.assertEqual(catalog["P3"]["effective_style"], "bullish")
@@ -364,11 +406,13 @@ class HotMoneyRadarTest(unittest.TestCase):
 
     def test_accumulation_model_uses_raw_feature_weights(self):
         weights = {
-            "chip": 0.20,
+            "chip": 0.10,
             "position": 0.20,
             "cmf_eff": 0.10,
             "p3": 0.20,
             "p24": 0.10,
+            "p1": 0.05,
+            "p25": 0.05,
             "holder_change": 0.10,
             "repurchase": 0.10,
         }
@@ -378,7 +422,7 @@ class HotMoneyRadarTest(unittest.TestCase):
                 "distribution_score": 0.0,
                 "holder_change": -15.0,
                 "repurchase_recent": True,
-                "patterns": ["P3", "P24"],
+                "patterns": ["P1", "P3", "P24", "P25"],
                 "signals": {},
                 "sub_scores": {
                     "chip": 80.0,
@@ -404,7 +448,7 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertAlmostEqual(sum(radar.ACCUM_MODEL_WEIGHTS.values()), 1.0)
         radar._apply_accumulation_model(rows)
 
-        self.assertEqual(rows[0]["ambush_score"], 84.0)
+        self.assertEqual(rows[0]["ambush_score"], 86.0)
         self.assertEqual(rows[0]["accumulation_percentile"], 100.0)
         self.assertEqual(rows[0]["distribution_percentile"], 0.0)
         self.assertEqual(rows[0]["opportunity_score"], 100.0)
@@ -412,6 +456,8 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertNotIn("technical_ambush_score", rows[0]["signals"])
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p3"], 100.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p24"], 100.0)
+        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p1"], 100.0)
+        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p25"], 100.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["chip"], 80.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["holder_change"], 100.0)
         self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["repurchase"], 100.0)
@@ -420,10 +466,24 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(rows[1]["opportunity_score"], 0.0)
         self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p3"], 0.0)
         self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p24"], 0.0)
+        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p1"], 0.0)
+        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p25"], 0.0)
         self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["holder_change"], 50.0)
         self.assertEqual(rows[0]["signals"]["accumulation_percentile"], 100.0)
         self.assertEqual(rows[0]["signals"]["distribution_percentile"], 0.0)
         self.assertEqual(rows[0]["signals"]["opportunity_formula"], radar.OPPORTUNITY_FORMULA)
+
+    def test_accumulation_weight_grid_fixes_p1_and_p25_at_five_percent(self):
+        grid = radar._accumulation_weight_grid()
+        self.assertEqual(len(grid), 210)
+        self.assertTrue(all(abs(sum(weights.values()) - 1.0) < 1e-9 for weights in grid))
+        self.assertTrue(all(weights["p1"] == 0.05 for weights in grid))
+        self.assertTrue(all(weights["p25"] == 0.05 for weights in grid))
+        for weights in grid:
+            for feature in radar.ACCUM_FEATURES:
+                if feature not in {"p1", "p25"}:
+                    self.assertGreaterEqual(weights[feature], 0.10)
+        self.assertIn(radar.ACCUM_MODEL_WEIGHTS, grid)
 
     def test_cross_section_percentiles_share_tie_rank(self):
         rows = [{"score": 10.0}, {"score": 20.0}, {"score": 20.0}, {"score": 40.0}]
@@ -508,6 +568,40 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertFalse(regime["above_ma20"])
         self.assertFalse(regime["favorable"])
         self.assertAlmostEqual(regime["ret5"], -0.0476)
+        conn.close()
+
+    def test_p1_market_gate_uses_ma60_or_pit_ma20_repair(self):
+        rising = [1.0 + 0.01 * i for i in range(60)]
+        repair = [2.0] * 35 + [1.0 + 0.01 * i for i in range(25)]
+        falling = [2.0 - 0.01 * i for i in range(60)]
+
+        self.assertTrue(radar._p1_market_gate_metrics(rising)["gate"])
+        repaired = radar._p1_market_gate_metrics(repair)
+        self.assertFalse(repaired["above_ma60"])
+        self.assertTrue(repaired["ma20_rising_5d"])
+        self.assertTrue(repaired["gate"])
+        self.assertFalse(radar._p1_market_gate_metrics(falling)["gate"])
+        self.assertFalse(radar._p1_market_gate_metrics(falling[:59])["available"])
+
+        conn = stock_storage.connect(":memory:")
+        base = date(2026, 1, 1)
+        records = [{
+            "date": (base + timedelta(days=i)).isoformat(),
+            "nav": f"{value:.4f}",
+            "nav_acc": f"{value:.4f}",
+        } for i, value in enumerate(repair)]
+        stock_storage.save_index_nav(
+            conn, {"code": radar.MARKET_REGIME_INDEX, "records": records}
+        )
+        gates = radar._p1_market_gate_by_date(
+            conn, [records[58]["date"], records[59]["date"]]
+        )
+        self.assertFalse(gates[records[58]["date"]])  # 仅59根，禁止偷看下一日。
+        self.assertTrue(gates[records[59]["date"]])
+        regime = radar._market_regime(conn)
+        self.assertTrue(regime["p1_trade_gate_available"])
+        self.assertTrue(regime["p1_trade_gate"])
+        self.assertEqual(regime["p1_trade_gate_reason"], "ma20_rising_5d")
         conn.close()
 
     def test_empty_pattern_phase_uses_watch_label(self):
@@ -777,7 +871,7 @@ class HotMoneyRadarTest(unittest.TestCase):
             "turnover": 2.0,
             "quote_time": "2026-07-08 10:30:00",
             "quote_date": "2026-07-08",
-        })
+        }, now=datetime(2026, 7, 8, 10, 30))
 
         self.assertTrue(bar["volume_projected"])
         self.assertEqual(bar["volume_elapsed_minutes"], 60.0)
@@ -789,6 +883,110 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertAlmostEqual(bar["turnover"], 6.0606, places=4)
         self.assertEqual(bar["raw_amount"], 220000.0)
         self.assertAlmostEqual(bar["amount"], 666666.667, places=3)
+
+    def test_stale_quote_is_not_projected_as_intraday_volume(self):
+        factor, elapsed, projected = radar._intraday_volume_projection(
+            {
+                "quote_time": "2026-07-08 10:30:00",
+                "quote_date": "2026-07-08",
+            },
+            now=datetime(2026, 7, 9, 10, 30),
+        )
+
+        self.assertEqual(factor, 1.0)
+        self.assertEqual(elapsed, 60.0)
+        self.assertFalse(projected)
+
+    def test_realtime_merge_rejects_multi_session_local_history_gap(self):
+        bars = [{
+            "date": "2026-07-08", "open": 10.0, "high": 10.2, "low": 9.8,
+            "close": 10.0, "volume": 1000.0, "amount": 10000.0,
+            "chg": 0.0, "turnover": 1.0,
+        }]
+        quote = {
+            "price": 11.0, "pre_close": 10.5, "change_pct": 4.7619,
+            "open": 10.6, "high": 11.1, "low": 10.4,
+            "quote_date": "2026-07-10",
+        }
+
+        merged, used = radar._merge_realtime_quote_bars(bars, quote)
+
+        self.assertFalse(used)
+        self.assertEqual(merged, bars)
+        self.assertIsNone(radar._quote_to_realtime_bar(bars, quote))
+
+    def test_realtime_merge_allows_friday_to_monday(self):
+        bars = [{
+            "date": "2026-07-10", "open": 10.0, "high": 10.2, "low": 9.8,
+            "close": 10.0, "volume": 1000.0, "amount": 10000.0,
+            "chg": 0.0, "turnover": 1.0,
+        }]
+        quote = {
+            "price": 10.5, "pre_close": 10.0, "change_pct": 5.0,
+            "open": 10.1, "high": 10.6, "low": 10.0,
+            "quote_date": "2026-07-13",
+        }
+
+        merged, used = radar._merge_realtime_quote_bars(bars, quote)
+
+        self.assertTrue(used)
+        self.assertEqual(merged[-1]["date"], "2026-07-13")
+        self.assertAlmostEqual(merged[-1]["close"], 10.5)
+
+    def test_candidate_scoring_reuses_current_chip_metrics(self):
+        bars = [
+            {
+                "date": day,
+                "open": close,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": volume,
+                "amount": close * volume * 100.0,
+                "chg": change,
+                "turnover": turnover,
+            }
+            for day, high, low, close, volume, change, turnover in _gen_bars(2, n=120)
+        ]
+
+        with patch.object(radar, "_chip_metrics", wraps=radar._chip_metrics) as chip_metrics:
+            result = radar._score_candidate_from_bars({"code": "600000"}, bars, pool="leader")
+
+        self.assertEqual(result["score_status"], "OK")
+        # Current window + five-days-prior risk window.  The score and pattern
+        # paths must share the current computation instead of making a third.
+        self.assertEqual(chip_metrics.call_count, 2)
+
+    def test_ambush_scores_each_stock_with_gate_at_its_own_last_bar(self):
+        candidates = [{"code": "600000"}, {"code": "600001"}]
+        bars_by_code = {
+            "600000": [{"date": "2026-07-01"}],
+            "600001": [{"date": "2026-07-10"}],
+        }
+        seen = []
+
+        def fake_recent(_conn, code, **_kwargs):
+            return bars_by_code[code]
+
+        def fake_score(cand, bars, **kwargs):
+            seen.append((cand["code"], bars[-1]["date"], kwargs["p1_market_gate"]))
+            return {"code": cand["code"]}
+
+        with patch.object(radar, "_recent_bars", side_effect=fake_recent), \
+             patch.object(radar, "_p1_market_gate_by_date", return_value={
+                 "2026-07-01": False,
+                 "2026-07-10": True,
+             }) as gate_map, \
+             patch.object(radar, "_score_candidate_from_bars", side_effect=fake_score):
+            radar._score_ambush_candidates(object(), candidates, None, "leader")
+
+        self.assertEqual(seen, [
+            ("600000", "2026-07-01", False),
+            ("600001", "2026-07-10", True),
+        ])
+        self.assertEqual(
+            set(gate_map.call_args.args[1]), {"2026-07-01", "2026-07-10"}
+        )
 
     def test_realtime_rescore_uses_eastmoney_quote_without_persisting(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -834,6 +1032,46 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertAlmostEqual(row["realtime_adjusted_close"], 10.8)
         self.assertEqual(row["market_cap_yi"], 88.0)
         self.assertEqual(row["last_date"], latest)
+
+    def test_realtime_rescore_does_not_apply_latest_gate_to_stale_bar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_file = Path(tmpdir) / "t.sqlite3"
+            conn = stock_storage.connect(db_file)
+            _seed_history(conn, "600000", _flat_bars(90, 10.0, 1000.0, 1.0))
+            last_date = conn.execute(
+                "SELECT MAX(date) FROM stock_history WHERE code='600000'"
+            ).fetchone()[0]
+            conn.close()
+            seen = []
+
+            def fake_score(cand, bars, **kwargs):
+                seen.append((bars[-1]["date"], kwargs["p1_market_gate"]))
+                return {
+                    **cand,
+                    "ambush_score": 1.0,
+                    "patterns": [],
+                    "signals": {},
+                    "triggered": False,
+                    "pattern_phase": "观望⚪",
+                }
+
+            with patch.object(radar, "DB_FILE", db_file), \
+                 patch.object(radar, "_market_regime", return_value={
+                     "available": True, "p1_trade_gate": True,
+                 }), \
+                 patch.object(radar, "_p1_market_gate_by_date", return_value={last_date: False}), \
+                 patch.object(radar, "_score_candidate_from_bars", side_effect=fake_score), \
+                 patch.object(radar, "_apply_distribution_model"), \
+                 patch.object(radar, "_attach_capital_evidence"), \
+                 patch.object(radar, "_apply_accumulation_model"), \
+                 patch.object(radar, "_apply_reversal_model"):
+                live = radar.realtime_rescore_payload({
+                    "pool": "hotmoney",
+                    "stocks": [{"code": "600000", "name": "停牌样本"}],
+                }, {})
+
+        self.assertEqual(seen, [(last_date, False)])
+        self.assertTrue(live["market_regime"]["p1_trade_gate"])
 
     def test_realtime_lhb_recent_uses_latest_trade_date_window(self):
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -997,8 +1235,46 @@ def _pat_bar(t, o, h, l, c, vol, prev):
 
 
 class PatternMatchTest(unittest.TestCase):
+    def test_p1_requires_first_low_base_confirmation_chip_cost_and_market_gate(self):
+        bars = _p1_low_base_bars()
+        chip = {
+            "concentration": 0.45,
+            "peak_pctile": 0.40,
+            "price_to_peak": 0.02,
+            "winner": 0.50,
+        }
+        context = {"chip": chip}
+
+        self.assertFalse(radar._p1_low_base_state(bars[:-3]))
+        self.assertTrue(radar._p1_low_base_state(bars[:-2]))
+        self.assertTrue(radar._p1_low_base_state(bars[:-1]))
+        self.assertTrue(radar._p1_low_base_state(bars))
+        self.assertTrue(radar._pat_low_consolidation(bars, context))
+        self.assertFalse(radar._pat_low_consolidation(
+            bars, {"chip": {**chip, "winner": 0.90}}
+        ))
+
+        p1_only = [("P1", "低位底盘吸筹确认", "吸筹", "buy", radar._pat_low_consolidation)]
+        with patch.object(radar, "PATTERNS", p1_only):
+            enabled = radar.match_patterns(
+                "600000", bars, ctx=context, pool="hotmoney", p1_market_gate=True
+            )
+            closed = radar.match_patterns(
+                "600000", bars, ctx=context, pool="hotmoney", p1_market_gate=False
+            )
+            leader = radar.match_patterns(
+                "600000", bars, ctx=context, pool="leader", p1_market_gate=True
+            )
+            unspecified = radar.match_patterns(
+                "600000", bars, ctx=context, p1_market_gate=True
+            )
+        self.assertEqual([row["code"] for row in enabled], ["P1"])
+        self.assertEqual(closed, [])
+        self.assertEqual([row["code"] for row in leader], ["P1"])
+        self.assertEqual([row["code"] for row in unspecified], ["P1"])
+
     def test_accumulation_bars_fire_buy_pattern(self):
-        # 先 16→9 阴跌 60 日，再低位横盘 9.0 共 30 日 → 应命中 P1 低位横盘磨人
+        # 先 16→9 阴跌 60 日，再低位横盘；应至少命中一个吸筹观察形态。
         bars = []
         prev = 16.0
         for t in range(90):
@@ -1056,6 +1332,62 @@ class PatternMatchTest(unittest.TestCase):
         for p in payload["patterns"]:
             for h in radar.VERIFY_HORIZONS:
                 self.assertIn(str(h), p["horizons"])
+                self.assertIn("hac_lag", p["horizons"][str(h)])
+                self.assertIn("fdr_10", p["horizons"][str(h)])
+        self.assertEqual(payload["bh_fdr_q"], radar.PATTERN_FDR_Q)
+
+    def test_leader_pattern_history_passes_pit_p1_gate_to_matcher(self):
+        conn = stock_storage.connect(":memory:")
+        _seed_history(conn, "600000", _gen_bars(1, n=240))
+        seen_gates = []
+
+        def gates_for_dates(_conn, dates):
+            return {day: True for day in dates}
+
+        def fake_match(_code, _bars, **kwargs):
+            seen_gates.append(kwargs.get("p1_market_gate"))
+            return []
+
+        with patch.object(radar, "VERIFY_STEP", 5), \
+             patch.object(radar, "_p1_market_gate_by_date", side_effect=gates_for_dates), \
+             patch.object(radar, "match_patterns", side_effect=fake_match):
+            collected = radar._collect_pattern_samples(
+                conn, [{"code": "600000"}], pool="leader"
+            )
+        conn.close()
+
+        self.assertTrue(collected["samples"])
+        self.assertTrue(seen_gates)
+        self.assertTrue(all(seen_gates))
+
+    def test_leader_accumulation_history_scores_p1_and_p25_with_pit_gate(self):
+        conn = stock_storage.connect(":memory:")
+        _seed_history(conn, "600000", _gen_bars(1, n=240))
+        seen = []
+
+        def gates_for_dates(_conn, dates):
+            return {day: True for day in dates}
+
+        def fake_match(_code, _bars, **kwargs):
+            seen.append((kwargs.get("pool"), kwargs.get("p1_market_gate")))
+            return [
+                {"code": "P1", "name": "P1", "phase": "吸筹", "signal": "buy"},
+                {"code": "P25", "name": "P25", "phase": "吸筹", "signal": "buy"},
+            ]
+
+        with patch.object(radar, "VERIFY_STEP", 5), \
+             patch.object(radar, "_p1_market_gate_by_date", side_effect=gates_for_dates), \
+             patch.object(radar, "match_patterns", side_effect=fake_match):
+            collected = radar._collect_accumulation_samples(
+                conn, [{"code": "600000"}], pool="leader"
+            )
+        conn.close()
+
+        self.assertTrue(collected["samples"])
+        self.assertTrue(seen)
+        self.assertTrue(all(pool == "leader" and gate for pool, gate in seen))
+        self.assertTrue(all(row["features"]["p1"] == 100.0 for row in collected["samples"]))
+        self.assertTrue(all(row["features"]["p25"] == 100.0 for row in collected["samples"]))
 
 
 class HotMoneyLatentTest(unittest.TestCase):

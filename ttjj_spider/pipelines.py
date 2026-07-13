@@ -5,6 +5,7 @@
 # Don't forget to add your pipeline to the ITEM_PIPELINES setting
 # See: https://doc.scrapy.org/en/latest/topics/item-pipeline.html
 
+import json
 import os
 
 from fund_storage import connect as connect_fund_db, save_profile_snapshots
@@ -30,10 +31,10 @@ from fund_storage import connect as connect_fund_db, save_profile_snapshots
 
 
 class TtjjSpiderPipeline(object):
-    """爬完且有数据才替换 SQLite 基金概况快照。
+    """把成功抓到的基金概况合并进 SQLite 快照。
 
-    避免爬虫启动即清空旧数据：一旦本次爬取整体失败，下游报告继续使用
-    上一次的正常快照。
+    部分基金请求失败时保留其上一次快照；只有明确确认本轮覆盖全部预期
+    基金代码时才做全量替换，以便删除配置中已移除的基金。
     """
 
     def __init__(self):
@@ -59,11 +60,47 @@ class TtjjSpiderPipeline(object):
 
     def close_spider(self, spider):
         if self.item_count > 0:
+            expected_codes = self._load_expected_codes(spider)
+            actual_codes = {
+                str(item.get('fundCode'))
+                for item in self.items
+                if item.get('fundCode')
+            }
+            complete = expected_codes is not None and actual_codes == expected_codes
             conn = connect_fund_db()
             try:
-                save_profile_snapshots(conn, self.items, replace=True)
+                save_profile_snapshots(
+                    conn,
+                    self.items,
+                    replace=complete,
+                    expected_codes=expected_codes if complete else None,
+                )
             finally:
                 conn.close()
-            spider.logger.info('SQLite 基金概况快照已更新，共 %d 条', self.item_count)
+            if complete:
+                spider.logger.info('SQLite 基金概况完整快照已替换，共 %d 条', self.item_count)
+            else:
+                missing_count = len(expected_codes - actual_codes) if expected_codes is not None else 0
+                spider.logger.warning(
+                    'SQLite 基金概况仅合并成功结果，共 %d 条，保留旧数据%s',
+                    self.item_count,
+                    '，缺少 {} 只'.format(missing_count) if missing_count else '',
+                )
         else:
             spider.logger.error('本次未爬到任何基金数据，保留旧 SQLite 基金概况快照')
+
+    @staticmethod
+    def _load_expected_codes(spider):
+        codes_file = getattr(spider, 'fund_codes_file', None)
+        if not codes_file:
+            return None
+        try:
+            with open(codes_file, 'r', encoding='utf-8') as fin:
+                payload = json.load(fin)
+        except (OSError, ValueError, TypeError) as exc:
+            spider.logger.warning('无法校验基金概况完整性，按增量合并处理: %s', exc)
+            return None
+        if not isinstance(payload, list):
+            spider.logger.warning('基金代码配置不是列表，按增量合并处理')
+            return None
+        return {str(code) for code in payload}

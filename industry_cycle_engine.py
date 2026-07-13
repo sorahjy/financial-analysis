@@ -421,6 +421,17 @@ class IndustryCycleEngine:
         if daily.empty:
             raise RuntimeError("plate_daily has no usable rows")
 
+        # ``as_of`` is a point-in-time boundary for the whole calculation, not
+        # merely for selecting the final row.  Keeping future observations in
+        # ``features`` would leak them into valuation percentiles and the
+        # forecast series even though ``latest`` itself was historical.
+        if as_of:
+            requested = pd.to_datetime(as_of)
+            trade_dates = pd.to_datetime(daily["trade_date"], errors="coerce")
+            daily = daily.loc[trade_dates <= requested].copy()
+            if daily.empty:
+                raise RuntimeError(f"no data available up to as_of={as_of}")
+
         features = self.feature_builder.build(daily)
         resolved_as_of = self._resolve_as_of(features, as_of)
         latest = self._latest_by_plate(features, resolved_as_of)

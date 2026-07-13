@@ -81,6 +81,22 @@ class IndustryCycleEngineTest(unittest.TestCase):
         self.assertEqual(len(smart_records), len(payloads["cycle"]["records"]))
         self.assertTrue(all(record["only_valid_near_cycle_bottom"] for record in smart_records))
 
+    def test_as_of_excludes_future_rows_from_percentiles_and_forecast(self):
+        rows = []
+        rows.extend(synthetic_plate("801001", "行业一", list(range(100, 320))))
+        rows.extend(synthetic_plate("801002", "行业二", list(range(260, 40, -1))))
+        frame = pd.DataFrame(rows)
+        cutoff = pd.bdate_range("2024-01-01", periods=160)[-1].strftime("%Y-%m-%d")
+        historical = frame[frame["trade_date"] <= pd.to_datetime(cutoff)].copy()
+
+        engine = IndustryCycleEngine(min_history_days=120, forecast_horizons=(20, 60))
+        expected = engine.build_payloads_from_frame(historical, as_of=cutoff)
+        actual = engine.build_payloads_from_frame(frame, as_of=cutoff)
+
+        self.assertEqual(actual["cycle"]["records"], expected["cycle"]["records"])
+        self.assertEqual(actual["strength"]["records"], expected["strength"]["records"])
+        self.assertEqual(actual["report"]["input_rows"], len(historical))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,7 +1,7 @@
 """短线行业热度数据准备入口。
 
 抓取申万二级行业日度分析数据，落库到 data/plate_data.sqlite3。
-默认从 2016-01-01 开始；后续运行只抓库内最新交易日之后的新数据。
+默认从 2016-01-01 开始；后续运行从所有板块共同覆盖水位之后继续，自动补齐尾部缺口。
 """
 
 from __future__ import annotations
@@ -110,10 +110,26 @@ def fetch_sw2_daily_analysis(
     conn = plate_storage.connect(db_file or plate_storage.DEFAULT_DB_FILE)
     try:
         latest = plate_storage.latest_trade_date(conn, plate_storage.PLATE_TYPE_SW2)
-        fetch_start = resolve_incremental_start(latest, start, end)
+        coverage_latest = plate_storage.oldest_latest_trade_date(
+            conn, plate_storage.PLATE_TYPE_SW2
+        )
+        coverage_gap = plate_storage.recent_incomplete_trade_date(
+            conn, plate_storage.PLATE_TYPE_SW2
+        )
+        frontier_start = resolve_incremental_start(coverage_latest or latest, start, end)
+        gap_start = None
+        if coverage_gap:
+            candidate = max(start, parse_dash(coverage_gap))
+            gap_start = candidate if candidate <= end else None
+        candidates = [candidate for candidate in (frontier_start, gap_start) if candidate]
+        fetch_start = min(candidates) if candidates else None
         if fetch_start is None:
             total = plate_storage.table_count(conn, "plate_daily")
-            print(f"[sw2] no new dates; latest={latest}, total={total}", flush=True)
+            print(
+                f"[sw2] no new dates; latest={latest}, "
+                f"coverage_latest={coverage_latest}, total={total}",
+                flush=True,
+            )
             return {
                 "requested_start": format_yyyymmdd(start),
                 "requested_end": format_yyyymmdd(end),
@@ -125,6 +141,8 @@ def fetch_sw2_daily_analysis(
                 "errors": [],
                 "total_records": total,
                 "latest_trade_date": latest,
+                "coverage_trade_date": coverage_latest,
+                "coverage_gap_date": coverage_gap,
             }
 
         totals = {"fetched": 0, "inserted": 0, "updated": 0}
@@ -150,6 +168,9 @@ def fetch_sw2_daily_analysis(
                     "failed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 })
                 print(f"[sw2] {start_text}-{end_text} failed: {exc}", flush=True)
+                # 不允许后续分块越过失败区间推进全局最新日期；否则下次增量无法知道中间
+                # 有一整段缺口。停在第一处失败，下轮仍会从共同覆盖水位继续补抓。
+                break
             if sleep_sec > 0:
                 time.sleep(sleep_sec)
 
@@ -166,6 +187,12 @@ def fetch_sw2_daily_analysis(
             "errors": errors,
             "total_records": total_records,
             "latest_trade_date": latest_after,
+            "coverage_trade_date": plate_storage.oldest_latest_trade_date(
+                conn, plate_storage.PLATE_TYPE_SW2
+            ),
+            "coverage_gap_date": plate_storage.recent_incomplete_trade_date(
+                conn, plate_storage.PLATE_TYPE_SW2
+            ),
         }
     finally:
         conn.close()
@@ -211,4 +238,6 @@ def main() -> Dict[str, Any]:
 
 
 if __name__ == "__main__":
-    main()
+    _result = main()
+    if _result["errors"]:
+        raise SystemExit(1)

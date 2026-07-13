@@ -11,7 +11,8 @@ if [ "$FUND_CRAWL_NO_PROXY" = "1" ]; then
     echo "已绕过代理直连境内数据源"
 fi
 
-python funds.py
+# 只解析严格校验过的基金代码列表，不执行 funds.py；同时兼容直接运行本脚本。
+python -c 'from app.routes.fund import _load_validated_fund_config, _sync_fund_codes; _sync_fund_codes(_load_validated_fund_config())'
 
 # Scrapy 缓存每日失效：非今日缓存自动清除
 CACHE_DIR=".scrapy/httpcache/jijin"

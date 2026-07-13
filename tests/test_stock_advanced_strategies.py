@@ -4,12 +4,15 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import stock_advanced_strategies as strategies
 from stock_advanced_strategies import (
     FactorSpec,
     SMALLCAP_EXCLUDED_FACTOR_KEYS,
     apply_scores,
     build_long_candidates,
     build_smallcap_candidates,
+    compute_ttm,
+    compute_yoy_growth,
     compute_long_raw_factors,
     csi300_persistence_proxy,
     first_not_none,
@@ -26,6 +29,7 @@ from stock_advanced_strategies import (
     run_smallcap_strategy,
     run_strategies,
     strip_internal,
+    yoy_from_latest_and_annual,
 )
 
 
@@ -71,6 +75,99 @@ PIT_SYNTH_STOCK = {
 
 
 class StockAdvancedStrategyTest(unittest.TestCase):
+    def test_price_row_caches_verify_identity_and_clear_on_invalidation(self):
+        strategies.invalidate_dir_fingerprints()
+        old_rows = [{"close": "1", "turnover_rate": "2"}]
+        fresh_rows = [{"close": "99", "turnover_rate": "88"}]
+        stale_arrays = strategies.price_arrays(old_rows, cache=True)
+
+        # Simulate an entry left under a newly reused integer id. The retained
+        # object identity must reject it rather than return old stock data.
+        strategies._price_arr_cache[id(fresh_rows)] = (old_rows, stale_arrays)
+        strategies._pretransformed_rows[id(fresh_rows)] = old_rows
+
+        arrays = strategies.price_arrays(fresh_rows, cache=True)
+        strategies.pretransform_price_rows(fresh_rows, cache=True)
+
+        self.assertEqual(arrays["close"].tolist(), [99.0])
+        self.assertEqual(arrays["turnover_rate"].tolist(), [88.0])
+        self.assertIs(type(fresh_rows[0]["close"]), float)
+        self.assertIs(strategies._price_arr_cache[id(fresh_rows)][0], fresh_rows)
+        self.assertIs(strategies._pretransformed_rows[id(fresh_rows)], fresh_rows)
+
+        strategies.invalidate_dir_fingerprints()
+        self.assertFalse(strategies._price_arr_cache)
+        self.assertFalse(strategies._pretransformed_rows)
+
+    def test_price_row_caches_are_bounded(self):
+        strategies.invalidate_dir_fingerprints()
+        rows_by_stock = [
+            [{"close": str(idx), "turnover_rate": "1"}] for idx in range(4)
+        ]
+        with patch.object(strategies, "_PRICE_ROW_CACHE_MAXSIZE", 2):
+            for rows in rows_by_stock:
+                strategies.pretransform_price_rows(rows, cache=True)
+                strategies.price_arrays(rows, cache=True)
+
+        self.assertEqual(len(strategies._pretransformed_rows), 2)
+        self.assertEqual(len(strategies._price_arr_cache), 2)
+        strategies.invalidate_dir_fingerprints()
+
+    def test_uncached_price_helpers_follow_in_place_mutation(self):
+        rows = [{"close": "1", "turnover_rate": "2"}]
+        first = strategies.price_arrays(rows)
+        rows[0]["close"] = "9"
+        rows.append({"close": "10", "turnover_rate": "3"})
+        strategies.pretransform_price_rows(rows)
+        second = strategies.price_arrays(rows)
+
+        self.assertEqual(first["close"].tolist(), [1.0])
+        self.assertEqual(second["close"].tolist(), [9.0, 10.0])
+        self.assertTrue(all(type(row["close"]) is float for row in rows))
+
+    def test_quarterly_ttm_yoy_matches_same_period_with_real_dates(self):
+        records = [
+            {"date": "2024-03-31", "revenue": 100},
+            {"date": "2023-12-31", "revenue": 300},
+            {"date": "2025-03-31", "revenue": 120},
+            {"date": "2023-03-31", "revenue": 80},
+            {"date": "2024-12-31", "revenue": 400},
+        ]
+
+        self.assertEqual(compute_ttm(records, "revenue"), 420.0)
+        self.assertAlmostEqual(compute_yoy_growth(records, "revenue"), 0.3125)
+
+    def test_balance_sheet_yoy_uses_previous_same_quarter_not_annual(self):
+        records = [
+            {"date": "2024-12-31", "total_assets": 130},
+            {"date": "2025-03-31", "total_assets": 140},
+            {"date": "2024-03-31", "total_assets": 100},
+            {"date": "2023-12-31", "total_assets": 90},
+        ]
+
+        self.assertAlmostEqual(
+            yoy_from_latest_and_annual(records, "total_assets"), 0.4
+        )
+
+    def test_short_event_date_and_follower_sample_use_full_sorted_signal(self):
+        data = {
+            "as_of_date": "2026-07-09",
+            "capital": {
+                "kline_as_of_date": "2026-07-10",
+                "followers": [
+                    {"seat": "B", "date": "2026-07-03", "buy_est": 2},
+                    {"seat": "A", "date": "2026-07-10", "buy_est": 1},
+                    {"seat": "C", "date": "2026-07-08", "buy_est": 3},
+                ],
+            },
+        }
+
+        self.assertEqual(strategies.short_signal_event_date(data), "2026-07-10")
+        self.assertEqual(
+            [row["date"] for row in strategies.follower_sample(data, limit=2)],
+            ["2026-07-10", "2026-07-08"],
+        )
+
     def test_factor_registry_has_required_depth(self):
         registry = get_factor_registry()
 
@@ -127,6 +224,31 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(config["short"]["top_n"], 6)
         self.assertEqual(config["_optimized_defaults"]["source"], str(backup))
         self.assertEqual(config["_optimized_defaults"]["iterations_per_strategy"], 1500)
+
+    def test_loaded_short_horizon_requires_explicit_selected_hold_days(self):
+        base_payload = {
+            "generated_at": "2026-07-12 10:00:00",
+            "short_universe_version": "hotmoney_small_cap_v1",
+            "config": {"short": {"hold_days_min": 2, "hold_days_max": 3}},
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            primary = Path(tmpdir) / "stock_strategy_optimized_config.json"
+            backup = Path(tmpdir) / "missing_backup.json"
+            primary.write_text(json.dumps(base_payload), encoding="utf-8")
+            with patch.object(strategies, "OPTIMIZED_CONFIG_FILE", primary), \
+                 patch.object(strategies, "OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                legacy = get_default_config()["short"]
+
+            base_payload["config"]["short"]["hold_days"] = 4
+            primary.write_text(json.dumps(base_payload), encoding="utf-8")
+            with patch.object(strategies, "OPTIMIZED_CONFIG_FILE", primary), \
+                 patch.object(strategies, "OPTIMIZED_CONFIG_BACKUP_FILE", backup):
+                current = get_default_config()["short"]
+
+        self.assertNotIn("hold_days", legacy)
+        self.assertEqual((legacy["hold_days_min"], legacy["hold_days_max"]), (1, 5))
+        self.assertEqual(current["hold_days"], 4)
+        self.assertEqual((current["hold_days_min"], current["hold_days_max"]), (4, 4))
 
     def test_smallcap_default_falls_back_to_its_own_backup(self):
         payload = {
@@ -315,6 +437,7 @@ class StockAdvancedStrategyTest(unittest.TestCase):
             "rank": 1,
             "code": "600000",
             "name": "浦发银行",
+            "event_date": "2026-07-10",
             "industry": "银行 / 股份制银行",
             "sw2_industry": "银行",
             "sw3_industry": "股份制银行",
@@ -326,6 +449,7 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(row["sw2_industry"], "银行")
         self.assertEqual(row["sw3_industry"], "股份制银行")
         self.assertEqual(row["sw3_segment_code"], "850111")
+        self.assertEqual(row["event_date"], "2026-07-10")
 
     def test_institution_conflict_distinguishes_lhb_direction(self):
         self.assertEqual(institution_conflict_score(-1e7, 5e7), 35.0)

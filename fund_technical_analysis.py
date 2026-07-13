@@ -327,20 +327,22 @@ def calc_adx(navs, period=14):
             minus_dm_s = minus_dm_s - minus_dm_s / period + minus_dm[i]
 
         if atr_s == 0:
-            dx_vals.append(0.0)
-            continue
-        plus_di = plus_dm_s / atr_s * 100
-        minus_di = minus_dm_s / atr_s * 100
-        di_sum = plus_di + minus_di
-        if di_sum == 0:
-            dx_vals.append(0.0)
+            dx = 0.0
         else:
-            dx_vals.append(abs(plus_di - minus_di) / di_sum * 100)
+            plus_di = plus_dm_s / atr_s * 100
+            minus_di = minus_dm_s / atr_s * 100
+            di_sum = plus_di + minus_di
+            dx = 0.0 if di_sum == 0 else abs(plus_di - minus_di) / di_sum * 100
+        dx_vals.append(dx)
 
         if len(dx_vals) == period:
             adx_list[i] = sum(dx_vals) / period
         elif len(dx_vals) > period:
-            adx_list[i] = (adx_list[i - 1] * (period - 1) + dx_vals[-1]) / period
+            previous_adx = adx_list[i - 1]
+            if previous_adx is None:
+                # Defensive fallback for discontinuous or degenerate inputs.
+                previous_adx = sum(dx_vals[-period - 1:-1]) / period
+            adx_list[i] = (previous_adx * (period - 1) + dx_vals[-1]) / period
 
     return adx_list
 

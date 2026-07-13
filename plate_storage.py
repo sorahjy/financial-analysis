@@ -347,6 +347,77 @@ def latest_trade_date(conn: sqlite3.Connection, plate_type: str = PLATE_TYPE_SW2
     return row["trade_date"] if row and row["trade_date"] else None
 
 
+def oldest_latest_trade_date(
+    conn: sqlite3.Connection,
+    plate_type: str = PLATE_TYPE_SW2,
+    *,
+    active_lookback_sessions: int = 40,
+) -> Optional[str]:
+    """返回近期活跃板块中最早的 ``last_date``，作为完整覆盖水位。
+
+    全表 MAX(trade_date) 只能说明至少一个板块到了该日；如果某个板块少一天，继续从
+    MAX+1 增量会永久跳过缺口。另一方面，对所有历史 plate_meta 直接取 MIN 会被已退役
+    板块永久卡住。因此只纳入最近若干交易日内仍出现过的活跃代码。
+    """
+    cutoff_row = conn.execute(
+        "SELECT MIN(trade_date) AS trade_date FROM ("
+        "  SELECT DISTINCT trade_date FROM plate_daily "
+        "  WHERE plate_type = ? ORDER BY trade_date DESC LIMIT ?"
+        ")",
+        (plate_type, max(2, int(active_lookback_sessions))),
+    ).fetchone()
+    cutoff = cutoff_row["trade_date"] if cutoff_row and cutoff_row["trade_date"] else None
+    if not cutoff:
+        return None
+    row = conn.execute(
+        "SELECT MIN(last_date) AS trade_date FROM plate_meta "
+        "WHERE plate_type = ? AND record_count > 0 "
+        "AND last_date IS NOT NULL AND last_date >= ?",
+        (plate_type, cutoff),
+    ).fetchone()
+    return row["trade_date"] if row and row["trade_date"] else None
+
+
+def recent_incomplete_trade_date(
+    conn: sqlite3.Connection,
+    plate_type: str = PLATE_TYPE_SW2,
+    *,
+    lookback_sessions: int = 40,
+) -> Optional[str]:
+    """查找近期横截面记录数低于常态的最早交易日。
+
+    per-plate ``last_date`` 能修复尾部缺口，但某板块若缺了中间一天、之后又有新数据，
+    last_date 已无法暴露该洞。这里以最近若干交易日最常见的板块数作为覆盖基线，找出
+    低于基线的日期供抓取器重叠补拉；高于基线通常是新增分类，不会误判为缺口。
+    """
+    rows = conn.execute(
+        "SELECT trade_date, COUNT(*) AS n FROM plate_daily "
+        "WHERE plate_type = ? GROUP BY trade_date "
+        "ORDER BY trade_date DESC LIMIT ?",
+        (plate_type, max(2, int(lookback_sessions))),
+    ).fetchall()
+    if len(rows) < 2:
+        return None
+
+    frequencies: Dict[int, int] = {}
+    for row in rows:
+        count = int(row["n"] or 0)
+        frequencies[count] = frequencies.get(count, 0) + 1
+    max_frequency = max(frequencies.values())
+    # rows 按日期倒序；频次并列时采用最近日期的横截面规模。
+    expected_count = next(
+        int(row["n"] or 0)
+        for row in rows
+        if frequencies[int(row["n"] or 0)] == max_frequency
+    )
+    incomplete = [
+        str(row["trade_date"])
+        for row in rows
+        if int(row["n"] or 0) < expected_count
+    ]
+    return min(incomplete) if incomplete else None
+
+
 def table_count(conn: sqlite3.Connection, table: str) -> int:
     row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()
     return int(row["n"] if row else 0)

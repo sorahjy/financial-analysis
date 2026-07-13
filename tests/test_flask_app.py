@@ -15,6 +15,24 @@ from app.services import stock_strategy_service
 from funds import get_funds, get_funds_bond
 
 
+VALID_FUND_EDITOR_CONTENT = """\
+# 用户可以保留基金分类和候选代码注释。
+compare_index = ["510310", "510580"]
+compare_index_bond = ["161119"]
+hold_index = ["510310"]
+fund_index = ["008115"]
+fund_stock = ["040046"]
+fund = fund_index + fund_stock
+fund_bond = ["011555"]
+
+def get_funds():
+    return {'compare_index': compare_index, 'fund': fund, 'hold_index': hold_index}
+
+def get_funds_bond():
+    return {'compare_index': compare_index_bond, 'fund': fund_bond, 'hold_index': hold_index}
+"""
+
+
 class FlaskAppTest(unittest.TestCase):
     def setUp(self):
         self.client = create_app().test_client()
@@ -245,6 +263,17 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(catalog["P11"]["effective_style"], "risk")
         self.assertFalse(catalog["P6"]["effective"])
         self.assertEqual(catalog["P6"]["effective_style"], "neutral")
+        self.assertEqual(len(catalog), 26)
+        self.assertTrue(all(item["production"] for item in catalog.values()))
+        self.assertEqual(catalog["P3"]["score_usage"], "吸筹分 20%")
+        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P25"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P14"]["score_usage"], "出货分 10%")
+        self.assertEqual(catalog["P26"]["score_usage"], "出货预警")
+        self.assertEqual(catalog["P25"]["validation_status"], "experimental")
+        self.assertEqual(catalog["P1"]["validation_label"], "仅小盘有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "仅小盘有效")
+        self.assertEqual(catalog["P6"]["validation_status"], "observation")
 
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
         css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
@@ -252,11 +281,24 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('meta.effective_style === "bullish"', script)
         self.assertIn('meta.effective_style === "momentum"', script)
         self.assertIn('meta.effective_style === "risk"', script)
-        self.assertIn("fetchPatternCatalog().finally(fetchData)", script)
+        self.assertIn(
+            "Promise.all([fetchPatternCatalog(), fetchScoringModel()]).finally(fetchData)",
+            script,
+        )
         self.assertNotIn("EFFECTIVE_RISK_PATTERNS", script)
         self.assertNotIn("PAT_TIP", script)
         for css_class in (".pat.pg", ".pat.po", ".pat.pr", ".pat.pd"):
             self.assertIn(css_class, css)
+
+    def test_radar_job_polling_uses_lightweight_endpoint(self):
+        response = self.client.get("/api/radar/jobs")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(set(response.get_json()), {"run_job", "data_job"})
+
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        self.assertIn('fetch("/api/radar/jobs")', script)
+        self.assertIn("setInterval(fetchJobState, 2000)", script)
+        self.assertNotIn("setInterval(fetchData, 2000)", script)
 
     def test_radar_kline_card_shows_selected_stock_basic_info(self):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
@@ -316,13 +358,46 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('id="radar-factor-modal"', body)
         self.assertIn("机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）", body)
         self.assertIn("P3 缩量打压首次收复", body)
-        self.assertIn("P24 OBV 底背离", body)
-        self.assertIn("股东户数下降", body)
-        self.assertIn("筹码集中保留展示，但已不参与总分", body)
+        self.assertIn("P24 OBV底背离", body)
+        self.assertIn("股东户数变化", body)
+        self.assertIn("9项原始特征直接加权", body)
+        self.assertIn("P1 低位底盘确认（仅小盘有效）", body)
+        self.assertIn("P25 缩量平台启动（仅小盘有效）", body)
+        self.assertIn('id="radar-scoring-factor-count">23<', body)
+        self.assertIn("9项风险特征直接加权", body)
         self.assertIn("近90日龙虎榜", body)
-        self.assertIn("游资小盘池以三日平滑反转分为主排序", body)
+        self.assertIn("游资小盘池按三日平滑反转分排序", body)
+        self.assertIn('id="radar-pattern-factor-groups"', body)
+        self.assertIn('id="radar-auxiliary-factors"', body)
+        self.assertIn("P1–P26 全部生产形态", body)
         self.assertIn(".radar-insight-modal[hidden]", css)
         self.assertIn(".radar-factor-grid", css)
+        self.assertIn(".radar-pattern-grid", css)
+
+    def test_radar_scoring_model_endpoint_matches_production_weights(self):
+        import stock_hot_money_radar as radar
+
+        response = self.client.get("/api/radar/model")
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        accumulation = {row["key"]: row["weight"] for row in payload["accumulation"]["factors"]}
+        distribution = {row["key"]: row["weight"] for row in payload["distribution"]["factors"]}
+        reversal = {row["key"]: row["weight"] for row in payload["reversal"]["factors"]}
+        self.assertEqual(accumulation, radar.ACCUM_MODEL_WEIGHTS)
+        self.assertEqual(len(accumulation), 9)
+        self.assertEqual(distribution, radar.DIST_MODEL_WEIGHTS)
+        self.assertEqual(reversal, radar.REVERSAL_WEIGHTS)
+        self.assertEqual(len(payload["auxiliary"]), 4)
+        self.assertEqual(
+            payload["opportunity"]["distribution_penalty"],
+            radar.OPPORTUNITY_DISTRIBUTION_PENALTY,
+        )
+
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        self.assertIn('fetch("/api/radar/model")', script)
+        self.assertIn("renderScoringModel", script)
+        self.assertIn("renderProductionPatterns", script)
+        self.assertIn("radar-pattern-factor-groups", script)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -402,6 +477,18 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(command, ["bash", "stock_radar_fresh_data.sh"])
         self.assertNotIn("--strict", command)
         self.assertNotIn("--timeout", command)
+
+    def test_stock_optimizer_shares_refresh_resource_lock(self):
+        with patch(
+            "app.services.stock_strategy_service.start_command_job", return_value=True
+        ) as start_job, patch(
+            "stock_data_refresh.resolve_python", return_value=sys.executable
+        ):
+            self.assertTrue(stock_strategy_service.start_optimizer_job())
+
+        self.assertEqual(start_job.call_args.args[0], "stock-optimizer")
+        self.assertEqual(start_job.call_args.kwargs["resource_key"], "stock-data-refresh")
+        self.assertIsNotNone(start_job.call_args.kwargs["on_success"])
 
     def test_stock_refresh_requires_full_fetch_confirmation(self):
         script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
@@ -741,27 +828,177 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(payload["path"], "funds.py")
         self.assertIn("get_funds", payload["content"])
 
-    def test_fund_editor_api_saves_patched_target_file(self):
+    def test_fund_editor_api_saves_only_validated_fund_config(self):
         with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
             target = Path(tmp_dir) / "fund.py"
-            target.write_text("value = 1\n", encoding="utf-8")
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
 
-            with patch("app.routes.fund.FUND_EDITOR_FILE", target):
-                response = self.client.put("/api/fund/editor", json={"content": "value = 2\n"})
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
+                response = self.client.put(
+                    "/api/fund/editor",
+                    json={"content": VALID_FUND_EDITOR_CONTENT},
+                )
 
             self.assertEqual(response.status_code, 200)
-            self.assertEqual(target.read_text(encoding="utf-8"), "value = 2\n")
+            saved = target.read_text(encoding="utf-8")
+            self.assertEqual(saved, VALID_FUND_EDITOR_CONTENT)
+            self.assertIn("# 用户可以保留基金分类和候选代码注释。", saved)
+            self.assertNotIn("import os", saved)
+            self.assertEqual(
+                json.loads(codes_target.read_text(encoding="utf-8")),
+                ["510310", "510580", "161119", "008115", "040046", "011555"],
+            )
+
+    def test_fund_editor_api_accepts_structured_config(self):
+        config = {
+            "compare_index": ["510310"],
+            "compare_index_bond": ["161119"],
+            "hold_index": ["510310"],
+            "fund_index": ["008115"],
+            "fund_stock": ["040046"],
+            "fund_bond": ["011555"],
+        }
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
+                response = self.client.put("/api/fund/editor", json={"funds": config})
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.get_json()["funds"], config)
 
     def test_fund_editor_api_rejects_invalid_python(self):
         with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
             target = Path(tmp_dir) / "fund.py"
-            target.write_text("value = 1\n", encoding="utf-8")
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
 
-            with patch("app.routes.fund.FUND_EDITOR_FILE", target):
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
                 response = self.client.put("/api/fund/editor", json={"content": "def broken(:\n"})
 
             self.assertEqual(response.status_code, 400)
-            self.assertEqual(target.read_text(encoding="utf-8"), "value = 1\n")
+            self.assertEqual(target.read_text(encoding="utf-8"), VALID_FUND_EDITOR_CONTENT)
+
+    def test_fund_editor_api_rejects_executable_python(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
+            malicious = VALID_FUND_EDITOR_CONTENT + "\n__import__('os').system('echo unsafe')\n"
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
+                response = self.client.put("/api/fund/editor", json={"content": malicious})
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("不允许执行", response.get_json()["error"])
+            self.assertEqual(target.read_text(encoding="utf-8"), VALID_FUND_EDITOR_CONTENT)
+            self.assertFalse(codes_target.exists())
+
+    def test_fund_editor_api_rejects_tuple_that_would_break_list_concatenation(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
+            invalid = VALID_FUND_EDITOR_CONTENT.replace(
+                'fund_index = ["008115"]', 'fund_index = ("008115",)'
+            )
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
+                response = self.client.put("/api/fund/editor", json={"content": invalid})
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("必须是基金代码列表", response.get_json()["error"])
+            self.assertEqual(target.read_text(encoding="utf-8"), VALID_FUND_EDITOR_CONTENT)
+
+    def test_fund_editor_api_rejects_oversized_source(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
+            oversized = VALID_FUND_EDITOR_CONTENT + "#" + ("x" * (256 * 1024))
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target):
+                response = self.client.put("/api/fund/editor", json={"content": oversized})
+
+            self.assertEqual(response.status_code, 400)
+            self.assertIn("256 KiB", response.get_json()["error"])
+            self.assertEqual(target.read_text(encoding="utf-8"), VALID_FUND_EDITOR_CONTENT)
+
+    def test_fund_run_refuses_unvalidated_python_without_starting_job(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text("raise SystemExit('unsafe')\n", encoding="utf-8")
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target), \
+                 patch("app.routes.fund.start_command_job") as start_mock:
+                response = self.client.post("/api/fund/run")
+
+            self.assertEqual(response.status_code, 409)
+            start_mock.assert_not_called()
+            self.assertFalse(codes_target.exists())
+
+    def test_fund_report_generate_refuses_unvalidated_python(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            target.write_text("raise SystemExit('unsafe')\n", encoding="utf-8")
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.start_command_job") as start_mock:
+                response = self.client.post("/api/fund/report/generate")
+
+            self.assertEqual(response.status_code, 409)
+            start_mock.assert_not_called()
+
+    def test_fund_run_syncs_codes_from_validated_config_before_start(self):
+        with tempfile.TemporaryDirectory(dir=ROOT_DIR) as tmp_dir:
+            target = Path(tmp_dir) / "fund.py"
+            codes_target = Path(tmp_dir) / "fund_codes.json"
+            target.write_text(VALID_FUND_EDITOR_CONTENT, encoding="utf-8")
+
+            with patch("app.routes.fund.FUND_EDITOR_FILE", target), \
+                 patch("app.routes.fund.FUND_CODES_FILE", codes_target), \
+                 patch("app.routes.fund.start_command_job", return_value=True) as start_mock:
+                response = self.client.post("/api/fund/run")
+
+            self.assertEqual(response.status_code, 202)
+            start_mock.assert_called_once_with(
+                "fund-refresh",
+                ["bash", "fund_run.sh"],
+                cwd=ROOT_DIR,
+                timeout=1800,
+                resource_key="fund-data-refresh",
+            )
+            self.assertEqual(
+                json.loads(codes_target.read_text(encoding="utf-8")),
+                ["510310", "510580", "161119", "008115", "040046", "011555"],
+            )
+
+    def test_fund_run_script_does_not_execute_funds_module(self):
+        script = (ROOT_DIR / "fund_run.sh").read_text(encoding="utf-8")
+
+        self.assertNotRegex(script, r"(?m)^\s*python\s+funds\.py\s*$")
+        self.assertIn("_load_validated_fund_config", script)
+        self.assertIn("_sync_fund_codes", script)
+
+    def test_fund_editor_refuses_save_while_fund_resource_is_running(self):
+        with patch("app.routes.fund.is_resource_running", return_value=True):
+            response = self.client.put(
+                "/api/fund/editor", json={"content": VALID_FUND_EDITOR_CONTENT}
+            )
+
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("运行中", response.get_json()["error"])
 
     def test_command_job_captures_recent_logs(self):
         job_id = f"test-log-{time.time_ns()}"

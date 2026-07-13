@@ -22,7 +22,7 @@ import math
 
 import numpy as np
 import threading
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from functools import lru_cache
@@ -44,7 +44,7 @@ OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_
 SMALLCAP_OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_smallcap_optimized_config.json"
 SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_smallcap_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
-LIVE_CANDIDATE_CACHE_VERSION = 3
+LIVE_CANDIDATE_CACHE_VERSION = 4
 SHORT_UNIVERSE_VERSION = "hotmoney_small_cap_v1"
 SMALLCAP_UNIVERSE_VERSION = SHORT_UNIVERSE_VERSION
 LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
@@ -268,40 +268,60 @@ def safe_float(value: Any) -> Optional[float]:
 
 
 _PRICE_NUM_FIELDS = ("close", "open", "high", "low", "turnover_rate", "amount", "volume", "change_pct")
-_pretransformed_row_ids: set = set()
+_PRICE_ROW_CACHE_MAXSIZE = 2048
+_price_row_cache_lock = threading.RLock()
+# Lists cannot be weak-referenced.  Keep the object itself beside its id so an
+# id reused by CPython can never hit an entry that belongs to a released list.
+# Both caches are bounded LRU maps because retaining the row object also keeps
+# its full history alive.
+_pretransformed_rows: "OrderedDict[int, List[Dict[str, Any]]]" = OrderedDict()
+_price_arr_cache: "OrderedDict[int, Tuple[List[Dict[str, Any]], Dict[str, Any]]]" = OrderedDict()
 
 
-def pretransform_price_rows(rows: List[Dict[str, Any]]) -> None:
-    """全历史日线行的数值字段原地转 float/None 一次（幂等，按 id 缓存避免重复转换）。
+def _bounded_row_cache_put(cache: OrderedDict, key: int, value: Any) -> None:
+    cache[key] = value
+    cache.move_to_end(key)
+    while len(cache) > _PRICE_ROW_CACHE_MAXSIZE:
+        cache.popitem(last=False)
+
+
+def _clear_price_row_caches() -> None:
+    with _price_row_cache_lock:
+        _pretransformed_rows.clear()
+        _price_arr_cache.clear()
+
+
+def pretransform_price_rows(
+    rows: List[Dict[str, Any]], *, cache: bool = False
+) -> None:
+    """全历史日线行的数值字段原地转 float/None 一次。
 
     因子计算里 `safe_float(row.get("close"))` 这类列表推导被调上亿次（profile 头号热点），
     且每个回测折(fold)对同一份全历史重复转换。rows 来自 cn_index/stock history 等长存活模块缓存、
-    跨 fold/trial 复用同一批 row 对象，故只需预转一次，之后下游 safe_float 全走 float fast-path。"""
+    跨 fold/trial 复用同一批 row 对象，故只需预转一次，之后下游 safe_float 全走 float fast-path。
+    ``cache=True`` 只用于模块内部从版本化数据快照加载、之后不再原地修改的列表。
+    默认不缓存，因此通用调用者追加/修改行后再次调用仍会重新转换。缓存同时校验
+    对象身份，不能只信任会被解释器复用的 ``id(rows)``。"""
     if not rows:
         return
     rid = id(rows)
-    if rid in _pretransformed_row_ids:
-        return
+    if cache:
+        with _price_row_cache_lock:
+            cached_rows = _pretransformed_rows.get(rid)
+            if cached_rows is rows:
+                _pretransformed_rows.move_to_end(rid)
+                return
     for r in rows:
         for k in _PRICE_NUM_FIELDS:
             v = r.get(k)
             if v is not None and type(v) is not float:
                 r[k] = safe_float(v)
-    _pretransformed_row_ids.add(rid)
+    if cache:
+        with _price_row_cache_lock:
+            _bounded_row_cache_put(_pretransformed_rows, rid, rows)
 
 
-_price_arr_cache: Dict[int, Dict[str, Any]] = {}
-
-
-def price_arrays(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """全历史 close/turnover_rate 的 numpy 数组(脏值→nan)，按 id 缓存一次。
-
-    供因子计算向量化(numpy 运算释放 GIL，解锁 optuna n_jobs 多线程)+各 fold 切前缀复用，
-    替代每 fold 对全历史逐行 safe_float(profile 头号热点)。"""
-    rid = id(rows)
-    cached = _price_arr_cache.get(rid)
-    if cached is not None:
-        return cached
+def _build_price_arrays(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     n = len(rows)
     close = np.empty(n, dtype=np.float64)
     turn = np.empty(n, dtype=np.float64)
@@ -312,9 +332,29 @@ def price_arrays(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         t = first_not_none(r.get("turnover_rate"), r.get("daily_turnover_rate"))
         tv = t if type(t) is float else safe_float(t)
         turn[i] = np.nan if tv is None else tv
-    cached = {"close": close, "turnover_rate": turn}
-    _price_arr_cache[rid] = cached
-    return cached
+    return {"close": close, "turnover_rate": turn}
+
+
+def price_arrays(
+    rows: List[Dict[str, Any]], *, cache: bool = False
+) -> Dict[str, Any]:
+    """全历史 close/turnover_rate 的 numpy 数组(脏值→nan)，按对象身份缓存一次。
+
+    供因子计算向量化(numpy 运算释放 GIL，解锁 optuna n_jobs 多线程)+各 fold 切前缀复用，
+    替代每 fold 对全历史逐行 safe_float(profile 头号热点)。通用调用默认不缓存，确保
+    同一列表原地变化后不会返回旧数组；模块内部只对不可变的数据快照显式启用缓存。"""
+    rid = id(rows)
+    if cache:
+        with _price_row_cache_lock:
+            entry = _price_arr_cache.get(rid)
+            if entry is not None and entry[0] is rows:
+                _price_arr_cache.move_to_end(rid)
+                return entry[1]
+    arrays = _build_price_arrays(rows)
+    if cache:
+        with _price_row_cache_lock:
+            _bounded_row_cache_put(_price_arr_cache, rid, (rows, arrays))
+    return arrays
 
 
 def first_not_none(*values: Any) -> Optional[float]:
@@ -398,6 +438,7 @@ def invalidate_dir_fingerprints() -> None:
             cached.cache_clear()
         except NameError:
             pass
+    _clear_price_row_caches()
 
 
 def load_json_optional(path: Path, default: Any) -> Any:
@@ -424,6 +465,33 @@ def load_smallcap_optimized_config_payload() -> Tuple[Dict[str, Any], Optional[P
         if isinstance(payload, dict) and payload.get("config"):
             return payload, path
     return {}, None
+
+
+def normalize_loaded_short_horizon(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize new optimized horizons and discard unrecoverable legacy ranges.
+
+    Older optimizer files saved independently searched min/max labels but
+    dropped the horizon used by the objective.  There is no honest way to
+    reconstruct that selected value, so legacy labels fall back to the public
+    1-5 day strategy default. New files carry ``hold_days`` and are forced to
+    the same value in all three fields.
+    """
+    normalized = copy.deepcopy(config)
+    selected_num = safe_float(normalized.get("hold_days"))
+    selected = (
+        int(selected_num)
+        if selected_num is not None and selected_num.is_integer()
+        else None
+    )
+    if selected is not None and 1 <= selected <= 5:
+        normalized["hold_days"] = selected
+        normalized["hold_days_min"] = selected
+        normalized["hold_days_max"] = selected
+    else:
+        normalized.pop("hold_days", None)
+        normalized.pop("hold_days_min", None)
+        normalized.pop("hold_days_max", None)
+    return normalized
 
 
 def deep_merge(base: Dict[str, Any], override: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -508,63 +576,82 @@ def clear_live_candidate_cache() -> None:
 # ---------------------------------------------------------------------------
 
 
+def _dated_financial_records(
+        records: List[Dict[str, Any]],
+) -> List[Tuple[datetime, Dict[str, Any]]]:
+    """Parse and order report periods without relying on input order/string prefixes."""
+    dated: List[Tuple[datetime, Dict[str, Any]]] = []
+    seen = set()
+    for row in records or []:
+        period = parse_date(row.get("date"))
+        if period is None or period in seen:
+            continue
+        seen.add(period)
+        dated.append((period, row))
+    dated.sort(key=lambda item: item[0], reverse=True)
+    return dated
+
+
+def _previous_year_period(period: datetime) -> Optional[datetime]:
+    try:
+        return period.replace(year=period.year - 1)
+    except ValueError:
+        # Financial periods are normally quarter ends; keep leap-day input
+        # deterministic rather than silently comparing it with an annual row.
+        if period.month == 2 and period.day == 29:
+            return period.replace(year=period.year - 1, day=28)
+        return None
+
+
+def _ttm_value_at(
+        dated: List[Tuple[datetime, Dict[str, Any]]],
+        field: str,
+        period: datetime,
+        *,
+        fallback_incomplete: bool,
+) -> Optional[float]:
+    by_period = {row_period: row for row_period, row in dated}
+    current = safe_float((by_period.get(period) or {}).get(field))
+    if current is None:
+        return None
+    if (period.month, period.day) == (12, 31):
+        return current
+
+    previous_same = _previous_year_period(period)
+    previous_fy = datetime(period.year - 1, 12, 31)
+    same_value = safe_float((by_period.get(previous_same) or {}).get(field)) if previous_same else None
+    fy_value = safe_float((by_period.get(previous_fy) or {}).get(field))
+    if same_value is not None and fy_value is not None:
+        return current + fy_value - same_value
+    return current if fallback_incomplete else None
+
+
 def compute_ttm(records: List[Dict[str, Any]], field: str) -> Optional[float]:
     if not records:
         return None
-    latest = records[0]
-    latest_val = safe_float(latest.get(field))
-    if latest_val is None:
-        return None
-    date = latest.get("date", "")
-    if len(date) < 7:
-        return latest_val
-    month = date[5:7]
-    if month == "12":
-        return latest_val
-
-    try:
-        latest_year = int(date[:4])
-    except ValueError:
-        return latest_val
-
-    prev_fy = None
-    prev_same = None
-    for row in records[1:]:
-        row_date = row.get("date", "")
-        if len(row_date) < 7:
-            continue
-        value = safe_float(row.get(field))
-        if value is None:
-            continue
-        try:
-            year = int(row_date[:4])
-        except ValueError:
-            continue
-        if year == latest_year - 1:
-            if row_date[5:7] == "12":
-                prev_fy = value
-            if row_date[5:7] == month:
-                prev_same = value
-    if prev_fy is not None and prev_same is not None:
-        return latest_val + prev_fy - prev_same
-    return latest_val
+    dated = _dated_financial_records(records)
+    if not dated:
+        # Preserve the legacy fallback for non-standard source rows that have
+        # no parseable report period at all.
+        return safe_float(records[0].get(field))
+    return _ttm_value_at(dated, field, dated[0][0], fallback_incomplete=True)
 
 
 def compute_yoy_growth(records: List[Dict[str, Any]], field: str) -> Optional[float]:
-    now = compute_ttm(records, field)
-    if now is None or not records:
+    dated = _dated_financial_records(records)
+    if not dated:
         return None
-    latest_date = records[0].get("date", "")
-    if len(latest_date) < 7:
+    latest_period = dated[0][0]
+    previous_period = _previous_year_period(latest_period)
+    if previous_period is None or not any(period == previous_period for period, _ in dated):
         return None
-    try:
-        latest_year = int(latest_date[:4])
-    except ValueError:
-        return None
-    target_prefix = f"{latest_year - 1}-{latest_date[5:7]}"
-    sub_records = [row for row in records if str(row.get("date", "")) <= target_prefix]
-    prev = compute_ttm(sub_records, field)
+    # Growth must compare complete like-for-like TTM periods. Falling back to
+    # a cumulative YTD value would quietly turn this into a different metric.
+    now = _ttm_value_at(dated, field, latest_period, fallback_incomplete=False)
+    prev = _ttm_value_at(dated, field, previous_period, fallback_incomplete=False)
     if prev is None or abs(prev) < 1e-9:
+        return None
+    if now is None:
         return None
     return (now - prev) / abs(prev)
 
@@ -845,9 +932,15 @@ def latest_value(records: List[Dict[str, Any]], field: str) -> Optional[float]:
 
 
 def yoy_from_latest_and_annual(records: List[Dict[str, Any]], field: str) -> Optional[float]:
-    latest = latest_value(records, field)
-    annual = annual_values(records, field, limit=2)
-    base = annual[1] if len(annual) > 1 else (annual[0] if annual else None)
+    """Point-in-time YoY for balance-sheet fields, matched to the same period."""
+    dated = _dated_financial_records(records)
+    if not dated:
+        return None
+    latest_period, latest_row = dated[0]
+    previous_period = _previous_year_period(latest_period)
+    by_period = {period: row for period, row in dated}
+    latest = safe_float(latest_row.get(field))
+    base = safe_float((by_period.get(previous_period) or {}).get(field)) if previous_period else None
     if latest is None or base is None or abs(base) < 1e-9:
         return None
     return (latest - base) / abs(base)
@@ -1553,8 +1646,11 @@ def build_long_candidates(
 
         cn_records = (cn_index.get(code) or {}).get("records", [])
         base_price_rows = cn_records or stock_history_records(stock)
-        pretransform_price_rows(base_price_rows)   # 全历史数值字段预转 float 一次，下游 safe_float 走 fast-path
+        # load_* caches return a versioned snapshot that stays immutable until
+        # invalidate_dir_fingerprints(); only this internal path enables LRU reuse.
+        pretransform_price_rows(base_price_rows, cache=True)
         hist_rows = price_rows_asof(base_price_rows, as_of)
+        price_arr = price_arrays(base_price_rows, cache=True)
 
         if as_of is None:
             market_cap_cny = estimate_market_cap_cny(stock, snap)
@@ -1572,7 +1668,7 @@ def build_long_candidates(
         if min_cap_yi and (market_cap_yi is None or market_cap_yi < min_cap_yi):
             continue
 
-        high_drawdown_pct = _drawdown_np(price_arrays(base_price_rows)["close"], len(hist_rows))
+        high_drawdown_pct = _drawdown_np(price_arr["close"], len(hist_rows))
         if require_high_drawdown:
             if high_drawdown_pct is None or high_drawdown_pct < min_high_drawdown_pct:
                 continue
@@ -1582,7 +1678,7 @@ def build_long_candidates(
             high_drawdown_pct, as_of=as_of, hist_rows=hist_rows,
             capital_signal=capital_signals.get(code),
             capital_available=capital_availability,
-            price_arr=price_arrays(base_price_rows), asof_len=len(hist_rows),
+            price_arr=price_arr, asof_len=len(hist_rows),
         )
 
         legacy_industry = (
@@ -2062,6 +2158,9 @@ def build_short_candidates(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any]]
             "name": name,
             "strategy": "short",
             "horizon": f"{config.get('hold_days_min', 1)}-{config.get('hold_days_max', 5)} days",
+            # The optimizer must not infer this from the truncated display
+            # sample below. It is computed from the complete signal payload.
+            "event_date": short_signal_event_date(data),
             "industry": industry,
             "sw2_industry": sw2_industry,
             "sw3_industry": sw3_industry,
@@ -2222,6 +2321,26 @@ def latest_follower_date(followers: List[Dict[str, Any]]) -> Optional[datetime]:
     if not dates:
         return None
     return max(dates)
+
+
+def short_signal_event_date(data: Dict[str, Any]) -> Optional[str]:
+    """Latest date whose information contributes to a short candidate.
+
+    Followers drive most event factors, while technical fields are calculated
+    at the signal/kline snapshot date. Taking the maximum of both prevents a
+    backtest from entering before every factor in the candidate was knowable.
+    """
+    pick = data.get("pick") or {}
+    capital = data.get("capital") or data.get("scored") or pick or {}
+    followers = normalize_followers(capital.get("followers") or pick.get("followers") or [])
+    dates = [parse_date(follower.get("date")) for follower in followers]
+    dates.extend(parse_date(value) for value in (
+        capital.get("kline_as_of_date"),
+        capital.get("as_of_date"),
+        data.get("as_of_date"),
+    ))
+    valid_dates = [date for date in dates if date is not None]
+    return max(valid_dates).strftime("%Y-%m-%d") if valid_dates else None
 
 
 def lhb_reason_features(reasons: List[str]) -> Tuple[float, int]:
@@ -2405,10 +2524,21 @@ def short_warnings(data: Dict[str, Any], raw: Dict[str, Any]) -> List[str]:
 
 
 def follower_sample(data: Dict[str, Any], limit: int = 6) -> List[Dict[str, Any]]:
-    capital = data.get("capital") or data.get("scored") or {}
-    followers = normalize_followers(capital.get("followers") or [])
+    pick = data.get("pick") or {}
+    capital = data.get("capital") or data.get("scored") or pick or {}
+    followers = normalize_followers(capital.get("followers") or pick.get("followers") or [])
+
+    def sample_order(follower: Dict[str, Any]) -> Tuple[int, str, str, float]:
+        date = parse_date(follower.get("date"))
+        return (
+            -(date.toordinal() if date else 0),
+            str(follower.get("seat") or ""),
+            str(follower.get("category") or ""),
+            -(safe_float(follower.get("buy_est")) or 0.0),
+        )
+
     out = []
-    for follower in followers[:limit]:
+    for follower in sorted(followers, key=sample_order)[:max(0, limit)]:
         out.append({
             "seat": follower.get("seat"),
             "date": follower.get("date"),
@@ -2770,6 +2900,10 @@ def get_default_config() -> Dict[str, Any]:
     optimized, optimized_source = load_optimized_config_payload()
     if optimized.get("config"):
         optimized_config = copy.deepcopy(optimized["config"])
+        if isinstance(optimized_config.get("short"), dict):
+            optimized_config["short"] = normalize_loaded_short_horizon(
+                optimized_config["short"]
+            )
         # 小盘权重只允许从独立文件加载，避免与长/短配置互相覆盖。
         optimized_config.pop("smallcap", None)
         # 旧优化结果基于“席位共振 JSON 候选池”，不能跨池沿用短线硬过滤与权重；
@@ -2840,6 +2974,7 @@ def strip_internal(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "name": item.get("name"),
             "strategy": item.get("strategy"),
             "horizon": item.get("horizon"),
+            "event_date": item.get("event_date"),
             "industry": item.get("industry"),
             "sw2_industry": item.get("sw2_industry"),
             "sw3_industry": item.get("sw3_industry"),

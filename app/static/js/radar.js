@@ -74,6 +74,7 @@
     let radarRunBusy = false;
     let realtimeRefreshPending = false;
     let realtimeRefreshQueued = false;
+    let jobsWereRunning = false;
     let activeJobType = "";                                  // "run" | "data"，用于日志面板归属
     let sortState = { key: "opportunity_score", dir: "desc" }; // 默认按机会分：吸筹/出货百分位折扣
     let patternMap = {};                                    // code -> {name,category,signal,desc,effective}
@@ -139,12 +140,95 @@
       return out;
     }
 
+    function renderProductionPatterns(patterns) {
+      const target = $("radar-pattern-factor-groups");
+      if (!target) return;
+      const rows = Array.isArray(patterns) ? patterns.filter((pattern) => pattern && pattern.production !== false) : [];
+      const phaseOrder = ["吸筹", "试盘", "洗盘", "突破", "拉升", "出货"];
+      const signalLabels = { buy: "偏多结构", hold: "阶段观察", sell: "风险结构" };
+      const statusClasses = { core: "core", experimental: "experimental", observation: "observation" };
+      target.innerHTML = phaseOrder.map((phase) => {
+        const phaseRows = rows.filter((pattern) => pattern.category === phase);
+        if (!phaseRows.length) return "";
+        const cards = phaseRows.map((pattern) => {
+          const statusClass = statusClasses[pattern.validation_status] || "observation";
+          const usageClass = String(pattern.score_usage || "").includes("吸筹分") ? "score-buy"
+            : (String(pattern.score_usage || "").includes("出货分") || pattern.score_usage === "出货预警") ? "score-risk" : "score-label";
+          return `<article class="radar-pattern-card"><div class="radar-pattern-card-head"><b>${esc(pattern.code)}</b><h5>${esc(pattern.name)}</h5><span class="radar-pattern-status ${statusClass}">${esc(pattern.validation_label || "形态观察")}</span></div><div class="radar-pattern-meta"><span class="${usageClass}">${esc(pattern.score_usage || "阶段标签")}</span><span>${esc(signalLabels[pattern.signal] || "结构观察")}</span></div><p>${esc(pattern.desc || "暂无说明")}</p></article>`;
+        }).join("");
+        return `<section class="radar-pattern-group"><div class="radar-pattern-group-title"><h4>${esc(phase)}</h4><span>${phaseRows.length}项</span></div><div class="radar-pattern-grid">${cards}</div></section>`;
+      }).join("");
+      if (!target.innerHTML) target.innerHTML = '<div class="radar-factor-loading">生产形态说明暂不可用。</div>';
+      if ($("radar-pattern-factor-count")) $("radar-pattern-factor-count").textContent = String(rows.length);
+      if ($("radar-effective-pattern-count")) $("radar-effective-pattern-count").textContent = String(rows.filter((pattern) => pattern.effective).length);
+    }
+
     async function fetchPatternCatalog() {
       try {
         const resp = await fetch("/api/radar/patterns");
         const data = await resp.json();
-        (data.patterns || []).forEach((p) => { patternMap[p.code] = p; });
-      } catch (err) { /* 解释模块降级为只显示编号 */ }
+        const patterns = data.patterns || [];
+        patterns.forEach((p) => { patternMap[p.code] = p; });
+        renderProductionPatterns(patterns);
+      } catch (err) {
+        if ($("radar-pattern-factor-groups")) $("radar-pattern-factor-groups").innerHTML = '<div class="radar-factor-loading">生产形态说明暂不可用，请刷新页面后重试。</div>';
+      }
+    }
+
+    function renderScoringModel(model) {
+      if (!model) return;
+      const opportunity = model.opportunity || {};
+      if ($("radar-opportunity-formula")) $("radar-opportunity-formula").textContent = opportunity.display_formula || opportunity.formula || "";
+      if ($("radar-opportunity-description")) $("radar-opportunity-description").textContent = opportunity.description || "";
+      const example = opportunity.example || {};
+      const penalty = Number(opportunity.distribution_penalty || 0);
+      const acc = Number(example.accumulation_percentile || 0);
+      const dist = Number(example.distribution_percentile || 0);
+      const keep = 1 - penalty * dist / 100;
+      if ($("radar-score-example")) {
+        $("radar-score-example").innerHTML = `<div><small>吸筹百分位</small><strong>${fmt(acc, 0)}</strong></div><span>×</span><div><small>风险保留系数</small><strong>${fmt(keep, 2)}</strong></div><span>=</span><div class="result"><small>机会分</small><strong>${fmt(example.opportunity_score, 0)}</strong></div>`;
+      }
+      const sorting = model.sorting || {};
+      if ($("radar-opportunity-sorting")) {
+        $("radar-opportunity-sorting").textContent = `机会分表达的是候选池内的相对位置，不是上涨概率。${sorting.leader || ""}；${sorting.hotmoney || ""}。`;
+      }
+
+      const weightHtml = (section) => ((section || {}).factors || []).map((factor) =>
+        `<p><b>${esc(factor.weight_pct)}%</b><span>${esc(factor.label)}</span></p>`
+      ).join("");
+      if ($("radar-accumulation-weights")) $("radar-accumulation-weights").innerHTML = weightHtml(model.accumulation);
+      if ($("radar-distribution-weights")) $("radar-distribution-weights").innerHTML = weightHtml(model.distribution);
+
+      const factorHtml = (section) => ((section || {}).factors || []).map((factor) =>
+        `<article><b>${esc(factor.key)}</b><h4>${esc(factor.label)} · ${esc(factor.weight_pct)}%</h4><p>${esc(factor.description)}</p></article>`
+      ).join("");
+      if ($("radar-accumulation-factors")) $("radar-accumulation-factors").innerHTML = factorHtml(model.accumulation);
+      if ($("radar-distribution-factors")) $("radar-distribution-factors").innerHTML = factorHtml(model.distribution);
+      if ($("radar-reversal-factors")) {
+        $("radar-reversal-factors").innerHTML = ((model.reversal || {}).factors || []).map((factor) =>
+          `<div><b>${esc(factor.weight_pct)}%</b><span>${esc(factor.label)}</span><small>${esc(factor.description)}</small></div>`
+        ).join("");
+      }
+      const scoringCount = [model.accumulation, model.distribution, model.reversal]
+        .reduce((total, section) => total + (((section || {}).factors || []).length), 0);
+      if ($("radar-scoring-factor-count")) $("radar-scoring-factor-count").textContent = String(scoringCount);
+      if ($("radar-auxiliary-factors")) {
+        $("radar-auxiliary-factors").innerHTML = (model.auxiliary || []).map((factor) =>
+          `<article><b>${esc(factor.key)}</b><h4>${esc(factor.label)}</h4><p>${esc(factor.description)}</p><span>不重复计分</span></article>`
+        ).join("");
+      }
+    }
+
+    async function fetchScoringModel() {
+      try {
+        const resp = await fetch("/api/radar/model");
+        if (!resp.ok) throw new Error("模型说明读取失败");
+        renderScoringModel(await resp.json());
+      } catch (err) {
+        if ($("radar-accumulation-factors")) $("radar-accumulation-factors").innerHTML = "<article><h4>模型说明暂不可用</h4><p>请刷新页面后重试。</p></article>";
+        if ($("radar-distribution-factors")) $("radar-distribution-factors").innerHTML = "<article><h4>模型说明暂不可用</h4><p>请刷新页面后重试。</p></article>";
+        if ($("radar-auxiliary-factors")) $("radar-auxiliary-factors").innerHTML = "<article><h4>辅助判断说明暂不可用</h4><p>请刷新页面后重试。</p></article>";
+      }
     }
 
     function stockSw2Name(s) {
@@ -306,6 +390,19 @@
         return data;
       } catch (err) {
         $("radar-status").textContent = "数据读取失败";
+        return null;
+      }
+    }
+
+    async function fetchJobState() {
+      try {
+        const resp = await fetch("/api/radar/jobs");
+        const data = await resp.json();
+        if (disposed) return null;
+        reflectJobs(data.run_job, data.data_job);
+        return data;
+      } catch (err) {
+        $("radar-status").textContent = "任务状态读取失败";
         return null;
       }
     }
@@ -1056,13 +1153,16 @@
 
     function reflectJobs(runJob, dataJob) {
       const wasRadarRunBusy = radarRunBusy;
+      const wasRunning = jobsWereRunning;
       radarRunBusy = Boolean(runJob && runJob.running);
       const running = (runJob && runJob.running) || (dataJob && dataJob.running);
+      jobsWereRunning = Boolean(running);
       setBusy(running);
       if (dataJob && (dataJob.running || activeJobType === "data")) showJobLog(dataJob, "数据刷新");
       else if (runJob && (runJob.running || activeJobType === "run")) showJobLog(runJob, "运行");
-      if (running && !pollTimer) pollTimer = setInterval(fetchData, 2000);
+      if (running && !pollTimer) pollTimer = setInterval(fetchJobState, 2000);
       if (!running && pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+      if (wasRunning && !running) fetchData();
       if (wasRadarRunBusy && !radarRunBusy && realtimeRefreshPending) {
         realtimeRefreshPending = false;
         fetchRealtimeData(true);
@@ -1089,12 +1189,13 @@
         if (resp.status === 409) {
           const d = await resp.json();
           $("radar-status").textContent = d.error || "任务已在运行";
+        } else if (resp.ok) {
+          jobsWereRunning = true;
         }
       } catch (err) {
         $("radar-status").textContent = label + "启动失败";
       }
-      await fetchData();
-      if (!pollTimer) pollTimer = setInterval(fetchData, 2000);
+      await fetchJobState();
     }
 
     // ---------- 绑定 ----------
@@ -1162,7 +1263,7 @@
       window.addEventListener("resize", onResize);
       document.addEventListener("click", onDocumentClick);
       document.addEventListener("keydown", onDocumentKeyDown);
-      fetchPatternCatalog().finally(fetchData);
+      Promise.all([fetchPatternCatalog(), fetchScoringModel()]).finally(fetchData);
     }
 
     function onResize() { if (!disposed) drawKline(); }

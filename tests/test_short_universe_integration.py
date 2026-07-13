@@ -77,6 +77,8 @@ class ShortUniverseIntegrationTest(unittest.TestCase):
 
         self.assertEqual({item["code"] for item in candidates}, radar_codes)
         self.assertTrue(any("1/2" in note for note in notes))
+        signal_candidate = next(item for item in candidates if item["code"] == "000001")
+        self.assertEqual(signal_candidate["event_date"], "2026-07-10")
         missing_signal = next(item for item in candidates if item["code"] == "000002")
         self.assertEqual(missing_signal["sources"], ["hotmoney_universe"])
 

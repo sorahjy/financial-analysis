@@ -4,11 +4,11 @@ import sys
 import os
 import io
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 import sqlite3
 
 from fund_generate_output import esc, parse_percent
-from fund_technical_analysis import analyze_fund, calc_percentile
+from fund_technical_analysis import analyze_fund, calc_adx, calc_percentile
 from fund_storage import (
     connect as connect_fund_db,
     load_nav_entry,
@@ -73,6 +73,13 @@ class TechnicalAnalysisTest(unittest.TestCase):
 
         self.assertIsNotNone(result)
         self.assertEqual(result["nav_percentile"], 50.0)
+
+    def test_calc_adx_recovers_after_flat_zero_atr_period(self):
+        adx = calc_adx([1.0] * 40 + [1.1], period=14)
+
+        self.assertEqual(len(adx), 41)
+        self.assertEqual(adx[27], 0.0)
+        self.assertAlmostEqual(adx[-1], 100 / 14, places=8)
 
 
 class StockBenchmarkEtfTest(unittest.TestCase):
@@ -403,7 +410,7 @@ class FundSQLiteStorageTest(unittest.TestCase):
         self.assertEqual([row["date"] for row in entry["records"]], ["2026-01-01", "2026-01-02"])
         self.assertEqual(entry["records"][1]["nav_acc"], "1.2")
 
-    def test_realtime_estimates_replace_previous_snapshot(self):
+    def test_realtime_estimates_merge_partial_snapshot_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
             try:
@@ -419,10 +426,38 @@ class FundSQLiteStorageTest(unittest.TestCase):
             finally:
                 conn.close()
 
-        self.assertEqual(list(estimates.keys()), ["000002"])
+        self.assertEqual(list(estimates.keys()), ["000001", "000002"])
+        self.assertEqual(estimates["000001"]["gsz"], "1.1")
         self.assertEqual(estimates["000002"]["gsz"], "2.2")
 
-    def test_profile_snapshot_save_replaces_absent_rows(self):
+    def test_empty_realtime_fields_do_not_erase_previous_snapshot(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_realtime_estimates(conn, {
+                    "000001": {
+                        "gsz": "1.1", "gszzl": "1.0",
+                        "gztime": "2026-01-01 15:00", "dwjz": "1.0",
+                    },
+                })
+                save_realtime_estimates(conn, {
+                    "000001": {"gsz": "", "gszzl": "", "gztime": "", "dwjz": ""},
+                })
+                with self.assertRaisesRegex(ValueError, "数据不完整"):
+                    save_realtime_estimates(
+                        conn,
+                        {"000001": {"gsz": "", "dwjz": ""}},
+                        replace=True,
+                        expected_codes=["000001"],
+                    )
+                estimates = load_realtime_estimates(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(estimates["000001"]["gsz"], "1.1")
+        self.assertEqual(estimates["000001"]["gztime"], "2026-01-01 15:00")
+
+    def test_profile_snapshot_save_merges_partial_snapshot_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
             db_file = Path(tmp) / "fund.sqlite3"
 
@@ -440,8 +475,200 @@ class FundSQLiteStorageTest(unittest.TestCase):
             finally:
                 conn.close()
 
-        self.assertEqual(list(profiles.keys()), ["000002"])
+        self.assertEqual(list(profiles.keys()), ["000001", "000002"])
+        self.assertEqual(profiles["000001"]["name"], "基金A")
         self.assertEqual(profiles["000002"]["name"], "基金B2")
+
+    def test_profile_snapshot_preserves_fields_from_failed_subrequests(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_profile_snapshots(conn, [{
+                    "fundCode": "000001",
+                    "name": "基金A",
+                    "managerTrigger": "任职以来 20%",
+                    "fund_manager_total_asset": "100亿元",
+                    "details": {"five_year_growth": "50%", "rank": "1/10"},
+                }])
+                save_profile_snapshots(
+                    conn,
+                    [{
+                        "fundCode": "000001",
+                        "name": "基金A新名称",
+                        "managerTrigger": "",
+                        "fund_manager_total_asset": None,
+                        "details": {"five_year_growth": ""},
+                    }],
+                    replace=True,
+                    expected_codes=["000001"],
+                )
+                profile = load_profile_snapshots(conn)["000001"]
+            finally:
+                conn.close()
+
+        self.assertEqual(profile["name"], "基金A新名称")
+        self.assertEqual(profile["managerTrigger"], "任职以来 20%")
+        self.assertEqual(profile["fund_manager_total_asset"], "100亿元")
+        self.assertEqual(
+            profile["details"], {"five_year_growth": "50%", "rank": "1/10"}
+        )
+
+    def test_full_snapshot_replace_requires_complete_expected_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_profile_snapshots(conn, [
+                    {"fundCode": "000001", "name": "基金A"},
+                    {"fundCode": "000002", "name": "基金B"},
+                ])
+
+                with self.assertRaisesRegex(ValueError, "数据不完整"):
+                    save_profile_snapshots(
+                        conn,
+                        [{"fundCode": "000002", "name": "基金B2"}],
+                        replace=True,
+                        expected_codes=["000001", "000002"],
+                    )
+                profiles = load_profile_snapshots(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(list(profiles.keys()), ["000001", "000002"])
+        self.assertEqual(profiles["000002"]["name"], "基金B")
+
+    def test_validated_full_snapshot_can_replace_removed_codes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
+            try:
+                save_realtime_estimates(conn, {
+                    "000001": {"gsz": "1.1"},
+                    "000002": {"gsz": "2.1"},
+                })
+                save_realtime_estimates(
+                    conn,
+                    {"000002": {"gsz": "2.2"}},
+                    replace=True,
+                    expected_codes=["000002"],
+                )
+                estimates = load_realtime_estimates(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(list(estimates), ["000002"])
+        self.assertEqual(estimates["000002"]["gsz"], "2.2")
+
+    def test_partial_realtime_fetch_preserves_failed_fund_snapshot(self):
+        import fund_fetch_data
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "fund.sqlite3"
+            conn = connect_fund_db(db_file)
+            try:
+                save_realtime_estimates(conn, {
+                    "000001": {"gsz": "1.1", "gztime": "old"},
+                    "000002": {"gsz": "2.1", "gztime": "old"},
+                })
+            finally:
+                conn.close()
+
+            with patch.object(
+                fund_fetch_data,
+                "fetch_estimate",
+                side_effect=[None, {"gsz": "2.2", "gszzl": "1.0", "gztime": "new", "dwjz": "2.0"}],
+            ), patch.object(
+                fund_fetch_data,
+                "connect_fund_db",
+                side_effect=lambda: connect_fund_db(db_file),
+            ), patch.object(fund_fetch_data.time, "sleep"):
+                fund_fetch_data.fetch_realtime_estimates(["000001", "000002"])
+
+            conn = connect_fund_db(db_file)
+            try:
+                estimates = load_realtime_estimates(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(estimates["000001"]["gsz"], "1.1")
+        self.assertEqual(estimates["000001"]["gztime"], "old")
+        self.assertEqual(estimates["000002"]["gsz"], "2.2")
+        self.assertEqual(estimates["000002"]["gztime"], "new")
+
+    def test_structurally_empty_realtime_fetch_is_not_counted_as_success(self):
+        import fund_fetch_data
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_file = Path(tmp) / "fund.sqlite3"
+            conn = connect_fund_db(db_file)
+            try:
+                save_realtime_estimates(conn, {
+                    "000001": {"gsz": "1.1", "gztime": "old"},
+                    "000002": {"gsz": "2.1", "gztime": "old"},
+                })
+            finally:
+                conn.close()
+
+            with patch.object(
+                fund_fetch_data,
+                "fetch_estimate",
+                side_effect=[
+                    {"gsz": "", "gszzl": "", "gztime": "", "dwjz": ""},
+                    {"gsz": "2.2", "gszzl": "1.0", "gztime": "new", "dwjz": "2.0"},
+                ],
+            ), patch.object(
+                fund_fetch_data,
+                "connect_fund_db",
+                side_effect=lambda: connect_fund_db(db_file),
+            ), patch.object(fund_fetch_data.time, "sleep"):
+                result = fund_fetch_data.fetch_realtime_estimates(["000001", "000002"])
+
+            conn = connect_fund_db(db_file)
+            try:
+                estimates = load_realtime_estimates(conn)
+            finally:
+                conn.close()
+
+        self.assertNotIn("000001", result)
+        self.assertEqual(estimates["000001"]["gsz"], "1.1")
+        self.assertEqual(estimates["000002"]["gsz"], "2.2")
+
+    def test_partial_profile_pipeline_preserves_failed_fund_snapshot(self):
+        from ttjj_spider.pipelines import TtjjSpiderPipeline
+        import ttjj_spider.pipelines as pipelines
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            db_file = tmp_path / "fund.sqlite3"
+            codes_file = tmp_path / "fund_codes.json"
+            codes_file.write_text('["000001", "000002"]', encoding="utf-8")
+            conn = connect_fund_db(db_file)
+            try:
+                save_profile_snapshots(conn, [
+                    {"fundCode": "000001", "name": "基金A"},
+                    {"fundCode": "000002", "name": "基金B"},
+                ])
+            finally:
+                conn.close()
+
+            spider = MagicMock()
+            spider.fund_codes_file = str(codes_file)
+            pipeline = TtjjSpiderPipeline()
+            pipeline.process_item({"fundCode": "000002", "name": "基金B2"}, spider)
+            with patch.object(
+                pipelines,
+                "connect_fund_db",
+                side_effect=lambda: connect_fund_db(db_file),
+            ):
+                pipeline.close_spider(spider)
+
+            conn = connect_fund_db(db_file)
+            try:
+                profiles = load_profile_snapshots(conn)
+            finally:
+                conn.close()
+
+        self.assertEqual(profiles["000001"]["name"], "基金A")
+        self.assertEqual(profiles["000002"]["name"], "基金B2")
+        spider.logger.warning.assert_called()
 
 
 class StockValuationDecisionTest(unittest.TestCase):
@@ -855,8 +1082,75 @@ class StockHistorySchemaTest(unittest.TestCase):
         self.assertFalse(result["history_replace"])
         self.assertEqual(
             [row["date"] for row in result["history_write_records"]],
-            ["2026-07-02"],
+            ["2026-07-01", "2026-07-02"],
         )
+
+    def test_process_stock_skips_redundant_overlap_after_final_bar_refresh(self):
+        existing = [self.complete_row("2026-07-02")]
+        saved = []
+
+        with patch.object(
+            stock_price_valuation,
+            "load_stock_file",
+            return_value={
+                "records": existing,
+                "start_date": "2026-07-02",
+                "end_date": "2026-07-02",
+                "history_refetched_at": "2026-07-02T15:11:00",
+            },
+        ), patch.object(
+            stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
+        ), patch.object(
+            stock_price_valuation, "fetch_daily_range"
+        ) as fetch_mock:
+            stock_price_valuation.process_stock(
+                "603281",
+                "江瀚新材",
+                1,
+                1,
+                save_callback=lambda code, name, data: saved.append(data),
+                max_years=0.0,
+                refresh_valuation=False,
+            )
+
+        fetch_mock.assert_not_called()
+        self.assertEqual(saved, [])
+
+    def test_process_stock_prunes_future_row_and_resets_metadata_frontier(self):
+        existing = [
+            self.complete_row("2026-07-02"),
+            self.complete_row("2026-07-03"),
+        ]
+        saved = []
+
+        with patch.object(
+            stock_price_valuation,
+            "load_stock_file",
+            return_value={
+                "records": existing,
+                "start_date": "2026-07-02",
+                "end_date": "2026-07-03",
+                "history_refetched_at": "2026-07-03T15:11:00",
+            },
+        ), patch.object(
+            stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
+        ), patch.object(
+            stock_price_valuation, "fetch_daily_range"
+        ) as fetch_mock:
+            stock_price_valuation.process_stock(
+                "603281",
+                "江瀚新材",
+                1,
+                1,
+                save_callback=lambda code, name, data: saved.append(data),
+                max_years=0.0,
+                refresh_valuation=False,
+            )
+
+        fetch_mock.assert_not_called()
+        self.assertEqual(saved[0]["end_date"], "2026-07-02")
+        self.assertEqual([row["date"] for row in saved[0]["records"]], ["2026-07-02"])
+        self.assertTrue(saved[0]["history_replace"])
 
     def test_sw3_member_schema_adds_official_market_cap_ratio_to_old_db(self):
         import stock_storage as ss
@@ -1158,7 +1452,7 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             portfolio_fold_path,
         )
 
-        self.assertEqual(long_partial_anchor_offsets(125), [66, 6])
+        self.assertEqual(long_partial_anchor_offsets(125), [86, 46, 6])
 
         benchmark = [
             {"date": f"2026-01-{day:02d}", "close": 1.0 + day * 0.01}
@@ -2181,8 +2475,12 @@ class FundamentalsRefreshDecisionTest(unittest.TestCase):
             payload = {
                 "symbol": code,
                 "name": code,
-                "financials": {"income": []},
-                "indicators": {"records": []},
+                "financials": {
+                    "income": [{"date": "2025-12-31", "revenue": 1}],
+                    "balance": [{"date": "2025-12-31", "total_equity": 1}],
+                    "cashflow": [{"date": "2025-12-31", "operating_cashflow_net": 1}],
+                },
+                "indicators": {"records": [{"date": "2025-12-31", "roe": 1}]},
                 "dividends": {"records": []},
                 "history": history_payload_from_records(
                     code, code, records, "test.stock_crawl_fundamentals"

@@ -105,9 +105,9 @@ SMALLCAP_FOLD_PATH_CHART_FILE = DATA_DIR / "stock_strategy_smallcap_fold_paths.s
 DEFAULT_OPTIMIZATION_ITERATIONS = 1500
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
-# 每 60 个交易日取一折，固定持有 60 个交易日；相邻完整折首尾衔接。
-LONG_HOLD_CHOICES = [60]   # 长线持有期固定为60交易日
-LONG_FOLD_STEP_TD = 60     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
+# 每 40 个交易日取一折，固定持有 40 个交易日；相邻完整折首尾衔接。
+LONG_HOLD_CHOICES = [40]   # 长线持有期固定为40交易日
+LONG_FOLD_STEP_TD = 40     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
 LONG_MAX_LOOKBACK_TD = 2400
 # 小盘独立回测合同：近5年、每20日一折、持有20日，折之间首尾衔接。
 SMALLCAP_HOLD_CHOICES = [20]
@@ -1254,11 +1254,23 @@ def short_actual_backtest(
 
 
 def latest_pick_event_date(pick: Dict[str, Any]) -> Optional[str]:
+    explicit = str(pick.get("event_date") or "")[:10]
+    try:
+        if explicit:
+            return datetime.strptime(explicit, "%Y-%m-%d").strftime("%Y-%m-%d")
+    except ValueError:
+        pass
+
+    # Compatibility fallback for candidate artifacts produced before
+    # event_date was added. New artifacts must use the explicit date computed
+    # from the full signal payload, not this truncated display sample.
     dates = []
     for follower in pick.get("followers", []) or []:
         date = str(follower.get("date", ""))[:10]
-        if len(date) == 10:
-            dates.append(date)
+        try:
+            dates.append(datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d"))
+        except ValueError:
+            continue
     if not dates:
         return None
     return max(dates)
@@ -1399,8 +1411,6 @@ def random_short_config(rng: random.Random, iteration: int) -> Dict[str, Any]:
         # top_n 不参与搜索，固定用 DEFAULT_CONFIG 的 10
         cfg["min_score"] = rng.choice([35, 40, 45, 50, 55, 60, 65, 70])
         cfg["max_consecutive_limit_up"] = rng.choice([1, 2, 3, 4])
-        cfg["hold_days_min"] = rng.choice([1, 2])
-        cfg["hold_days_max"] = rng.choice([3, 4, 5])
     return cfg
 
 
@@ -1446,6 +1456,16 @@ def _nearest_choice(value: Any, choices: List[Any]) -> Any:
     if num is not None and all(isinstance(c, (int, float)) for c in choices):
         return min(choices, key=lambda c: abs(c - num))
     return value if value in choices else choices[0]
+
+
+def _short_config_with_hold_days(config: Dict[str, Any], hold_days: Any) -> Dict[str, Any]:
+    """Keep displayed, evaluated and persisted short horizons identical."""
+    selected = int(_nearest_choice(hold_days, SHORT_HOLD_DAYS_CHOICES))
+    cfg = copy.deepcopy(config)
+    cfg["hold_days"] = selected
+    cfg["hold_days_min"] = selected
+    cfg["hold_days_max"] = selected
+    return cfg
 
 
 def _long_weight_bounds(key: str) -> Tuple[float, float]:
@@ -1512,10 +1532,8 @@ def _suggest_short_config(trial) -> Tuple[Dict[str, Any], int]:
     }
     cfg["min_score"] = trial.suggest_categorical("min_score", SHORT_MIN_SCORE_CHOICES)
     cfg["max_consecutive_limit_up"] = trial.suggest_categorical("max_consecutive_limit_up", [1, 2, 3, 4])
-    cfg["hold_days_min"] = trial.suggest_categorical("hold_days_min", [1, 2])
-    cfg["hold_days_max"] = trial.suggest_categorical("hold_days_max", [3, 4, 5])
     hold_days = trial.suggest_categorical("hold_days", SHORT_HOLD_DAYS_CHOICES)
-    return cfg, hold_days
+    return _short_config_with_hold_days(cfg, hold_days), hold_days
 
 
 def _default_short_params() -> Dict[str, Any]:
@@ -1527,10 +1545,32 @@ def _default_short_params() -> Dict[str, Any]:
     }
     params["min_score"] = _nearest_choice(base.get("min_score"), SHORT_MIN_SCORE_CHOICES)
     params["max_consecutive_limit_up"] = _nearest_choice(base.get("max_consecutive_limit_up"), [1, 2, 3, 4])
-    params["hold_days_min"] = _nearest_choice(base.get("hold_days_min"), [1, 2])
-    params["hold_days_max"] = _nearest_choice(base.get("hold_days_max"), [3, 4, 5])
-    params["hold_days"] = 1
+    params["hold_days"] = _nearest_choice(
+        base.get("hold_days", base.get("hold_days_min", 1)), SHORT_HOLD_DAYS_CHOICES
+    )
     return params
+
+
+def _short_backtest_for_horizon(
+        picks: List[Dict[str, Any]],
+        series: Dict[str, List[Dict[str, Any]]],
+        suggested_hold_days: Any,
+) -> Tuple[int, Dict[str, Any]]:
+    """Evaluate exactly the horizon attributed to this search trial."""
+    selected = int(_nearest_choice(suggested_hold_days, SHORT_HOLD_DAYS_CHOICES))
+    return selected, short_actual_backtest(picks, series, hold_days=selected)
+
+
+def _finalize_short_best(row: Dict[str, Any]) -> Dict[str, Any]:
+    """Do not persist an arbitrary horizon selected only by a timeless proxy."""
+    best = copy.deepcopy(row)
+    if best.get("hold_days_validated"):
+        return best
+    baseline = int(_default_short_params()["hold_days"])
+    best["hold_days"] = baseline
+    best["config"] = _short_config_with_hold_days(best.get("config") or {}, baseline)
+    best["hold_days_fallback_reason"] = "no_forward_price_samples"
+    return best
 
 
 def optuna_startup_trials(iterations: int) -> int:
@@ -1827,7 +1867,13 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
 
     def evaluate_short(cfg: Dict[str, Any], hold_days: int) -> Tuple[float, Dict[str, Any]]:
         picks = score_prepared_short_candidates(prepared, cfg)
-        actual = short_actual_backtest(picks, series, hold_days=hold_days)
+        suggested_hold_days = int(_nearest_choice(hold_days, SHORT_HOLD_DAYS_CHOICES))
+        # Never substitute another horizon's return: Optuna must attribute the
+        # objective to the exact categorical value it suggested.
+        effective_hold_days, actual = _short_backtest_for_horizon(
+            picks, series, suggested_hold_days
+        )
+        cfg = _short_config_with_hold_days(cfg, effective_hold_days)
         proxy = short_proxy_backtest(picks)
         actual_objective = objective_from_summary(actual, fallback_quality=-999.0)
         proxy_objective = objective_from_summary(proxy, fallback_quality=0.0)
@@ -1840,7 +1886,9 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
         row = {
             "objective": round(objective, 5),
             "objective_mode": objective_mode,
-            "hold_days": hold_days,
+            "hold_days": effective_hold_days,
+            "suggested_hold_days": suggested_hold_days,
+            "hold_days_validated": bool(actual.get("samples")),
             "selected_count": len(picks),
             "actual_backtest": actual,
             "proxy_backtest": proxy,
@@ -1856,14 +1904,19 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
             trace.append(row)
         return objective
 
+    def random_short_trial(iteration: int) -> Tuple[Dict[str, Any], int]:
+        hold_days = rng.choice(SHORT_HOLD_DAYS_CHOICES) if iteration else int(
+            _default_short_params()["hold_days"]
+        )
+        return _short_config_with_hold_days(
+            random_short_config(rng, iteration), hold_days
+        ), hold_days
+
     search_note = _run_config_search(
         iterations, rng,
         suggest=_suggest_short_config,
         default_params=_default_short_params(),
-        random_config=lambda i: (
-            random_short_config(rng, i),
-            rng.choice(SHORT_HOLD_DAYS_CHOICES) if i else 1,
-        ),
+        random_config=random_short_trial,
         record=_record,
         progress_label="短线参数搜索",
         n_jobs=OPTUNA_TRIAL_JOBS,
@@ -1871,7 +1924,7 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
     )
     if not trace:
         raise RuntimeError("短线优化没有产生任何 trial。")
-    best = max(trace, key=lambda x: x["objective"])
+    best = _finalize_short_best(max(trace, key=lambda x: x["objective"]))
     return {
         "strategy": "short",
         "iterations": iterations,
@@ -1880,6 +1933,7 @@ def optimize_short(iterations: int, rng: random.Random, progress_position: int =
             "短线候选池因子分在 trial 前预转为 NumPy 矩阵，trial 阶段向量化完成硬过滤、打分和 topN 选择。",
             "最少上榜与最少共振默认固定为0，不参与优化；页面仍可手动调高做二次筛选。",
             "短线真实前推收益回测仅在事件日之后存在本地价格数据时使用。",
+            "持有期只由真实前推收益选择；无对应价格样本时回退默认持有期，代理分不冒充持有期依据。",
             "当前本地快照中，龙虎榜事件多数晚于缓存价格行，因此大多需要使用代理评分。",
         ],
         "best": best,
@@ -2672,7 +2726,16 @@ def run_optimization(
             saved_scores = optimized_config.setdefault("scores", {})
             for name in standard_names:
                 section = strategy_results[name]
-                saved_config[name] = section["best"]["config"]
+                best_config = section["best"]["config"]
+                if name == "short":
+                    selected_hold_days = section["best"].get(
+                        "hold_days", best_config.get("hold_days")
+                    )
+                    if selected_hold_days is not None:
+                        best_config = _short_config_with_hold_days(
+                            best_config, selected_hold_days
+                        )
+                saved_config[name] = best_config
                 saved_scores[f"{name}_objective"] = section["best"]["objective"]
             with open(OPTIMIZED_CONFIG_FILE, "w", encoding="utf-8") as fp:
                 json.dump(optimized_config, fp, ensure_ascii=False, indent=2)

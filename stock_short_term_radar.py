@@ -580,7 +580,11 @@ CANDIDATE_FACTORS: List[tuple] = [
 ]
 
 
-def _collect_factor_samples(conn, candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _collect_factor_samples(
+        conn,
+        candidates: List[Dict[str, Any]],
+        as_of: Optional[str] = None,
+) -> Dict[str, Any]:
     """PIT 滑窗：对每只票每个 as-of 截面算齐候选因子原始值 + 未来前向收益。
 
     samples 每项 = {date, code, factors:{name:val}, rets:{h:ret}, rets_t1:{h:ret}}。
@@ -588,11 +592,14 @@ def _collect_factor_samples(conn, candidates: List[Dict[str, Any]]) -> Dict[str,
       · rets    收盘→收盘：close[i+h]/close[i] —— 信号日收盘价买入（理想价，封板/涨停时买不进）。
       · rets_t1 次日开盘→收盘：close[i+h]/open[i+1] —— T+1 开盘真实买入（剥离隔夜跳空/封板幻觉，
         口径同 momentum_buypoint）。open[i+1] 缺失/≤0 时不填该样本 t1，聚合时独立过滤。
+    ``as_of`` 给定时还会先截断全量日线，因而因子和前向收益都不会越过该日期。
     """
     max_h = max(SHORT_HORIZONS)
     series: Dict[str, tuple] = {}
     for cand in candidates:
         bars = hmr._all_bars(conn, cand["code"])
+        if as_of:
+            bars = [bar for bar in bars if str(bar.get("date") or "") <= as_of]
         if len(bars) < LOOKBACK + max_h + 1:
             continue
         series[cand["code"]] = (bars, {b["date"]: i for i, b in enumerate(bars)})
@@ -690,7 +697,7 @@ def run_verify(as_of: Optional[str] = None, max_cap: Optional[float] = None,
     conn = stock_storage.connect(DB_FILE)
     try:
         candidates = hmr.load_candidates(conn, pool, max_cap=max_cap)
-        collected = _collect_factor_samples(conn, candidates)
+        collected = _collect_factor_samples(conn, candidates, as_of=as_of)
     finally:
         conn.close()
     samples = collected["samples"]
@@ -700,6 +707,7 @@ def run_verify(as_of: Optional[str] = None, max_cap: Optional[float] = None,
     payload.update({
         "status": "ok" if samples else "empty",
         "description": "短线因子有效性后验：PIT 截面 RankIC(因子,前向收益) + t + 多空价差，逐因子裁 KEEP/DROP。",
+        "as_of": as_of,
         "params": {
             "horizons": list(SHORT_HORIZONS), "step": VERIFY_STEP,
             "window_days": VERIFY_WINDOW_DAYS, "buckets": VERIFY_BUCKETS,
@@ -1059,7 +1067,7 @@ def run_backtest(as_of: Optional[str] = None, max_cap: Optional[float] = None,
     conn = stock_storage.connect(DB_FILE)
     try:
         candidates = hmr.load_candidates(conn, pool, max_cap=max_cap)
-        collected = _collect_factor_samples(conn, candidates)
+        collected = _collect_factor_samples(conn, candidates, as_of=as_of)
         bench = _load_benchmark(conn)
     finally:
         conn.close()
@@ -1093,6 +1101,7 @@ def run_backtest(as_of: Optional[str] = None, max_cap: Optional[float] = None,
         "status": "ok" if samples else "empty",
         "description": "买入组(截面前20%)绝对收益 + 对沪深300/中证500等权混合基准超额，持有 2/5/10/20 日；跨as-of日平均+t+胜率。"
                        "两套买入口径：close=信号日收盘价买入(理想)、t1open=次日开盘买入(剥离封板/跳空幻觉,真实可执行)。",
+        "as_of": as_of,
         "params": {
             "horizons": list(BACKTEST_HORIZONS), "buy_top_frac": BUY_TOP_FRAC,
             "buckets": BACKTEST_BUCKETS, "bucket_order": "Q1=最低买入信号；Q5=最高买入信号",

@@ -195,6 +195,15 @@ FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属
 
 DEFAULT_POOL_MAX_AGE_DAYS = 14
 LOCAL_TAXONOMY_MIN_BACKUP_RATIO = 0.80
+LOCAL_TAXONOMY_TRUNCATION_GUARD_MIN_COUNT = 20
+
+
+def _taxonomy_response_looks_truncated(fetched_count: int, reference_count: int) -> bool:
+    """Flag large taxonomy responses that would unexpectedly delete >=20%."""
+    return (
+        reference_count >= LOCAL_TAXONOMY_TRUNCATION_GUARD_MIN_COUNT
+        and fetched_count <= reference_count * LOCAL_TAXONOMY_MIN_BACKUP_RATIO
+    )
 
 
 def _norm_code(value: Any) -> str:
@@ -968,8 +977,8 @@ def _save_sw3_membership_to_db(payload: Dict[str, Any]) -> None:
 def _mark_leaders_in_db(segments: List[Dict[str, Any]]) -> int:
     """把龙头池里每个赛道选出的龙头 code 回写到主库 sw3_member.is_leader。
 
-    save_sw3_membership 重建 sw3_member 时 is_leader 会落回 0，故在龙头池生成的最后一步
-    重新打标，让 is_leader 始终反映最新一轮选股，供主力雷达等模块直接 WHERE is_leader=1 取池。
+    save_sw3_membership 的增量同步会保留现有标记；龙头池生成完成后仍以本轮结果全量
+    重打标，让 is_leader 始终反映最新选股，供主力雷达直接 WHERE is_leader=1 取池。
     """
     codes = {
         lead.get("code")
@@ -1013,6 +1022,22 @@ def crawl_sw3_membership(
                            desc="申万三级行业列表")
     except Exception as exc:
         print(f"  [membership] 三级总表抓取失败：{exc}", flush=True)
+        sw3 = None
+    reference_count = max(
+        int(db_count or 0),
+        int(backup_count or 0),
+        len(prev.get("segments") or []),
+    )
+    if (
+        sw3 is not None
+        and not sw3.empty
+        and _taxonomy_response_looks_truncated(len(sw3), reference_count)
+    ):
+        print(
+            f"  [membership] 三级总表疑似截断({len(sw3)}/{reference_count}，不高于80%)，"
+            "拒绝据此删除旧赛道并回退完整快照",
+            flush=True,
+        )
         sw3 = None
     if sw3 is None or sw3.empty:
         taxonomy_from_fallback = True
@@ -1102,7 +1127,9 @@ def crawl_sw3_membership(
         "source": "申万三级行业成分(Legulegu 主源 / 申万宏源官方兜底, 缓存)",
         "segment_count": len(segments),
         "segments": segments,
-        "errors": errors[:80],
+        # DB 同步必须拿到完整失败集合，才能保护每个失败赛道的旧成员/信号；
+        # 展示层如需限长，应在输出时截断，不能在持久化前截断。
+        "errors": errors,
     }
     _save_sw3_membership_to_db(payload)
     print(f"  -> 归属缓存已落库 {STOCK_DB_FILE}"
@@ -1191,7 +1218,7 @@ def refresh_oldest_segments(n: int = DEFAULT_REFRESH_SLICE, sleep_sec: float = 0
         "source": "申万三级行业成分(Legulegu 主源 / 申万宏源官方兜底, 缓存+切片增量)",
         "segment_count": len(segments),
         "segments": segments,
-        "errors": list(errors_map.values())[:80],
+        "errors": list(errors_map.values()),
     }
     _save_sw3_membership_to_db(payload)
     print(f"  -> 切片刷新完成：成功 {refreshed} / 失败 {failed}"
@@ -1363,7 +1390,7 @@ def build_segment_leader_pool(
         "segment_count": len(segments),
         "leader_count": leader_count,
         "segments": segments,
-        "errors": membership.get("errors", [])[:50],
+        "errors": membership.get("errors", []),
     }
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)

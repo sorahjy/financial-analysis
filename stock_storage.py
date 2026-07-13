@@ -497,11 +497,13 @@ def _sw3_member_metric(mem: Mapping[str, Any], col: str) -> Optional[float]:
 
 
 def save_sw3_membership(conn: sqlite3.Connection, payload: Mapping[str, Any]) -> Dict[str, int]:
-    """把 sw3_membership payload 全量落库（sw3_segment + sw3_member 两表替换）。
+    """把 sw3_membership payload 同步到 sw3_segment + sw3_member。
 
     一个赛道可同时出现在 segments(带 members) 与 errors(上次刷新失败)——后者只在对应
     segment 行的 error 列打标、不丢 members；纯失败赛道补一行无 member 的 segment。
-    全量 DELETE + 重插，匹配旧 json"整文件重写"语义(自然丢弃消失赛道)。返回写入计数。
+    对仍存在的成员做 upsert，只删除本次 payload 已消失的成员/赛道：这样例行行业分类刷新
+    不会把 is_leader/is_hot_money 重置为 0，也不会通过外键级联误删仍在池中的短线信号。
+    真正退出最新分类的成员仍会被删除，其关联信号随之外键级联清理。返回同步后计数。
     """
     segments = payload.get("segments") or []
     errors = payload.get("errors") or []
@@ -542,21 +544,78 @@ def save_sw3_membership(conn: sqlite3.Connection, payload: Mapping[str, Any]) ->
             seen.add(sc)
             seg_rows.append((sc, _optional_text(err.get("segment_name")), None, None, None, err.get("error")))
 
+    # 申万三级分类不可能合法地为空。把空/损坏 payload 当作失败而不是“全量删除”指令，
+    # 避免上游解析或网络异常清空分类、池标记以及所有外键信号快照。
+    if not seg_rows:
+        raise ValueError("refusing to replace SW3 membership with an empty payload")
+
     member_cols = ("code", "segment_code", "name") + _SW3_MEMBER_METRIC_COLS
-    with conn:
-        conn.execute("DELETE FROM sw3_member")
-        conn.execute("DELETE FROM sw3_segment")
-        conn.executemany(
-            "INSERT INTO sw3_segment "
-            "(segment_code, segment_name, parent_segment, member_count, refreshed_at, error, updated_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
-            seg_rows,
+    member_updates = ", ".join(
+        (
+            "segment_code=excluded.segment_code",
+            "name=COALESCE(excluded.name, sw3_member.name)",
         )
+        + tuple(
+            f"{col}=COALESCE(excluded.{col}, sw3_member.{col})"
+            for col in _SW3_MEMBER_METRIC_COLS
+        )
+    )
+    with conn:
+        if seg_rows:
+            conn.executemany(
+                "INSERT INTO sw3_segment "
+                "(segment_code, segment_name, parent_segment, member_count, refreshed_at, error, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                "ON CONFLICT(segment_code) DO UPDATE SET "
+                "segment_name=COALESCE(excluded.segment_name, sw3_segment.segment_name), "
+                "parent_segment=COALESCE(excluded.parent_segment, sw3_segment.parent_segment), "
+                "member_count=COALESCE(excluded.member_count, sw3_segment.member_count), "
+                "refreshed_at=COALESCE(excluded.refreshed_at, sw3_segment.refreshed_at), "
+                "error=excluded.error, "
+                "updated_at=CURRENT_TIMESTAMP",
+                seg_rows,
+            )
         if member_rows:
             conn.executemany(
                 f"INSERT INTO sw3_member ({', '.join(member_cols)}) "
-                f"VALUES ({', '.join('?' for _ in member_cols)})",
+                f"VALUES ({', '.join('?' for _ in member_cols)}) "
+                f"ON CONFLICT(code) DO UPDATE SET {member_updates}",
                 member_rows,
+            )
+
+        # 分块删除差集，避免全表 DELETE 触发仍在分类中的 short_signal_snapshot 级联删除，
+        # 同时规避 SQLite 变量数量上限。成员必须先删，之后才能删其旧 segment 父行。
+        existing_members = {
+            str(row["code"]): str(row["segment_code"])
+            for row in conn.execute("SELECT code, segment_code FROM sw3_member")
+        }
+        protected_failed_members = {
+            code
+            for code, segment_code in existing_members.items()
+            if segment_code in error_by_code
+        }
+        stale_member_codes = sorted(
+            set(existing_members) - seen_members - protected_failed_members
+        )
+        for i in range(0, len(stale_member_codes), 500):
+            chunk = stale_member_codes[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM sw3_member WHERE code IN ({placeholders})",
+                chunk,
+            )
+
+        existing_segment_codes = {
+            str(row["segment_code"])
+            for row in conn.execute("SELECT segment_code FROM sw3_segment")
+        }
+        stale_segment_codes = sorted(existing_segment_codes - seen)
+        for i in range(0, len(stale_segment_codes), 500):
+            chunk = stale_segment_codes[i:i + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            conn.execute(
+                f"DELETE FROM sw3_segment WHERE segment_code IN ({placeholders})",
+                chunk,
             )
     return {"segments": len(seg_rows), "members": len(member_rows)}
 
@@ -667,9 +726,8 @@ def segment_map(conn: sqlite3.Connection) -> Dict[str, Dict[str, Any]]:
 def mark_sw3_leaders(conn: sqlite3.Connection, codes: Sequence[str]) -> int:
     """把给定 code 标记为细分龙头(is_leader=1)，其余全部清零。
 
-    供 build_segment_leader_pool 选出龙头后回写：save_sw3_membership 会 DELETE 重插
-    sw3_member（is_leader 落回默认 0），故每次重建龙头池后调用本函数重新打标，
-    让 is_leader 反映最新一轮选股结果。返回实际打标命中的行数。
+    供 build_segment_leader_pool 选出龙头后回写。成员分类增量刷新会保留已有标记，
+    本函数仍以最新一轮选股结果全量重置标记，供主力雷达直接取池。返回命中行数。
     """
     norm = sorted({_normalize_code(c) for c in codes if _normalize_code(c)})
     with _WRITE_LOCK:

@@ -15,7 +15,7 @@ import random
 import re
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import requests
 
@@ -295,18 +295,25 @@ def fetch_estimate(code: str) -> Optional[Dict[str, str]]:
             if not match:
                 return None
             data = json.loads(match.group(1))
-            return {
+            result = {
                 "gsz": data.get("gsz", ""),
                 "gszzl": data.get("gszzl", ""),
                 "gztime": data.get("gztime", ""),
                 "dwjz": data.get("dwjz", ""),
             }
+            if not _estimate_has_usable_nav(result):
+                raise ValueError("估值接口返回空净值字段")
+            return result
         except Exception as exc:
             if attempt < MAX_RETRIES - 1:
                 time.sleep(2 ** attempt + random.uniform(0, 0.5))
             else:
                 print(f"  [ERROR] {code}: {exc}")
     return None
+
+
+def _estimate_has_usable_nav(estimate: Mapping[str, Any]) -> bool:
+    return any(str(estimate.get(field) or "").strip() for field in ("gsz", "dwjz"))
 
 
 def fetch_realtime_estimates(codes: Optional[List[str]] = None) -> Dict[str, Dict[str, str]]:
@@ -318,7 +325,7 @@ def fetch_realtime_estimates(codes: Optional[List[str]] = None) -> Dict[str, Dic
     for index, code in enumerate(codes):
         print(f"[{index + 1}/{total}] 获取估算: {code}", end="", flush=True)
         result = fetch_estimate(code)
-        if result:
+        if result and _estimate_has_usable_nav(result):
             estimates[code] = result
             print(f'  gsz={result["gsz"]} gszzl={result["gszzl"]}% gztime={result["gztime"]}')
         else:
@@ -328,7 +335,13 @@ def fetch_realtime_estimates(codes: Optional[List[str]] = None) -> Dict[str, Dic
 
     conn = connect_fund_db()
     try:
-        save_realtime_estimates(conn, estimates)
+        complete = set(estimates) == set(codes)
+        save_realtime_estimates(
+            conn,
+            estimates,
+            replace=complete,
+            expected_codes=codes if complete else None,
+        )
     finally:
         conn.close()
 
