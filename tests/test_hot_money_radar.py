@@ -205,7 +205,10 @@ class HotMoneyRadarTest(unittest.TestCase):
         )
 
     def test_pattern_effective_set_matches_latest_retest(self):
-        expected = {"P3", "P11", "P12", "P13", "P14", "P16", "P17", "P19", "P20", "P22", "P24", "P26"}
+        expected = {
+            "P1", "P2", "P3", "P5", "P11", "P12", "P13", "P14", "P15",
+            "P16", "P17", "P19", "P20", "P21", "P22", "P24", "P26",
+        }
         self.assertEqual(radar.PATTERN_EFFECTIVE, expected)
         self.assertEqual(set(radar.PATTERN_EFFECTIVE_STYLE), expected)
 
@@ -222,10 +225,10 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertFalse(catalog["P7"]["effective"])
         self.assertIn("P25", catalog)
         self.assertFalse(catalog["P25"]["effective"])
-        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 10%")
         self.assertEqual(catalog["P25"]["score_usage"], "吸筹分 5%")
-        self.assertEqual(catalog["P1"]["validation_label"], "仅小盘有效")
-        self.assertEqual(catalog["P25"]["validation_label"], "仅小盘有效")
+        self.assertEqual(catalog["P1"]["validation_label"], "核心有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "双池10/20日正向")
         self.assertIn("P26", catalog)
         self.assertTrue(catalog["P26"]["effective"])
         self.assertEqual(catalog["P3"]["effective_style"], "bullish")
@@ -403,6 +406,34 @@ class HotMoneyRadarTest(unittest.TestCase):
 
         p19_only = radar._distribution_model_features(0.0, ["P19"], lhb_recent=False, divergence_score=0.0)
         self.assertEqual(radar._distribution_model_score(p19_only, weights), 15.0)
+
+    def test_distribution_model_production_weights_include_p15(self):
+        self.assertEqual(len(radar.DIST_MODEL_WEIGHTS), 11)
+        self.assertAlmostEqual(sum(radar.DIST_MODEL_WEIGHTS.values()), 1.0)
+        self.assertEqual(radar.DIST_MODEL_WEIGHTS["p15"], 0.05)
+        self.assertEqual(radar.DIST_MODEL_WEIGHTS["p22"], 0.05)
+
+        p15_only = radar._distribution_model_features(
+            0.0, ["P15"], lhb_recent=False, divergence_score=0.0,
+        )
+        p22_only = radar._distribution_model_features(
+            0.0, ["P22"], lhb_recent=False, divergence_score=0.0,
+        )
+        self.assertEqual(p15_only["p15"], 1.0)
+        self.assertEqual(radar._distribution_model_score(p15_only), 5.0)
+        self.assertEqual(radar._distribution_model_score(p22_only), 5.0)
+
+        catalog = {item["code"]: item for item in radar.pattern_catalog()}
+        self.assertEqual(catalog["P15"]["score_usage"], "出货分 5%")
+        self.assertEqual(catalog["P22"]["score_usage"], "出货分 5%")
+
+        grids = radar._distribution_weight_grid()
+        self.assertTrue(grids)
+        self.assertTrue(any(row == radar.DIST_MODEL_WEIGHTS for row in grids))
+        for row in grids:
+            self.assertAlmostEqual(sum(row.values()), 1.0)
+            for key in ("p14", "p15", "p20", "p22"):
+                self.assertEqual(row[key], 0.05)
 
     def test_accumulation_model_uses_raw_feature_weights(self):
         weights = {
@@ -611,29 +642,55 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(radar._phase_confidence("观望⚪", [], 12.3, 0), 85.0)
         self.assertLess(radar._phase_confidence("观望⚪", [], 64.0, 10.0), 35.0)
 
-    def test_distribution_warning_uses_cumulative_pattern_points(self):
+    def test_pattern_phase_labels_are_valid_unicode(self):
+        def pattern(code, phase, signal):
+            return {"code": code, "name": code, "phase": phase, "signal": signal}
+
+        accumulation = pattern("P3", "吸筹", "buy")
+        wash = pattern("P8", "洗盘", "buy")
+        phases = [
+            radar._pattern_phase([], score=radar.SUSPECT_ACCUM_SCORE),
+            radar._pattern_phase([accumulation], score=0),
+            radar._pattern_phase([pattern("P6", "试盘", "hold")], score=0),
+            radar._pattern_phase([wash], score=0),
+            radar._pattern_phase([accumulation, wash], score=0),
+            radar._pattern_phase([pattern("P11", "突破", "hold")], score=0),
+            radar._pattern_phase([pattern("P12", "拉升", "hold")], score=0),
+        ]
+        with patch.object(radar, "_distribution_warning_triggered", return_value=True):
+            phases.append(radar._pattern_phase([pattern("P14", "出货", "sell")], score=0))
+        phases.append(radar._pattern_phase([], score=0))
+
+        self.assertEqual(tuple(phases), radar.PHASE_ORDER)
+        self.assertNotIn("\ufffd", "".join(phases))
+        self.assertNotIn(
+            "\ufffd",
+            Path(radar.__file__).read_text(encoding="utf-8"),
+        )
+
+    def test_distribution_warning_uses_any_pattern_once(self):
         def pattern(code):
             return {"code": code, "name": code, "phase": "出货", "signal": "sell"}
 
-        cases = [
-            (("P14",), 2, False),
-            (("P16",), 2, False),
-            (("P17",), 3, True),
-            (("P19",), 3, True),
-            (("P20", "P22"), 2, False),
-            (("P14", "P20"), 3, True),
-            (("P16", "P22"), 3, True),
-            (("P26",), 3, True),
-            (("P14", "P16"), 4, True),
-            (("P15", "P18"), 0, False),
-        ]
+        warning_codes = ("P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26")
+        cases = [((code,), 1, True) for code in warning_codes]
+        cases.extend([
+            (("P18",), 0, False),
+            (("P11",), 0, False),
+            (("P15", "P18"), 1, True),
+        ])
         for codes, points, warned in cases:
             fired = [pattern(code) for code in codes]
             self.assertEqual(radar._distribution_warning_points(fired), points)
+            self.assertEqual(radar._effective_sell_pattern_count(fired), points)
             self.assertEqual(radar._pattern_phase(fired, score=0) == "出货预警🔴", warned)
 
-        duplicate = [pattern("P17"), pattern("P17")]
-        self.assertEqual(radar._distribution_warning_points(duplicate), 3)
+        duplicate = [pattern("P15"), pattern("P15")]
+        self.assertEqual(radar._distribution_warning_points(duplicate), 1)
+        self.assertEqual(radar._effective_sell_pattern_count(duplicate), 1)
+        self.assertIn(
+            "P15", radar.distribution_warning_rule_metadata()["pattern_codes"],
+        )
 
     def test_phase_confidence_uses_score_confirmation(self):
         buy = [{"code": "P3", "name": "缩量阴线打压吸筹", "phase": "吸筹", "signal": "buy"}]

@@ -130,6 +130,7 @@ class DataRefreshPipelineTest(unittest.TestCase):
         self.assertLess(run_steps.index("long_capital_events"), run_steps.index("hot_money_small_cap_universe"))
         self.assertLess(run_steps.index("hot_money_small_cap_universe"), run_steps.index("short_signal_enrichment"))
         self.assertLess(run_steps.index("short_signal_enrichment"), run_steps.index("strategy_results"))
+        self.assertIn("--enrich-long-factors", step_commands["hot_money_small_cap_universe"])
         self.assertEqual(
             step_commands["short_signal_enrichment"][-4:],
             ["--days", "14", "--top-yyb", "30"],
@@ -158,6 +159,65 @@ class HotMoneyHistoryRefreshTest(unittest.TestCase):
             refresh_valuation=False,
             label="游资初筛",
         )
+
+    def test_final_hotmoney_pool_refreshes_long_factor_data(self):
+        import stock_crawl_hot_money_universe as universe
+
+        result = {"requested": 2, "processed": 2, "failed": []}
+        plan = {"000001": True, "000002": False}
+        pledge = {"000001": {"pledge_ratio": 3.0}}
+        with patch.object(
+            universe, "plan_fundamentals_refresh", return_value=(plan, pledge)
+        ) as plan_mock, patch.object(
+            universe, "refresh_stock_histories", return_value=result
+        ) as refresh_mock:
+            actual = universe.refresh_selected_factor_data(
+                ["000001", "000002"],
+                {"000001": "平安银行", "000002": "万科A"},
+                years=4.0,
+                workers=6,
+            )
+
+        self.assertEqual(actual, result)
+        plan_mock.assert_called_once_with({"000001", "000002"})
+        refresh_mock.assert_called_once_with(
+            {"000001": "平安银行", "000002": "万科A"},
+            max_years=4.0,
+            workers=6,
+            refresh_valuation=True,
+            fundamentals_plan=plan,
+            pledge_map=pledge,
+            label="游资小盘长线因子",
+        )
+
+    def test_factor_refresh_failure_preserves_previous_hotmoney_pool(self):
+        import stock_crawl_hot_money_universe as universe
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = ["2026-07-17"]
+        with patch.object(sys, "argv", [
+                 "stock_crawl_hot_money_universe.py", "--enrich-long-factors"
+             ]), \
+             patch.object(universe.stock_storage, "connect", return_value=conn), \
+             patch.object(universe.stock_storage, "_ensure_table_columns"), \
+             patch.object(universe, "select_seed", return_value={
+                 "in_member": ["000002"],
+                 "not_member": [],
+                 "names": {"000002": "万科A"},
+             }), \
+             patch.object(universe, "refresh_seed_histories", return_value={"failed": []}), \
+             patch.object(universe, "latest_history_dates", return_value={"000002": "2026-07-17"}), \
+             patch.object(universe, "_bars_count", return_value=300), \
+             patch.object(universe, "history_is_fresh", return_value=True), \
+             patch.object(universe, "float_cap_yi", return_value=50.0), \
+             patch.object(universe, "refresh_selected_factor_data", return_value={
+                 "failed": ["000002"],
+             }):
+            with self.assertRaisesRegex(RuntimeError, "保留上一份有效股票池"):
+                universe.main()
+
+        executed = [call.args[0] for call in conn.execute.call_args_list]
+        self.assertFalse(any("UPDATE sw3_member SET is_hot_money = 0" in sql for sql in executed))
 
     def test_history_freshness_uses_actual_latest_bar_date(self):
         import stock_crawl_hot_money_universe as universe
@@ -2041,6 +2101,7 @@ class HotMoneySliceRefreshTest(unittest.TestCase):
         build_mock.assert_called_once_with(
             top_per_segment=r.DEFAULT_TOP_PER_SEGMENT,
             refresh_slice=15,
+            refresh_industry_heat=True,
         )
         self.assertEqual(stocks, {"600000": "浦发银行"})
 

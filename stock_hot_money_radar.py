@@ -6,16 +6,20 @@
   调研背景：「放量+创新高」经 verify 回测证明是右侧追高(截面 RankIC 显著为负)。吸筹的真正
   指纹是方向性的——参考 Wyckoff/VSA、A股筹码分布、OBV/ADL 三套体系，落地三个判别信号：
 
-ambush 吸筹分（九项 0~100 原始分直接加权）：
+ambush 吸筹分（十三项 0~100 原始分直接加权）：
   筹码  低位筹码集中                                  权重 0.10
-  位置  价格中低位                                    权重 0.20
+  位置  价格中低位                                    权重 0.10
   CMF   高买压反向有效分（最高50）                     权重 0.10
-  P3    缩量打压后首次完整收复                         权重 0.20
-  P24   OBV底背离连续确认后的首次成立                   权重 0.10
-  P1    长期低位底盘吸筹首次确认                       权重 0.05（仅小盘回测有效）
-  P25   低位横盘缩量后的量能启动                       权重 0.05（仅小盘回测有效）
+  P1    超额优先复合确认                               权重 0.10（双池10日有效，小盘更有效）
+  P2    低位真实长下影温和缩量承接                     权重 0.05（大盘更有效）
+  P3    缩量收盘大跌后首次完整收复                     权重 0.10
+  P5    双底右腿确认                                  权重 0.05（临时核心有效，小盘更有效）
+  P21   深破缩量收回                                  权重 0.10
+  P23   低位压缩温和量能转强                           权重 0.05（实验形态）
+  P24   OBV底背离连续确认后的首次成立                   权重 0.05
+  P25   中低位缩量平台价格转强                         权重 0.05（双池10/20日正向）
   户数  股东户数下降                                  权重 0.10
-  回购  近90日公司回购                                权重 0.10
+  回购  近90日公司回购                                权重 0.05
 旧四技术因子加权分及其一字板/派发/P20折扣已删除；出货风险只在机会分中单独折扣。
 
 另叠加「游资形态匹配」(规格见 meta_data_backup/hot_money_patterns.md)：把游资坐庄的「吸筹→试盘→
@@ -26,21 +30,25 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
 游资形态总表（PATTERNS，6 类 / 26 个，编号 P1-P26）
   · 列：编号  名称  —— 命中条件（位置=收盘价近60日分位；量比=近5日均量/前20日均量；
         漂移=近20日涨跌幅；CMF=Chaikin资金流；筹码集中=主峰±7%价带内筹码占比）。
-  · 信号方向 buy/hold/sell；阶段配色按操作进程由早到晚渐变：吸筹🟢→试盘/洗盘🟡→突破/拉升🟠→出货🔴（观望⚪）。
-  · 阶段优先级见 _pattern_phase：出货风险积分≥3 > 突破 > 吸筹/洗盘 > 拉升 > 试盘。
+  · 信号方向 buy/hold/sell/observe；observe仅展示结构，不参与主导阶段。阶段配色按操作进程由早到晚渐变：
+    吸筹🟢→试盘/洗盘🟡→突破/拉升🟠→出货🔴（观望⚪）。
+  · 阶段优先级见 _pattern_phase：出货预警（P14/P15/P16/P17/P19/P20/P22/P26任一命中）> 突破 > 吸筹/洗盘 > 拉升 > 试盘。
 ─────────────────────────────────────────────────────────────────────────────
 【吸筹 🟢buy】主力在低位悄悄建仓
-  P1 低位底盘吸筹确认  120日低分位 + 60日横盘 + 波动压缩/底部不再下移，连续3日后首次确认；
-                       叠加低位集中筹码成本与沪深300 ETF趋势/修复门；双池计算，仅小盘回测有效
-  P2 低位影线吸筹      位置<0.40 + 当日为十字星/长下影 + 近10日同类K线≥5根(下影>2×实体且>1.5%)
-  P3 缩量打压首次收复  位置<0.35 + 近8日有"大阴跌≥4.5%且缩量(<0.85×此前20日均量)"，
-                       期间不深破底并首次完整收复跌前收盘：隐性吸货确认
-  P4 量增价稳吸收      位置<0.60 + 量比>1.2 + |漂移|<6% + CMF>0：放量但价稳、资金净流入
-  P5 底部形态构筑      位置<0.45 + 近端两摆动低点等高/低点抬高(-4%~+8%) + 中间反弹≥6%(颈线) + 当前价回升未破颈线：双底/W底
-  P23 箱体波动压缩     位置<0.60 + 近20日振幅<0.80×近60日：波动收窄蓄势
+  P1 超额优先复合确认  原低位缩量企稳连续2日首次确认，或低位首次突破前10日最高收盘
+                       且通过510310五条件日终风险门；两腿任一命中即触发，小盘更有效
+  P2 低位影线吸筹      位置<0.40 + 近10日真实长下影≥2根(下影≥2×实体且≥2%)
+                       + 当日量能为此前20日均量的0.4~1.0倍，且当日自身再次出现长下影；大盘更有效
+  P3 缩量打压首次收复  位置<0.32 + 近10日有"收盘跌≥4.2%且量<此前20日均量"，
+                       期间收盘最多再破底6%，只在真正首次完整收复跌前收盘时确认
+  P4 量增价稳观察      位置<0.60 + 量比1.2~2.5 + |漂移|<6% + CMF>0，首次进入时报告；
+                       双池留出未验证为买点，不驱动绿色吸筹阶段
+  P5 双底右腿确认      位置<0.45 + 两摆动低点(-2%~+10%) + 颈线反弹≥5% + 二底后8日内
+                       收盘触及颈线，且由昨日未突破切换为今日突破近3日收盘高点：W底右腿事件；小盘更有效
+  P23 低位压缩温和量能转强 位置<0.36 + 近20/60日振幅比<0.96 + 收盘≥1.005×MA20；
+                       结构首次成立，且仅信号日量能/此前20日均量在0.4~1.2
   P24 OBV底背离        位置<0.50 + 30日价≤+3% + OBV净流入>0.10 + 背离>0.25，连续5日后首次确认
-  P25 低位横盘缩量后启动  120日低位 + 60日严格横盘缩量 + 量能启动 + 临近20日平台
-  P26 获利盘风险            获利盘≥90%或5日前<40%且当前≥60%，并且当日量能≥此前20日均量1.5倍
+  P25 中低位缩量平台转强  120日中低位 + 60日横盘缩量 + 20日价格转正 + 临近20日平台
 【试盘 🟡hold】拉升前试探上方抛压
   P6 试盘长上影        近8日有长上影(>3%且>2×实体)创20日新高后收盘缩回；保留形态观测，不作为有效因子
   P7 底部异动放量      位置<0.40 + 量比>1.5 + 近5日最大振幅>7%；保留形态观测，不作为有效因子
@@ -48,7 +56,7 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P8 缩量回踩洗盘      站上MA20 + 回踩近10日高点-2%~-15% + 跌日量<涨日量 + 筹码集中≥0.40：挖坑不破位
   P9 边拉边洗          多头排列(MA5>10>20) + 近8日涨跌符号切换≥4次 + 低点抬高：边拉边洗
   P10 高换手洗盘       量比>1.5 + 收盘>MA20 + 筹码集中≥0.45：高换手震仓但筹码峰不发散
-  P21 假跌破收回       近5日假摔穿前40日箱体下沿×0.985、收盘又站回：Wyckoff spring(各周期不显著,40日+1.15%弱)
+  P21 深破缩量收回     近5日深破前40日箱底≥2.5%、收盘站回 + 当日量≤前20日均量0.75倍；双池10~40日正向
 【突破 🟠hold（阶段标签，优先级仅次出货）】放量右进
   P11 放量突破启动     右进左出触发器命中：从低/中位放量(>1.3×)突破近20日收盘高点；全历史复测为负向风险
 【拉升 🟠hold】超短动量，持有期拉长需防反转
@@ -56,18 +64,21 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P13 首板卡位         今日首板(近20日无涨停) + 换手10%~45%；复测 2 日动量有效
 【出货 🔴sell】高位派发，当风控示警
   P14 高位放量滞涨     位置≥0.85 + 量比>1.5 + 近5日涨幅≤2% + 上影>2%；复测 40 日风控有效
-  P15 量价背离         创60日新高却缩量(量比<1.0)、或放量(>1.8)却5日涨幅<1%：量价背离顶
-  P16 阴天量           位置≥0.80 + 近5日出现40日最大量且收阴；全历史复测 2~40 日风控有效
-  P17 倒V反转          位置≥0.80 + 较前期冲高>15%后从峰值回落≤-8%；复测 2~40 日持续有效
+  P15 新高量背离放量回撤 前15日出现旧P15新高量背离 + 距近10日盘中高点回撤≥4% + 单日量比>1.5
+  P16 阴天量回撤确认   位置≥0.80 + 近3日出现40日最大量且收跌 + 距近10日最高价回撤≥3%；
+                       全历史双池 2~40 日胜率与同池超额均低于旧版
+  P17 新鲜倒V反转      位置≥0.80 + 冲高>16%后回撤≥8% + 峰值首次出现于最近5根 + 信号日不反弹；双池2~40日增强
   P18 顶部大阴包阳      位置≥0.80 + 昨阳今阴且今实体完全吞没昨实体：顶部看跌吞没
   P19 灌压巨量大阴      位置≥0.70 + 量比>1.8 + 实体跌>6%且收在当日价区下1/4；复测 5~40 日风控有效
-  P20 均线放量破位      收盘跌破MA20(5日前还在MA20上方) + 量比>1.2；全历史复测 2~40 日风控有效
+  P20 均线放量破位      收盘跌破MA20(第5根bar仍在MA20上方) + 量比>1.3 + 当日跌≥1%；双池复测 2~40 日风控有效
   P22 放量假突破        今日盘中破前40日高但收盘没站上 + 当日放量>1.8×；全历史复测 2~40 日风控有效
+  P26 获利盘冲高回撤风险 获利盘≥90%或5日前<40%且当前≥60% + 当日量≥前20日均量2倍
+                       + 近5日涨≥5% + 收盘较近10日最高价回撤≥3%；双池覆盖与负向效果通过复测
 
-当前跨池核心有效集（2026-07-11 全历史逐日滚动，HAC + FDR）：
-P3、P11、P12、P13、P14、P16、P17、P19、P20、P22、P24。
+当前跨池核心有效集（P15/P21于2026-07-15按双池复测加入，P5为产品口径临时有效）：
+P1、P2、P3、P5、P11、P12、P13、P14、P15、P16、P17、P19、P20、P21、P22、P24、P26。
 P6、P7 保留命中数据用于后续研究，但不作为有效因子或前端高亮。
-P1/P25 会在所有股票池计算并各占吸筹分5%；两者仅小盘池回测有效，不进入跨池 PATTERN_EFFECTIVE。
+P1/P3/P21各占吸筹分10%；P2/P5/P23/P24/P25各占5%，其中P23/P25仍保留实验标签。
 ─────────────────────────────────────────────────────────────────────────────
 
 Modes:
@@ -112,7 +123,8 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
      · 出货类经验证有效：P19 灌压巨量大阴 40日超额 -4.97%、P20 均线放量破位 -1.39%(t-2.16)。
        · P20 位置分桶：低位<0.6 命中930(占74%) 40日 -1.41%(t-2.03 显著)；高位≥0.6 仅321且不显著(t-0.85)。
          即「低位放量破位」=失败反弹/下跌中继才是 P20 主体信号，**不可按位置门控**(加门槛会扔掉74%有效信号)；
-         故低位股「吸筹分高却命中出货预警(P20)」是正确预警而非 bug——结构因子漏掉、形态层补上的真实风险。
+         故低位股命中 P20 仍是有效风险证据而非 bug——结构因子漏掉、形态层补上的真实风险；
+         当前命中 P20 即直接升级为「出货预警」。
      · buy 类多为反转陷阱(P8 洗盘 -1.17%/t-3.0、P10 -1.61%/t-3.0)；唯 P3 缩量阴线打压吸筹
        +3.35%/60日+3.94%(t1.47 近显著)有正向苗头。拉升类 P11/P12 负超额，追入=接盘。
      · P5 底部形态构筑(双底/W底, 后补)→ 命中2080, 20/40/60日 -0.65%/-0.84%/-0.82%(t-1.46)，
@@ -239,7 +251,7 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
        但 hotmoney 池 P12 10/20/40 日 -3.22%/-5.53%/-8.33%，P13 20/40 日 -2.33%/-4.06%。
      · 最强风控为 P19（hotmoney 2~40 日 -2.31%~-5.90%），其次 P17、P16、P22、P14；
        P11/P20 也是双池负向风险。P6/P7 的信号较弱且稳定性不足，降级为观察形态。
-     · 单池次级信号：旧P2/P24仅hotmoney中长期弱正；P15/P18仅hotmoney 20日负向。
+     · 单池次级信号：旧P2/P24仅hotmoney中长期弱正；旧P15/P18仅hotmoney 20日负向。
        它们统计显著但跨池证据不足，不进入 PATTERN_EFFECTIVE。
      · 局限：当前成分股口径存在幸存者偏差；收盘到收盘收益未计交易成本、涨跌停与可买性。
  19) 【2026-07-11 P2阈值专项】原“15日≥3次”命中 leader/hotmoney 39.70万/14.63万，命中率34.64%/30.37%。
@@ -250,12 +262,13 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
      命中率2.10%，全样本10/20/40日超额+0.13%/+0.49%/+0.82%。该触发式规则跨时段证据较弱，继续作为实验标签。
  20) 【2026-07-11 P23/P24低频确认优化】双池全历史网格比较严格阈值、连续3/5日确认与一次性触发；所有池参数相同。
      · P23 严格候选曾加入振幅比<0.65、20日箱体<15%、20/60日量能比<0.90及连续5日首次确认，命中降至
-       1,178/577，但HAC/FDR仍未通过。按后续使用要求，生产P23恢复原“位置<0.60 + 振幅比<0.80”状态规则；
-       严格候选只保留在研究文件，不接入生产。
+       1,178/577，但HAC/FDR仍未通过。按当时使用要求，生产P23曾恢复原“位置<0.60 + 振幅比<0.80”
+       状态规则；当前事件化版本见(29)。
      · P24 改为位置<0.50、30日涨幅≤3%、量纲化OBV>0.10、OBV与价格背离>0.25，并连续5日后首次确认。
        命中由138,093/65,937降至1,144/677；10日超额+0.67%/+0.82%，绝对胜率56.5%/64.5%，双池10日
        均通过HAC与BH-FDR 10%，因此加入 PATTERN_EFFECTIVE。
-  21) 【2026-07-11 P3首次收复优化】旧P3把信号日附近30日均量用于更早的下跌日，且一次下跌会连续多日重复命中；
+  21) 【2026-07-11 P3首次收复优化】旧P3把信号日附近30日均量用于更早的下跌日，且同一事件在收复后跌回、
+     再次收复时仍可能重复命中；
      改为下跌日只和此前20日均量比较，并要求8日内首次完整收复跌前收盘、期间不深破底、确认日不过度放量。
      参数只用2017-2023开发段排序，2024+留出不参与选参；leader/hotmoney 两池始终使用同一规则。
      · 生产参数：位置<0.35、跌幅≥4.5%、下跌量比<0.85、8日内完整收复、最多再破底3%、确认日量比≤1.30。
@@ -263,16 +276,106 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
        hotmoney +0.46/+1.04/+0.70/+0.92/+2.36%，十个池×周期全部为正。
      · leader 2日与 hotmoney 5日通过各池24×5次检验的BH-FDR 10%，因此P3重新加入 PATTERN_EFFECTIVE；
        仍存在当前成分股幸存者偏差，且未计交易成本与涨跌停可买性。
- 22) 【2026-07-12 P25统一升级】按使用决定，将严格缩量底部方案作为全池统一 P25，不再区分
+ 22) 【历史结果，已由(33)替代；2026-07-12 P25统一升级】按使用决定，将严格缩量底部方案作为全池统一 P25，不再区分
      leader/hotmoney 公式，并删除沪深300站上MA20门槛。判据为120日位置≤45%、60日振幅≤25%、60日绝对涨跌≤8%、近20日/前40日均量≤70%、
      60日量能斜率≤-1%、当日量≥前20日均量1.5倍、距20日平台≥-2%；保留防追高门槛。
      · leader 1,296次：2/5/10/20/40日同日池超额 -0.11%/-0.10%/-0.34%/-0.58%/-1.77%。
      · hotmoney 282次：2日约0%，5/10/20/40日 +0.39%/+0.63%/+1.51%/+1.46%，但FDR均未通过。
      · 结论：P25在所有池统一计算，继续作为实验标签，不加入 PATTERN_EFFECTIVE。
- 23) 【2026-07-13 P1/P25双池计分】统一180日回看复测显示，两者在leader池各周期同池超额均为负；
+ 23) 【历史P25结果，已由(33)替代；2026-07-13 P1/P25双池计分】统一180日回看复测显示，两者在leader池各周期同池超额均为负；
      hotmoney池P1 5/10/20日超额+1.20%/+1.08%/+1.54%，P25 10/20/40日+0.57%/+1.36%/+1.33%。
-     按产品决定仍让P1/P25在leader/hotmoney双池触发并各占吸筹分5%，但前端和目录统一标注“仅小盘有效”；
+     当时按产品决定仍让P1/P25在leader/hotmoney双池触发并各占吸筹分5%，前端和目录曾标注“仅小盘有效”；
      筹码集中权重由20%降至10%，其余七项权重不变。P1/P25不加入跨池PATTERN_EFFECTIVE。
+ 24) 【2026-07-13 P1简化扩容】当前hotmoney成分全历史复测：删除无增量的20日收盘区间门、现价高于
+     筹码峰上限和获利盘上限，并把60日最高/最低振幅由≤25%放宽至≤30%；三日确认、市场门和其余保护门不变。
+     · 10日事件117→147（+25.6%），信号日99→123（+24.2%），胜率59.0%→63.3%，同池超额
+       +1.13%→+1.44%，HAC t 2.12→2.67；2017–2022、2023–2024、2025+三段均为正超额。
+     · 获利盘下界继续保持20%；降到15%虽可把事件扩到170，但早期段超额由+0.46%降至+0.18%，不取。
+     · leader池不满足扩容守门：range放宽后10日胜率下降1.62pct、40日负超额加深，故P1仍只标“小盘有效”。
+ 25) 【2026-07-13 P2真实长下影+量能优化】删除“普通十字星也算影线”的旧口径，统一改为位置<0.40、
+     近10日真实长下影≥2次（下影≥2×实体且≥昨收2%，当日必须命中），只叠加当日/此前20日均量0.4~1.0。
+     · leader/hotmoney命中7,118/2,604，命中率0.386%/0.532%；10日超额+0.459%/+0.457%，
+       绝对胜率54.58%/60.60%；20日超额+0.827%/+0.915%，绝对胜率54.73%/61.94%。
+     · 同一2%影线阈值下，测试的12组相邻量比区间全部保持双池10/20日正超额；1.8%/2.0%/2.2%
+       三档影线阈值在量比0.4~1.0时也全部为正。该方案仍是全样本探索结果，不宣称严格样本外。
+     · 2日leader仍为负超额，P2定位为5~20日承接观察信号；本轮研究完成时暂未加入有效集或吸筹总分。
+ 26) 【2026-07-13 P2生产计分】按产品决定将P2加入PATTERN_EFFECTIVE并在前端使用绿色bullish样式；
+     吸筹模型的价格位置权重由20%降至10%，腾出的10%全部分配给P2。其余八项权重不变，总权重仍为100%。
+  27) 【2026-07-13 P3严格首次+降耗优化】修复旧规则在“收复→跌回→再收复”时对同一打压事件重复
+     触发的问题；当前规则为位置<0.32、近10日收盘跌≥4.2%、事件量比<1.00、最多再破底6%、
+     确认量比≤1.35，并要求事件后到昨日从未收复，今日才真正首次完整站回跌前收盘。
+     · leader命中1,854/1,845,270（0.1005%），2/5/10/20/40日同池超额
+       +0.41%/+0.74%/+1.30%/+1.29%/+1.64%，胜率53.5%/53.1%/59.4%/58.7%/54.3%。
+     · hotmoney命中980/489,420（0.2002%），同池超额+0.76%/+1.53%/+2.23%/+2.47%/+4.02%，
+       胜率55.8%/54.6%/59.6%/63.1%/52.4%；2024+收益在参数冻结后揭盲，双池10日超额仍为正。
+     · 复用上下文确认量比、用收盘直接推导跌幅，并先做O(1)价格短路、只对候选跌日计算量均；
+       虽把事件窗从8日放宽到10日，隔离matcher微基准仍明显快于旧生产实现。
+ 28) 【2026-07-13 P1双池替换】旧“长期底盘+筹码+510310市场门”覆盖不足且leader超额为负，生产改为
+     pos60<40%、|ret20|≤4%、收盘/MA20≥0.995、收阳、当日量能/此前20日均量0.4~1.0，连续2日后首次确认。
+     删除120日分位、60日振幅/收益、波动/低点路径、筹码和市场门；leader/hotmoney始终使用同一规则。
+     · 全历史命中4,185/1,007，覆盖率0.227%/0.206%；10日胜率55.03%/55.51%，同池超额
+       +0.46%/+1.19%，HAC t=2.79/2.38。
+     · ≤2024开发段双池胜率53.41%/52.66%、超额+0.48%/+1.49%；2025+时间留出胜率
+       63.61%/63.92%、超额+0.37%/+0.23%。留出HAC尚未显著，继续前瞻观察。
+ 29) 【2026-07-13 P23低位压缩事件化】原状态型P23覆盖leader/hotmoney 11.34%/13.62%，leader各周期
+     超额为负。约1,300个不超过两个附加门的候选统一比较后，保留“位置<0.40、振幅比<0.80，
+     核心状态由昨日不成立转为今日首次成立，且收盘≥MA20”；两个池使用同一规则，主持有期10日。
+     · leader命中5,160/1,845,270（0.280%），10日胜率50.2%、同池超额+0.17%、HAC t=1.05；
+       hotmoney命中1,623/489,420（0.332%），10日胜率51.8%、同池超额+0.22%、HAC t=0.83。
+     · ≤2023/2024+的10日超额leader为+0.10%/+0.37%，hotmoney为+0.24%/+0.18%，四段胜率均>50%；
+       但双池HAC均未显著，且leader 20/40日超额为负，故P23仅作10日实验信号，不加入PATTERN_EFFECTIVE。
+     · 相比原规则只收紧既有位置阈值并新增“首次进入、站上MA20”两项；仍为固定窗口O(LOOKBACK)，
+       不增加数据源、筹码重建或数据库查询。研究结论存在当前成分股幸存者偏差，且未计交易成本与可买性。
+ 30) 【2026-07-13 P4双池否定与中性化】原P4覆盖leader/hotmoney 2.480%/2.236%，2/5/10/20/40日
+     同池超额全部为负；10日胜率49.0%/49.6%、超额-0.38%/-0.16%。按≤2023开发、2024验证、
+     2025+最终留出冻结参数，在原四变量与最多两个低成本门内，没有方案同时满足三段双池胜率>50%、
+     超额>0和0.1%~2%覆盖率，故不强选买入版本。
+     · 生产仅修复规格漂移：量比恢复为(1.2,2.5]，核心状态只在False→True首次进入日报告；命中率
+       1.174%/1.057%，但10日超额仍为-0.40%/-0.16%，因此signal改为observe，不进入有效集或吸筹分，
+       也不再单独驱动绿色吸筹阶段。完整研究见meta_data_backup/p4_factor_optimization.md。
+     · 昨日P4只重算固定180日价量上下文，不建筹码、不查新数据，复杂度仍为O(LOOKBACK)。
+ 31) 【2026-07-13 P5双底右腿确认】旧P5是二底后可连续多日成立的宽松回升状态，
+     leader/hotmoney命中率5.163%/5.550%，10日胜率46.4%/47.6%、同池超额-0.35%/-0.10%。
+     生产保留W底主体，把二底区间调为-2%~+10%、颈线反弹调为≥5%，收盘收紧到颈线的100%~103%；
+     只额外增加“二底在近8日”和“昨日未突破→今日突破前3日收盘高点”两项，并删除筹码门。
+     · leader命中2,142/1,845,270（0.1161%），10日胜率55.2%、同池超额+0.35%、HAC t=1.34；
+       hotmoney命中641/489,420（0.1310%），10日胜率63.8%、超额+0.84%、HAC t=1.58。
+     · 两池早晚分段的10日胜率与超额均为正，但双池HAC/BH-FDR未过门槛，故只作10日观察信号，
+       不加入PATTERN_EFFECTIVE或吸筹分。固定60日收盘扫描不增加复杂度量级，详见p5_right_leg_research.md。
+  32) 【2026-07-13 P5生产计分】按产品决定将P5作为5%原始特征加入吸筹分，同时把P3由20%降至15%；
+     其余权重不变，总权重仍为100%。P5继续保留观察信号与非PATTERN_EFFECTIVE状态，计分不改变统计验证标签。
+ 33) 【2026-07-13 P25双池低频扩容】旧P25用“当日量≥前20日均量1.5倍”确认启动，双池命中率仅
+     0.071%/0.059%，且leader 10/20日同池超额-0.31%/-0.52%。受限研究只替换两项确认：删除爆量门，
+     改为20日价格涨幅≥0.5%；距前20日最高收盘由-2%放宽为-4%。底盘既有阈值同步放宽为120日分位≤65%、
+     60日振幅≤35%、|60日涨跌|≤16%、量能斜率≤-0.5%，近20/前40均量≤70%保持不变。
+     · leader命中24,466/1,845,270（1.326%），10/20日胜率52.4%/53.1%，超额+0.24%/+0.46%；
+       hotmoney命中6,136/489,420（1.254%），胜率53.7%/53.9%，超额+0.55%/+0.86%。
+     · ≤2023与2024+四个池段的10/20日胜率和超额均为正；ret20取0%~0.5%、平台距离取-4%~-3%的
+       六个邻域也保持方向不变。hotmoney 10/20日HAC t=2.08/1.99，leader仅1.35/1.36，且逐年仍有波动，
+       因此P25继续作为双池实验形态、主持有期10~20日，不加入PATTERN_EFFECTIVE。
+ 33) 【2026-07-13 P5临时有效】按产品决定暂时将P5加入PATTERN_EFFECTIVE并使用bullish样式；
+     5%吸筹权重和10日主持有期不变，历史显著性限制仍保留在研究记录中。
+ 34) 【2026-07-14 P23覆盖与质量二次优化】以当时生产P23（位置<0.40、振幅比<0.80、核心状态首次成立且
+     收盘≥MA20）为严格基线；新规则改为“位置<0.36、振幅比<0.96、收盘≥1.005×MA20”结构状态
+     False→True，再只对信号日加量能/此前20日均量0.4~1.2；量能不参与状态去重。
+     · 冻结快照生产等价复核：leader 12,461/1,837,526（0.6781%），10日胜率51.83%、同池超额
+       +0.3315%、HAC t=2.62；基线为0.2796%/50.16%/+0.1541%/0.97。
+     · hotmoney 3,715/496,233（0.7486%），胜率52.19%、超额+0.5290%、HAC t=2.66；基线为
+       0.3319%/51.55%/+0.1825%/0.70。双池覆盖均进入0.5%~2%，全历史胜率和超额均严格提高。
+     · hotmoney 2024+分段胜率52.26%→51.61%，虽超额+0.13%→+0.69%，仍须前瞻观察；未做完整FDR重验，
+       P23继续作10日实验信号。仅新增一个低成本当日量能门，复用已有上下文，仍为O(LOOKBACK)且无新查询。
+ 35) 【2026-07-15 P21深破缩量收回】旧规则只要求近5日跌穿前40日箱底1.5%并站回，是可连续命中的宽状态；
+     leader/hotmoney覆盖3.907%/4.172%，10日胜率53.24%/53.88%，但同池超额-0.102%/-0.210%。
+     新规则把最低跌破收紧到2.5%，只叠加“信号日量能/此前20日均量≤0.75”一个既有指标；量能优先换手率，
+     近180日换手覆盖不足70%时退回成交量。它识别深破后的缩量收回，避免把普通反弹与放量真破位混入。
+     · leader命中11,402/1,828,471（0.624%），10/20/40日胜率54.53%/56.44%/54.45%，同池超额
+       +0.332%/+0.510%/+1.346%；hotmoney命中4,566/500,359（0.913%），胜率56.44%/63.78%/60.91%，
+       超额+0.421%/+1.327%/+1.949%。开发段与2024+的双池10/20日胜率、超额均为正。
+     · False→True事件化会把覆盖压到0.259%/0.405%，低于0.5%业务下限且近期小盘超额转负；限制最大跌破5%
+       也会令leader覆盖降到0.486%。故保留最多5日的状态口径且不设最大深度。P21加入核心有效集，继续只作
+       洗盘阶段标签/买点，不改变吸筹总分权重；固定窗口与既有量能上下文使复杂度仍为O(LOOKBACK)。
+ 36) 【2026-07-17生产展示与权重调整】按产品决定，因子描述与命中形态解释明确标注P1/P5小盘更有效、
+     P2大盘更有效；吸筹分中P5由10%降至5%，P21由5%提高到10%，其余权重不变，总权重仍为100%。
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -280,6 +383,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+from concurrent.futures import ProcessPoolExecutor
 import json
 import math
 import re
@@ -294,12 +398,14 @@ import numpy as np
 import requests
 
 import stock_storage
+from stock_etf_pool import load_etf_pool
 
 
 ROOT = Path(__file__).resolve().parent
 DATA_DIR = ROOT / "data"
 CAPITAL_DIR = DATA_DIR / "capital"
 DB_FILE = stock_storage.DEFAULT_DB_FILE
+ETF_REFRESH_REPORT_FILE = DATA_DIR / "etf_pool_refresh_report.json"
 AMBUSH_RESULT_FILE = CAPITAL_DIR / "hot_money_ambush.json"
 THEME_CANDIDATES_FILE = CAPITAL_DIR / "theme_candidates.json"   # stock_theme_candidates.py 落盘
 WATCH_STATE_FILE = CAPITAL_DIR / "hot_money_watch.json"
@@ -344,41 +450,114 @@ CHIP_WINNER_RISK_PRIOR_MAX = 0.40  # P26：N 日前获利盘仍低于 40%
 CHIP_WINNER_RISK_CURRENT_MIN = 0.60  # P26：当前快速跃升到 60% 以上
 CHIP_WINNER_RISK_VOLUME_BASE_WIN = 20  # P26：当日量能对比此前 N 日均量
 CHIP_WINNER_RISK_VOLUME_MIN_OBS = 15   # P26：此前窗口至少 15 个有效量能点
-CHIP_WINNER_RISK_VOLUME_RATIO_MIN = 1.50  # P26：获利盘风险必须有放量确认
+CHIP_WINNER_RISK_VOLUME_RATIO_MIN = 2.00  # P26：获利盘风险必须有极端放量确认
+P26_RET_5_MIN = 0.05              # P26：先有近5日快速拉升，才把获利盘拥挤解释为冲高风险
+P26_PEAK_HIGH_DAYS = 10           # P26：价格走弱确认所用近端盘中高点窗口（含信号日）
+P26_PEAK_DRAWDOWN_MIN = 0.03      # P26：当前收盘至少较近10日最高价回撤3%
 SEALED_AMP = 0.005       # 日内振幅 ≤ 0.5% 视为一字封死板
 TURNOVER_COVERAGE = 0.7  # 近端窗口换手率覆盖率达标才用换手率，否则退回成交量
-SUSPECT_ACCUM_SCORE = 65  # 无形态命中但吸筹分≥此值 → 疑似吸筹(待确认)；低于则观望
-COMPRESS_AMP_RATIO = 0.80  # 近20日振幅 < 此倍×近60日振幅 → 波动压缩(酝酿)
+# 疑似吸筹是“完全没有生产形态确认，但原始吸筹分已进入高分尾部”的弱买点。
+# 普通股无形态理论上限为40；股东数据缺失但有回购时为35，公司资金面完全缺失时为30。
+# ETF 排除公司行为因子后重新归一，无形态理论上限约29.41，因此35分口径下不会产生ETF疑似吸筹点。
+SUSPECT_ACCUM_SCORE = 35.0  # 仅 fired 为空且吸筹分达标 → 疑似吸筹(待确认)
+SUSPECT_ACCUM_PATTERN_CODE = "SUSPECT_ACCUM"
+COMPRESS_AMP_RATIO = 0.96  # P23：近20日振幅 < 此倍×近60日振幅
+P23_POSITION_60_MAX = 0.36  # P23：近60日收盘位置分位严格小于36%
+P23_MA20_FLOOR = 1.005      # P23：确认状态须收盘至少高于MA20 0.5%
+P23_DAY_VOLUME_RATIO_MIN = 0.40  # P23：当日量能/此前20日均量下界（含）
+P23_DAY_VOLUME_RATIO_MAX = 1.20  # P23：当日量能/此前20日均量上界（含）
 PATTERN_CONFIRM_DAYS = 5   # P24：连续确认后只在首次成立日触发一次
 OBV_POSITION_MAX = 0.50
 OBV_PRICE_RETURN_MAX = 0.03
 OBV_RETURN_MIN = 0.10      # P24：30日量纲化OBV净流入下限
 OBV_DIV_MIN = 0.25         # P24：OBV净流入(量纲化)−价格涨幅的最小背离
-P2_WINDOW = 10             # P2：近X日反复出现十字星/长下影（参数研究见纪要19）
-P2_MIN_COUNT = 5           # P2：X日内至少Y次，且当日自身必须是其中一次；所有池参数相同
-P1_POSITION_120_MAX = 0.45
-P1_RANGE_60_MAX = 0.25
-P1_ABS_RET_60_MAX = 0.08
-P1_CLOSE_RANGE_20_MAX = 0.14
-P1_RET_20_MIN = -0.02
-P1_RET_20_MAX = 0.04
-P1_AMP_RATIO_MAX = 0.85
-P1_MA20_FLOOR = 0.98
-P1_LOW_HOLD_FLOOR = 0.98
-P1_CONFIRM_DAYS = 3
-P1_CHIP_CONCENTRATION_MIN = 0.40
-P1_CHIP_PEAK_PCTILE_MAX = 0.50
-P1_PRICE_TO_PEAK_MIN = -0.03
-P1_PRICE_TO_PEAK_MAX = 0.08
-P1_WINNER_MIN = 0.20
-P1_WINNER_MAX = 0.70
-P25_POSITION_120_MAX = 0.45
-P25_RANGE_60_MAX = 0.25
-P25_ABS_RET_60_MAX = 0.08
+P2_WINDOW = 10             # P2：近X日反复出现真实长下影（优化研究见纪要25）
+P2_MIN_COUNT = 2           # P2：X日内至少Y次，且当日自身必须是其中一次；所有池参数相同
+P2_LOWER_SHADOW_MIN = 0.020
+P2_SHADOW_BODY_RATIO_MIN = 2.0
+P2_DAY_VOLUME_RATIO_MIN = 0.40
+P2_DAY_VOLUME_RATIO_MAX = 1.00
+P3_POSITION_MAX = 0.32
+P3_DROP_MIN = 0.042
+P3_EVENT_WINDOW = 10
+P3_EVENT_VOLUME_RATIO_MAX = 1.00
+P3_UNDERCUT_MAX = 0.06
+P3_CONFIRM_VOLUME_RATIO_MAX = 1.35
+P5_POSITION_MAX = 0.45
+P5_SECOND_LOW_RETURN_MIN = -0.02
+P5_SECOND_LOW_RETURN_MAX = 0.10
+P5_NECK_REBOUND_MIN = 0.05
+P5_SECOND_LOW_RECENCY_MAX = 8
+P5_RIGHT_LEG_BREAKOUT_WIN = 3
+P5_NECK_RATIO_MIN = 1.00
+P5_NECK_RATIO_MAX = 1.03
+P5_FLOAT_EPSILON = 1e-12
+P15_EVENT_HIGH_DAYS = 60
+P15_EVENT_LOOKBACK_DAYS = 15
+P15_EVENT_LOW_VOLUME_RATIO_MAX = 1.00
+P15_EVENT_HIGH_VOLUME_RATIO_MIN = 1.80
+P15_EVENT_RET5_MAX = 0.01
+P15_PULLBACK_HIGH_DAYS = 10
+P15_PULLBACK_MIN = 0.04
+P15_DAY_VOLUME_RATIO_MIN = 1.50
+P15_DAY_VOLUME_BASE_DAYS = CHIP_WINNER_RISK_VOLUME_BASE_WIN
+P15_DAY_VOLUME_MIN_OBS = CHIP_WINNER_RISK_VOLUME_MIN_OBS
+# 当前确认日需要额外保留15根，才能按每个历史事件当日的完整180根窗口
+# 复算量源；评分上下文本身仍只取末尾LOOKBACK根，不增加因子维度。
+PATTERN_EVAL_BARS = LOOKBACK + max(CHIP_WINNER_RISK_DAYS, P15_EVENT_LOOKBACK_DAYS)
+P16_POSITION_MIN = 0.80
+P16_MAX_VOLUME_DAYS = 40
+P16_EVENT_RECENCY_DAYS = 3
+P16_PEAK_HIGH_DAYS = 10
+P16_PEAK_DRAWDOWN_MIN = 0.03
+P17_POSITION_MIN = 0.80
+P17_RECENT_DAYS = 10
+P17_BASE_DAYS = 6
+P17_RUNUP_MIN = 0.16
+P17_PULLBACK_MIN = 0.08
+P17_PEAK_RECENCY_BARS = 5
+P21_BOX_DAYS = 40
+P21_RECLAIM_DAYS = 5
+P21_UNDERCUT_RATIO_MAX = 0.975
+P21_DAY_VOLUME_RATIO_MAX = 0.75
+P20_VOLUME_RATIO_MIN = 1.30
+P20_DAY_RETURN_MAX = -0.01
+# 与正式 patterns 回测首个锚点完全一致：180 日量度来源窗口 + P26 预留的
+# 5 日筹码回看。P21 本身不使用筹码，但统一资格可避免新股线上命中却不在回测样本中。
+P21_MIN_HISTORY_BARS = LOOKBACK + CHIP_WINNER_RISK_DAYS
+P4_POSITION_MAX = 0.60
+P4_VOLUME_RATIO_MIN = 1.20
+P4_VOLUME_RATIO_MAX = 2.50
+P4_ABS_DRIFT_MAX = 0.06
+P4_CMF_MIN = 0.0
+P1_POSITION_60_MAX = 0.40
+P1_ABS_RET_20_MAX = 0.04
+P1_MA20_FLOOR = 0.995
+P1_DAY_VOLUME_RATIO_MIN = 0.40
+P1_DAY_VOLUME_RATIO_MAX = 1.00
+P1_CONFIRM_DAYS = 2
+P1_VERSION = "p1_excess_priority_v1"
+P1_REPLACED_ON = "2026-07-14"
+P1_BREAKOUT_DAYS = 10
+P1_ADDON_POSITION_60_MAX = 0.45
+P1_ADDON_ABS_RET_20_MAX = 0.06
+P1_ADDON_MA20_FLOOR = 0.995
+P1_ADDON_DAY_VOLUME_RATIO_MIN = 0.20
+P1_ADDON_DAY_VOLUME_RATIO_MAX = 1.20
+P1_MARKET_MA20_FLOOR = 0.99
+P1_MARKET_MA60_FLOOR = 0.95
+P1_MARKET_RET5_MIN = -0.06
+P1_MARKET_RET5_MAX = 0.08
+P1_MARKET_RET20_MIN = -0.05
+P1_MARKET_RET20_MAX = 0.10
+P1_MARKET_MA20_SLOPE5_MIN = -0.015
+P25_POSITION_120_MAX = 0.65
+P25_RANGE_60_MAX = 0.35
+P25_ABS_RET_60_MAX = 0.16
 P25_VOLUME_CONTRACT_MAX = 0.70
-P25_VOLUME_SLOPE_60_MAX = -0.01
-P25_VOLUME_IGNITION_MIN = 1.50
-P25_BREAKOUT_20_MIN = -0.02
+P25_VOLUME_SLOPE_60_MAX = -0.005
+P25_RET_20_MIN = 0.005
+P25_BREAKOUT_20_MIN = -0.04
 
 # 资金面维度（数据由 stock_crawl_holders.py / stock_crawl_capital.py 入库，见纪要(13)）：
 #   股东户数下降/公司回购作为吸筹侧原始特征；龙虎榜上榜进出货侧避雷。
@@ -389,19 +568,24 @@ LHB_TABLE = "lhb_all"                  # code, date(上榜日)
 CAPITAL_EVENT_DAYS = 90                # 回购/上榜：近 N 自然日内有事件视为"近期"
 ACCUM_MODEL_WEIGHTS = {
     "chip": 0.1,                        # 低位筹码集中
-    "position": 0.2,                    # 价格中低位
+    "position": 0.1,                    # 价格中低位
     "cmf_eff": 0.1,                     # CMF 反向有效分：高买压反转风险不加分
-    "p3": 0.2,                          # P3 缩量阴线打压吸筹
-    "p24": 0.1,                         # P24 OBV 底背离：连续确认后的首次成立日
-    "p1": 0.05,                         # P1 长期低位底盘首次确认；双池计分、仅小盘有效
-    "p25": 0.05,                        # P25 低位缩量平台量能启动；双池计分、仅小盘有效
+    "p1": 0.1,                          # P1 两日企稳 OR 首次10日突破+市场门；双池10日有效
+    "p2": 0.05,                         # P2 低位真实长下影 + 温和缩量承接
+    "p3": 0.1,                          # P3 缩量收盘大跌后首次收复
+    "p5": 0.05,                         # P5 双底右腿确认；临时核心有效，小盘更有效
+    "p21": 0.1,                         # P21 深破箱底后缩量收回
+    "p23": 0.05,                        # P23 低位压缩后温和量能转强；实验形态
+    "p24": 0.05,                        # P24 OBV 底背离：连续确认后的首次成立日
+    "p25": 0.05,                        # P25 中低位缩量平台价格转强；双池10/20日正向
     "holder_change": 0.1,               # 股东户数变化：户数降=高分，缺失=中性50
-    "repurchase": 0.1,                  # 公司回购：近90日回购=100，否则0
+    "repurchase": 0.05,                 # 公司回购：近90日回购=100，否则0
 }
 ACCUM_FEATURES = tuple(ACCUM_MODEL_WEIGHTS.keys())
+ETF_ACCUM_EXCLUDED = ("holder_change", "repurchase")
 ACCUM_EXPERIMENT_HORIZONS = (5, 10, 20)
 ACCUM_EXPERIMENT_GRID_STEP = 0.05
-ACCUM_EXPERIMENT_MIN_WEIGHT = 0.1
+ACCUM_EXPERIMENT_MIN_WEIGHT = 0.05
 ACCUM_EXPERIMENT_SPREAD_W = 3.0
 
 # 出货风险分（连续 0~100）：高位 + 阶段涨幅大 + 高位放量 = 派发特征。沿用早期形态研究
@@ -413,24 +597,37 @@ DIST_RUNUP_HI = 0.60     # 涨幅 ≥ 此值 → 满格（已大涨）
 DIST_VOL_LO = 1.5        # 量比 ≥ 此值开始计高位放量
 DIST_VOL_HI = 3.0        # 量比 ≥ 此值 → 满格（天量见天价）
 DIST_MODEL_WEIGHTS = {
-    "p14": 0.10,          # 高位放量滞涨
+    "p14": 0.05,          # 高位放量滞涨
+    "p15": 0.05,          # 新高量背离放量回撤确认
     "p16": 0.10,          # 阴天量
-    "p17": 0.15,          # 倒V反转
-    "p19": 0.15,          # 灌压巨量大阴
+    "p17": 0.10,          # 倒V反转
+    "p19": 0.10,          # 灌压巨量大阴
     "p20": 0.05,          # 均线放量破位
     "p22": 0.05,          # 放量假突破
+    "p26": 0.10,          # 获利盘冲高回撤风险
     "lhb_recent": 0.10,   # 近90日龙虎榜：反向避雷信号
     "technical": 0.15,    # 连续高位派发分：高位 + 20日涨幅 + 高位放量
     "divergence": 0.15,   # 原始 divergence 分，不用 div_eff
 }
 DIST_FEATURES = tuple(DIST_MODEL_WEIGHTS.keys())
+ETF_DIST_EXCLUDED = ("lhb_recent",)
 DIST_EXPERIMENT_HORIZONS = (5, 10, 20)
-DIST_EXPERIMENT_GRID_STEP = 0.1
+DIST_EXPERIMENT_GRID_STEP = 0.05
 DIST_EXPERIMENT_MIN_WEIGHT = 0.1
 DIST_EXPERIMENT_SPREAD_W = 3.0
 EXPERIMENT_VALIDATION_CANDIDATES = 200
 OPPORTUNITY_DISTRIBUTION_PENALTY = 0.5
 OPPORTUNITY_FORMULA = "accumulation_percentile * (1 - 0.5 * distribution_percentile / 100)"
+
+# 阶段“把握”中的出货分支：2017-04-14~2026-06-15、1,110只当前池成分、
+# 130,464个PIT事件上做时间切分校准（<=2023训练、2024选参、2025+留出测试）。
+# 形态代码负责触发出货阶段；样本外结果显示形态身份/数量的可靠度不稳定，因此把握只用
+# 同日可见的吸筹分A与连续出货分D做保守Logistic校准。完整实验见
+# data/capital/hot_money_phase_confidence_experiment.json。
+PHASE_CONFIDENCE_SELL_MODEL_VERSION = "sell_logit_20260715_v1"
+PHASE_CONFIDENCE_SELL_INTERCEPT = 0.04397102
+PHASE_CONFIDENCE_SELL_ACCUMULATION_COEF = -0.60109165
+PHASE_CONFIDENCE_SELL_DISTRIBUTION_COEF = 1.10926961
 
 # 阶段标签按游资操作顺序排列（疑似吸筹→吸筹→试盘→洗盘→突破→拉升→出货，观望=场外）。
 # 表头计数据此从左到右展示；标签字符串须与 _pattern_phase() 的返回值完全一致。
@@ -446,18 +643,20 @@ PHASE_ORDER: Tuple[str, ...] = (
     "观望⚪",
 )
 
-# 出货预警采用形态积分制：弱风险需共振，P17/P19 强风险可单独触发。
-DISTRIBUTION_WARNING_POINTS = {
-    "P14": 2,
-    "P16": 2,
-    "P17": 3,
-    "P19": 3,
-    "P20": 1,
-    "P22": 1,
-    "P26": 3,
-}
-DISTRIBUTION_WARNING_THRESHOLD = 3
+# 形态回测的生产买点：命中任一代码即标记买入。该集合与形态是否属于
+# PATTERN_EFFECTIVE（统计验证标签）相互独立，P23/P25 可按产品口径参与买点。
+PATTERN_BACKTEST_BUY = frozenset({"P1", "P2", "P3", "P5", "P21", "P23", "P24", "P25"})
 
+# 出货预警：下列任一形态命中即触发。按代码去重后每项记1分；保留两个阈值
+# 常量和原 metadata 字段，兼容既有列表、回测与前端消费者。
+DISTRIBUTION_WARNING_PATTERN_CODES = frozenset({
+    "P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26",
+})
+DISTRIBUTION_WARNING_POINTS = {
+    code: 1 for code in sorted(DISTRIBUTION_WARNING_PATTERN_CODES)
+}
+DISTRIBUTION_WARNING_EFFECTIVE_SELL_THRESHOLD = 1
+DISTRIBUTION_WARNING_POINTS_THRESHOLD = 1
 # 市值上限(亿)：传给 --exclude-large-cap 时生效。默认「不剔除/全市值」(用户选择)，
 # 仅在显式 --exclude-large-cap 时启用，用于按市值分层查看小/中盘子集。
 MAX_MARKET_CAP_YI = 300.0
@@ -585,10 +784,10 @@ def _eastmoney_quote_time(value: Any) -> Optional[str]:
 
 def _market_symbol(code: str) -> str:
     code = _clean_stock_code(code)
-    if code.startswith(("6", "9")):
-        return f"sh{code}"
-    if code.startswith(("4", "8")):
+    if code.startswith(("4", "8", "92")):
         return f"bj{code}"
+    if code.startswith(("5", "6", "9")):
+        return f"sh{code}"
     return f"sz{code}"
 
 
@@ -861,6 +1060,51 @@ def fetch_eastmoney_a_spot_quotes(timeout: int = 8) -> Dict[str, Dict[str, Any]]
     return quotes
 
 
+def fetch_eastmoney_etf_spot_quotes(timeout: int = 8) -> Dict[str, Dict[str, Any]]:
+    """东方财富 ETF 快照兜底；基金规模不冒充公司总市值。"""
+    response = requests.get(
+        "https://88.push2.eastmoney.com/api/qt/clist/get",
+        params={
+            "pn": "1", "pz": "10000", "po": "1", "np": "1",
+            "ut": "bd1d9ddb04089700cf9c27f6f7426281", "fltt": "2", "invt": "2",
+            "fid": "f12", "fs": "b:MK0021,b:MK0022,b:MK0023,b:MK0024,b:MK0827",
+            "fields": "f2,f3,f5,f6,f8,f12,f14,f15,f16,f17,f18,f21,f124",
+        },
+        headers={"User-Agent": "Mozilla/5.0", "Referer": "https://quote.eastmoney.com/"},
+        timeout=timeout,
+    )
+    response.raise_for_status()
+    rows = ((response.json().get("data") or {}).get("diff") or [])
+    quotes: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        code = _clean_stock_code(row.get("f12"))
+        if not code:
+            continue
+        quote_time = _eastmoney_quote_time(row.get("f124"))
+        fund_scale = _eastmoney_number(row.get("f21"))
+        quotes[code] = {
+            "code": code,
+            "name": str(row.get("f14") or "").strip(),
+            "price": _eastmoney_number(row.get("f2")),
+            "change_pct": _eastmoney_number(row.get("f3")),
+            "volume": _eastmoney_number(row.get("f5")),
+            "amount": _eastmoney_number(row.get("f6")),
+            "turnover": _eastmoney_number(row.get("f8")),
+            "high": _eastmoney_number(row.get("f15")),
+            "low": _eastmoney_number(row.get("f16")),
+            "open": _eastmoney_number(row.get("f17")),
+            "pre_close": _eastmoney_number(row.get("f18")),
+            "market_cap_yi": None,
+            "fund_scale_yi": round(fund_scale / 1e8, 4) if fund_scale else None,
+            "quote_time": quote_time,
+            "quote_date": quote_time[:10] if quote_time else datetime.now().strftime("%Y-%m-%d"),
+            "source": "eastmoney_etf_spot",
+        }
+    return quotes
+
+
 def fetch_realtime_a_quotes(codes: Sequence[str], timeout: int = 8) -> Dict[str, Dict[str, Any]]:
     """当前雷达实时行情入口：腾讯批量优先，新浪备用，东财全 A 兜底。"""
     clean_codes = [_clean_stock_code(code) for code in codes]
@@ -877,6 +1121,15 @@ def fetch_realtime_a_quotes(codes: Sequence[str], timeout: int = 8) -> Dict[str,
             errors.append(f"{label}: empty")
         except Exception as exc:
             errors.append(f"{label}: {exc}")
+    if any(code.startswith(("1", "5")) for code in clean_codes):
+        try:
+            all_etfs = fetch_eastmoney_etf_spot_quotes(timeout=timeout)
+            quotes = {code: all_etfs[code] for code in clean_codes if code in all_etfs}
+            if quotes:
+                return quotes
+            errors.append("eastmoney_etf_spot: empty")
+        except Exception as exc:
+            errors.append(f"eastmoney_etf_spot: {exc}")
     try:
         all_quotes = fetch_eastmoney_a_spot_quotes(timeout=timeout)
         quotes = {code: all_quotes[code] for code in clean_codes if code in all_quotes}
@@ -895,9 +1148,9 @@ def display_path(path: Path) -> str:
         return str(path)
 
 
-# ── 候选池：细分龙头(is_leader) / 游资小盘universe(is_hot_money) ──
+# ── 候选池：细分龙头 / 游资小盘 / ETF 配置池 ──
 
-POOLS = ("leader", "hotmoney")
+POOLS = ("leader", "hotmoney", "etf")
 DEFAULT_POOL = "leader"
 
 
@@ -909,6 +1162,59 @@ def load_candidates(conn: sqlite3.Connection, pool: str = DEFAULT_POOL,
     max_cap>0 时剔除总市值超过该值(亿元)的股票(按市值分层查看小/中盘子集用)；
     市值缺失会先由 stock_storage 从 stock_history 最新非空 market_cap 回补。max_cap=None/0 不过滤。
     """
+    if pool == "etf":
+        configured = load_etf_pool()
+        codes = [row["code"] for row in configured]
+        validated_codes: Optional[set[str]] = None
+        try:
+            validation_report = json.loads(ETF_REFRESH_REPORT_FILE.read_text(encoding="utf-8"))
+            report_codes = validation_report.get("validated_codes")
+            if (
+                validation_report.get("status") in {"ok", "partial"}
+                and isinstance(report_codes, list)
+            ):
+                validated_codes = {
+                    str(code).zfill(6) for code in report_codes
+                    if str(code).isdigit()
+                }
+        except (OSError, ValueError, TypeError):
+            pass
+        meta: Dict[str, sqlite3.Row] = {}
+        for start in range(0, len(codes), 500):
+            chunk = codes[start:start + 500]
+            placeholders = ",".join("?" for _ in chunk)
+            for row in conn.execute(
+                f"SELECT m.code, m.name, m.instrument_type, "
+                f"EXISTS(SELECT 1 FROM stock_history h WHERE h.code = m.code) AS has_history "
+                f"FROM stock_meta m WHERE m.code IN ({placeholders})",
+                chunk,
+            ).fetchall():
+                meta[str(row["code"]).zfill(6)] = row
+        out: List[Dict[str, Any]] = []
+        for item in configured:
+            code = item["code"]
+            stored = meta.get(code)
+            # 只分析已经过 ETF 刷新链验证并成功入库行情的代码。新改配置需先点
+            # “刷新数据”，避免 LOF/普通股票仅凭六位代码混入 ETF 候选池。
+            if (
+                (validated_codes is not None and code not in validated_codes)
+                or
+                stored is None
+                or str(stored["instrument_type"] or "stock") != "etf"
+                or not bool(stored["has_history"])
+            ):
+                continue
+            category = str(item.get("category") or "ETF")
+            out.append({
+                "code": code,
+                "name": str((stored and stored["name"]) or item.get("name") or f"ETF {code}"),
+                "market_cap_yi": None,
+                "segment_name": category,
+                "parent_segment": category,
+                "asset_type": "etf",
+            })
+        return out
+
     rows = stock_storage.pool_members(conn, pool)
     out: List[Dict[str, Any]] = []
     for row in rows:
@@ -924,6 +1230,7 @@ def load_candidates(conn: sqlite3.Connection, pool: str = DEFAULT_POOL,
             "market_cap_yi": cap,
             "segment_name": row.get("segment_name") or "",
             "parent_segment": row.get("parent_segment") or "",
+            "asset_type": "stock",
         })
     return out
 
@@ -936,7 +1243,7 @@ def load_leader_candidates(conn: sqlite3.Connection,
 
 def _bar(row: sqlite3.Row) -> Dict[str, Any]:
     """把一行日线整成轻量短键 dict（解耦 DB 列名、PIT 切片更快）。"""
-    return {
+    bar = {
         "date": row["date"],
         "open": _safe(row["daily_open"]),
         "high": _safe(row["daily_high"]),
@@ -947,6 +1254,10 @@ def _bar(row: sqlite3.Row) -> Dict[str, Any]:
         "chg": _safe(row["daily_change_pct"]),
         "turnover": _safe(row["daily_turnover_rate"]),
     }
+    # 历史回测的相邻窗口会重复访问同一根 bar 数百次；均价只依赖该 bar，
+    # 入库读取时算一次即可，避免在每个筹码窗口里重复做成交额/成交量换算。
+    bar["_chip_avg_price"] = _bar_avg_price(bar)
+    return bar
 
 
 _BAR_SQL = (
@@ -1150,6 +1461,8 @@ def _score_cmf(bars: List[Dict[str, Any]], vol: List[Optional[float]]) -> Tuple[
 
 def _bar_avg_price(bar: Dict[str, Any]) -> Optional[float]:
     """用成交额/成交量估算均价；不可用时退回典型价，供三角筹码分布作为峰值。"""
+    if "_chip_avg_price" in bar:
+        return bar["_chip_avg_price"]
     h, l, c = bar["high"], bar["low"], bar["close"]
     amount, volume = bar.get("amount"), bar.get("volume")
     if amount and volume and amount > 0 and volume > 0 and h is not None and l is not None:
@@ -1197,16 +1510,63 @@ def _chip_metrics(bars: List[Dict[str, Any]]) -> Optional[Dict[str, float]]:
     if pmax <= pmin:
         return None
     grid = np.linspace(pmin, pmax, CHIP_BUCKETS)
-    chips = np.zeros(CHIP_BUCKETS)
     span = pmax - pmin
-    for lo, hi, peak, t in zip(lows, highs, peaks, turns):
-        frac = min(1.0, max(0.0, t / 100.0 * CHIP_DECAY))   # 当日搬移的筹码比例
-        chips *= (1.0 - frac)                                # 旧筹码按换手衰减
-        i0 = int((lo - pmin) / span * (CHIP_BUCKETS - 1))
-        i1 = int((hi - pmin) / span * (CHIP_BUCKETS - 1))
-        i0 = max(0, i0); i1 = min(CHIP_BUCKETS - 1, max(i0, i1))
-        weights = _triangular_weights(grid[i0:i1 + 1], lo, hi, peak)
-        chips[i0:i1 + 1] += frac * weights / weights.sum()
+    low_array = np.asarray(lows, dtype=float)
+    high_array = np.asarray(highs, dtype=float)
+    peak_array = np.clip(np.asarray(peaks, dtype=float), low_array, high_array)
+    frac_array = np.clip(
+        np.asarray(turns, dtype=float) / 100.0 * CHIP_DECAY,
+        0.0,
+        1.0,
+    )
+
+    # 旧实现逐日创建一个很短的 NumPy 数组，180 日窗口会触发约 180 次
+    # _triangular_weights 调用。这里一次广播生成所有日的三角分布；最终筹码递推
+    #   chips_t = chips_(t-1) * (1-frac_t) + frac_t * day_dist_t
+    # 等价为各日分布按“当日换手 × 后续存活率”加权求和。
+    prices = grid[None, :]
+    lo = low_array[:, None]
+    hi = high_array[:, None]
+    peak = peak_array[:, None]
+    width = hi - lo
+    left_width = np.where(peak > lo, peak - lo, 1.0)
+    right_width = np.where(peak < hi, hi - peak, 1.0)
+    regular = np.where(
+        prices <= peak,
+        (prices - lo) / left_width,
+        (hi - prices) / right_width,
+    )
+    weights = np.where(
+        peak <= lo,
+        (hi - prices) / width,
+        np.where(peak >= hi, (prices - lo) / width, regular),
+    )
+
+    i0 = np.floor((low_array - pmin) / span * (CHIP_BUCKETS - 1)).astype(int)
+    i1 = np.floor((high_array - pmin) / span * (CHIP_BUCKETS - 1)).astype(int)
+    i0 = np.clip(i0, 0, CHIP_BUCKETS - 1)
+    i1 = np.clip(np.maximum(i0, i1), 0, CHIP_BUCKETS - 1)
+    bucket_ids = np.arange(CHIP_BUCKETS)[None, :]
+    weights = np.maximum(weights, 0.0)
+    weights[(bucket_ids < i0[:, None]) | (bucket_ids > i1[:, None])] = 0.0
+    row_sums = weights.sum(axis=1)
+    empty_rows = np.flatnonzero(row_sums <= 0.0)
+    if len(empty_rows):
+        empty_bucket_ids = bucket_ids < i0[empty_rows, None]
+        empty_bucket_ids |= bucket_ids > i1[empty_rows, None]
+        distances = np.abs(grid[None, :] - peak_array[empty_rows, None])
+        distances[empty_bucket_ids] = np.inf
+        nearest = distances.argmin(axis=1)
+        weights[empty_rows, nearest] = 1.0
+        row_sums[empty_rows] = 1.0
+    weights /= row_sums[:, None]
+
+    coefficients = np.empty(len(frac_array), dtype=float)
+    survival = 1.0
+    for index in range(len(frac_array) - 1, -1, -1):
+        coefficients[index] = frac_array[index] * survival
+        survival *= 1.0 - frac_array[index]
+    chips = coefficients @ weights
     tot = chips.sum()
     if tot <= 0:
         return None
@@ -1307,7 +1667,8 @@ def _breakout_trigger(bars: List[Dict[str, Any]], vol: List[Optional[float]]) ->
 
 # ── 游资形态匹配器（P1-P26，规格见 meta_data_backup/hot_money_patterns.md）──────────
 # 每个匹配器输入 (bars, ctx) 返回 bool（命中），PIT 安全（只用窗口内 bar）。
-# 信号方向：buy=吸筹/洗盘(左侧) · hold=拉升(只标记不追) · sell=出货(风控/回避)。
+# 信号方向：buy=吸筹/洗盘(左侧) · hold=拉升(只标记不追) · sell=出货(风控/回避)
+#          · observe=中性结构观察（不驱动主导阶段）。
 
 def _kl_pc(bars: List[Dict[str, Any]], i: int) -> Optional[float]:
     return bars[i - 1]["close"] if i > 0 else None
@@ -1373,22 +1734,45 @@ def _swing_lows(values: List[float], k: int = 3) -> List[int]:
     return lows
 
 
-def _build_pattern_context(code: str, bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+_PRIOR_CHIP_UNSET = object()
+
+
+def _build_pattern_context(
+    code: str,
+    bars: List[Dict[str, Any]],
+    prior_chip: Any = _PRIOR_CHIP_UNSET,
+    defer_chip: bool = False,
+) -> Dict[str, Any]:
     """一次性算齐形态匹配要用的量价上下文（避免每个匹配器各算一遍）。"""
     current_bars = bars[-LOOKBACK:]
     closes = [b["close"] for b in current_bars]
     vol, vol_measure = _volume_series(current_bars)
     score_position, pos = _score_position(current_bars)
     _, vol_ratio = _score_volume_ratio(vol)
-    p26_volume_ratio = _p26_volume_ratio(vol)
+    day_volume_ratio = _p26_volume_ratio(vol)
     score_divergence, drift = _score_divergence(current_bars, vol)
     score_cmf, cmf = _score_cmf(current_bars, vol)
-    score_chip, chip = _score_chip(current_bars)
-    prior_end = len(bars) - CHIP_WINNER_RISK_DAYS
-    prior_start = max(0, prior_end - LOOKBACK)
-    prior_chip = _chip_metrics(bars[prior_start:prior_end]) if prior_end >= MIN_BARS else None
+    if prior_chip is _PRIOR_CHIP_UNSET:
+        prior_end = len(bars) - CHIP_WINNER_RISK_DAYS
+        prior_start = max(0, prior_end - LOOKBACK)
+        prior_chip_bars = bars[prior_start:prior_end]
+    else:
+        prior_chip_bars = []
+    if defer_chip:
+        score_chip, chip = None, None
+        prior_chip_value = None if prior_chip is _PRIOR_CHIP_UNSET else prior_chip
+    else:
+        score_chip, chip = _score_chip(current_bars)
+        if prior_chip is _PRIOR_CHIP_UNSET:
+            prior_chip_value = (
+                _chip_metrics(prior_chip_bars)
+                if len(prior_chip_bars) >= MIN_BARS
+                else None
+            )
+        else:
+            prior_chip_value = prior_chip
     chip_winner = chip.get("winner") if chip else None
-    chip_winner_prior = prior_chip.get("winner") if prior_chip else None
+    chip_winner_prior = prior_chip_value.get("winner") if prior_chip_value else None
     chip_winner_change = (
         chip_winner - chip_winner_prior
         if chip_winner is not None and chip_winner_prior is not None
@@ -1399,7 +1783,7 @@ def _build_pattern_context(code: str, bars: List[Dict[str, Any]]) -> Dict[str, A
     ma = {n: _ma_last(closes, n) for n in (5, 10, 20, 60)}
     ma_bull = bool(ma[5] and ma[10] and ma[20] and ma[5] > ma[10] > ma[20]
                    and closes[-1] and closes[-1] > ma[5])
-    return {
+    context = {
         "code": code, "closes": closes, "vol": vol,
         "pos": pos, "vol_ratio": vol_ratio, "drift": drift, "cmf": cmf,
         "chip": chip, "sealed": sealed, "streak": streak, "triggered": triggered,
@@ -1412,159 +1796,443 @@ def _build_pattern_context(code: str, bars: List[Dict[str, Any]]) -> Dict[str, A
         "chip_winner": chip_winner,
         "chip_winner_prior": chip_winner_prior,
         "chip_winner_change": chip_winner_change,
-        "p26_volume_ratio": p26_volume_ratio,
+        "day_volume_ratio": day_volume_ratio,
+        "p26_volume_ratio": day_volume_ratio,
         "ma5": ma[5], "ma10": ma[10], "ma20": ma[20], "ma60": ma[60], "ma_bull": ma_bull,
     }
+    if defer_chip:
+        context.update({
+            "_chip_deferred": True,
+            "_chip_computed": False,
+            "_prior_chip_computed": prior_chip is not _PRIOR_CHIP_UNSET,
+            "_prior_chip": prior_chip_value,
+            "_chip_bars": current_bars,
+            "_prior_chip_bars": prior_chip_bars,
+        })
+    return context
+
+
+def _ensure_pattern_chip_context(
+    ctx: Dict[str, Any],
+    include_prior: bool = False,
+) -> Optional[Dict[str, float]]:
+    """按需补算形态研究的筹码上下文；实时评分仍走 eager 路径。"""
+    if not ctx.get("_chip_deferred"):
+        return ctx.get("chip")
+    if not ctx.get("_chip_computed"):
+        score_chip, chip = _score_chip(ctx.get("_chip_bars") or [])
+        ctx["score_chip"] = score_chip
+        ctx["chip"] = chip
+        ctx["chip_winner"] = chip.get("winner") if chip else None
+        ctx["_chip_computed"] = True
+    if include_prior and not ctx.get("_prior_chip_computed"):
+        prior_bars = ctx.get("_prior_chip_bars") or []
+        ctx["_prior_chip"] = _chip_metrics(prior_bars) if len(prior_bars) >= MIN_BARS else None
+        ctx["_prior_chip_computed"] = True
+    if include_prior:
+        prior_chip = ctx.get("_prior_chip")
+        ctx["chip_winner_prior"] = prior_chip.get("winner") if prior_chip else None
+        winner = ctx.get("chip_winner")
+        prior = ctx.get("chip_winner_prior")
+        ctx["chip_winner_change"] = (
+            winner - prior if winner is not None and prior is not None else None
+        )
+    return ctx.get("chip")
 
 
 # --- 吸筹 🟢buy ---
 def _p1_low_base_state(bars: List[Dict[str, Any]]) -> bool:
-    """P1底盘状态：长期低位、横而不跌、波动收缩且近期低点不再下移。"""
-    if len(bars) < 121:
+    """P1原始状态：低位窄幅横住、贴近MA20、收阳且温和缩量。"""
+    if len(bars) < HIGH_WIN:
         return False
+    current_bars = bars[-LOOKBACK:]
     try:
-        closes = [float(bar.get("close")) for bar in bars]
-        highs60 = [float(bar.get("high")) for bar in bars[-60:]]
-        lows60 = [float(bar.get("low")) for bar in bars[-60:]]
+        closes = [float(bar.get("close")) for bar in current_bars]
+        open_price = float(current_bars[-1].get("open"))
     except (TypeError, ValueError):
         return False
-    if any(not math.isfinite(value) or value <= 0 for value in closes[-121:] + highs60 + lows60):
-        return False
-
-    close = closes[-1]
-    position120 = sum(1 for value in closes[-120:] if value <= close) / 120.0
-    if position120 > P1_POSITION_120_MAX:
-        return False
-
-    range60 = max(highs60) / min(lows60) - 1.0
-    ret60 = close / closes[-61] - 1.0
-    if range60 > P1_RANGE_60_MAX or abs(ret60) > P1_ABS_RET_60_MAX:
-        return False
-
-    closes20 = closes[-20:]
-    mean20 = _mean(closes20)
-    ret20 = close / closes[-21] - 1.0
-    close_range20 = (max(closes20) - min(closes20)) / mean20 if mean20 else None
     if (
-        close_range20 is None
-        or close_range20 > P1_CLOSE_RANGE_20_MAX
-        or not P1_RET_20_MIN <= ret20 <= P1_RET_20_MAX
+        len(closes) < HIGH_WIN
+        or any(not math.isfinite(value) or value <= 0 for value in closes[-HIGH_WIN:])
+        or not math.isfinite(open_price)
+        or open_price <= 0
     ):
         return False
 
-    amp_ratio = _amp_ratio(bars)
-    ma20 = mean20
-    previous_low = min(lows60[-40:-10])
-    recent_low = min(lows60[-10:])
-    return bool(
-        amp_ratio is not None
-        and amp_ratio <= P1_AMP_RATIO_MAX
-        and close >= P1_MA20_FLOOR * ma20
-        and recent_low >= P1_LOW_HOLD_FLOOR * previous_low
-    )
-
-
-def _p1_chip_cost_state(chip: Optional[Dict[str, float]]) -> bool:
-    """P1筹码成本门：低位单峰密集、现价贴近成本峰且获利盘不过热。"""
-    if not chip:
+    close = closes[-1]
+    position60 = sum(1 for value in closes[-HIGH_WIN:] if value <= close) / HIGH_WIN
+    if position60 >= P1_POSITION_60_MAX:
         return False
-    price_to_peak = chip.get("price_to_peak")
+
+    ma20 = _mean(closes[-20:])
+    reference20 = closes[-21] if len(closes) > 20 else None
+    if (
+        ma20 is None
+        or not reference20
+        or abs(close / reference20 - 1.0) > P1_ABS_RET_20_MAX
+        or close < P1_MA20_FLOOR * ma20
+        or close < open_price
+    ):
+        return False
+
+    volume, _source = _volume_series(current_bars)
+    day_volume_ratio = _p26_volume_ratio(volume)
     return bool(
-        chip.get("concentration") is not None
-        and chip["concentration"] >= P1_CHIP_CONCENTRATION_MIN
-        and chip.get("peak_pctile") is not None
-        and chip["peak_pctile"] <= P1_CHIP_PEAK_PCTILE_MAX
-        and price_to_peak is not None
-        and P1_PRICE_TO_PEAK_MIN <= price_to_peak <= P1_PRICE_TO_PEAK_MAX
-        and chip.get("winner") is not None
-        and P1_WINNER_MIN <= chip["winner"] <= P1_WINNER_MAX
+        day_volume_ratio is not None
+        and P1_DAY_VOLUME_RATIO_MIN <= day_volume_ratio <= P1_DAY_VOLUME_RATIO_MAX
     )
 
 
-def _pat_low_consolidation(bars, ctx):           # P1 低位底盘吸筹确认
-    """底盘连续3日首次确认，并在确认日要求筹码成本结构支持“吸筹”解释。"""
-    return bool(
-        _confirmed_new_state(bars, _p1_low_base_state, days=P1_CONFIRM_DAYS)
-        and _p1_chip_cost_state(ctx.get("chip"))
-    )
+def _p1_breakout_addon_state(bars: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """计算P1突破补充腿的个股侧状态，先做纯突破去重，再叠加过滤条件。
 
+    “昨日是否已突破”只看昨日相对其此前10日收盘的纯突破状态。即使昨日因量能、
+    位置或市场门未通过，今天仍不会被误当作一个新的突破 episode。
+    """
+    empty: Dict[str, Any] = {
+        "available": False,
+        "current_breakout": False,
+        "previous_breakout": False,
+        "first_breakout": False,
+        "stock_gate": False,
+        "position60": None,
+        "ret20": None,
+        "close_over_ma20": None,
+        "day_volume_ratio": None,
+        "day_volume_source": None,
+        "reason": "insufficient_history",
+        "failed_checks": ["history"],
+    }
+    required = max(HIGH_WIN, P1_BREAKOUT_DAYS + 2, 21)
+    current_bars = bars[-LOOKBACK:]
+    if len(current_bars) < required:
+        return empty
 
-def _p1_rule_params() -> Dict[str, Any]:
-    """P1生产/回测共用的可审计参数快照。"""
+    closes = [_safe(bar.get("close")) for bar in current_bars]
+    recent = closes[-HIGH_WIN:]
+    if any(value is None or value <= 0 for value in recent):
+        invalid = dict(empty)
+        invalid["reason"] = "invalid_close"
+        invalid["failed_checks"] = ["valid_close"]
+        return invalid
+
+    # All closes needed below are inside the validated trailing 60-bar window.
+    close = float(closes[-1])
+    previous_close = float(closes[-2])
+    prior_today = [float(value) for value in closes[-(P1_BREAKOUT_DAYS + 1):-1]]
+    prior_yesterday = [float(value) for value in closes[-(P1_BREAKOUT_DAYS + 2):-2]]
+    current_breakout = close > max(prior_today)
+    previous_breakout = previous_close > max(prior_yesterday)
+    first_breakout = bool(current_breakout and not previous_breakout)
+
+    position60 = sum(1 for value in recent if float(value) <= close) / HIGH_WIN
+    reference20 = float(closes[-21])
+    ret20 = close / reference20 - 1.0
+    ma20 = _mean([float(value) for value in closes[-20:]])
+    close_over_ma20 = close / ma20 if ma20 and ma20 > 0 else None
+    volume, volume_source = _volume_series(current_bars)
+    day_volume_ratio = _p26_volume_ratio(volume)
+
+    checks = {
+        "first_breakout": first_breakout,
+        "position60": position60 < P1_ADDON_POSITION_60_MAX,
+        "ret20": abs(ret20) <= P1_ADDON_ABS_RET_20_MAX,
+        "ma20": bool(
+            close_over_ma20 is not None
+            and close_over_ma20 >= P1_ADDON_MA20_FLOOR
+        ),
+        "volume": bool(
+            day_volume_ratio is not None
+            and P1_ADDON_DAY_VOLUME_RATIO_MIN
+            <= day_volume_ratio
+            <= P1_ADDON_DAY_VOLUME_RATIO_MAX
+        ),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
     return {
-        "scope": "leader_and_hotmoney",
-        "validated_scope": "hotmoney_only",
-        "holding_days": 10,
-        "position120_max": P1_POSITION_120_MAX,
-        "range60_max": P1_RANGE_60_MAX,
-        "abs_ret60_max": P1_ABS_RET_60_MAX,
-        "close_range20_max": P1_CLOSE_RANGE_20_MAX,
-        "ret20": [P1_RET_20_MIN, P1_RET_20_MAX],
-        "amp20_over_amp60_max": P1_AMP_RATIO_MAX,
-        "close_over_ma20_min": P1_MA20_FLOOR,
-        "recent_low_over_prior_low_min": P1_LOW_HOLD_FLOOR,
-        "confirmation_days": P1_CONFIRM_DAYS,
-        "chip_concentration_min": P1_CHIP_CONCENTRATION_MIN,
-        "chip_peak_pctile_max": P1_CHIP_PEAK_PCTILE_MAX,
-        "price_to_chip_peak": [P1_PRICE_TO_PEAK_MIN, P1_PRICE_TO_PEAK_MAX],
-        "chip_winner": [P1_WINNER_MIN, P1_WINNER_MAX],
-        "market_gate": "510310 nav_acc > MA60 OR MA20 > MA20 five trading days ago",
-        "missing_market_data": "fail_closed",
+        "available": True,
+        "current_breakout": bool(current_breakout),
+        "previous_breakout": bool(previous_breakout),
+        "first_breakout": first_breakout,
+        "stock_gate": not failed,
+        "position60": position60,
+        "ret20": ret20,
+        "close_over_ma20": close_over_ma20,
+        "day_volume_ratio": day_volume_ratio,
+        "day_volume_source": volume_source,
+        "reason": "open" if not failed else "closed",
+        "failed_checks": failed,
     }
 
 
-def _pat_low_shadows(bars, ctx):                 # P2 低位十字星/长下影反复
+def _p1_rule_state(
+    bars: List[Dict[str, Any]],
+    market_gate: bool,
+) -> Dict[str, Any]:
+    """正式P1复合事件：原两日企稳腿 OR 首次10日突破补充腿。"""
+    base_hit = _confirmed_new_state(
+        bars, _p1_low_base_state, days=P1_CONFIRM_DAYS
+    )
+    stock = _p1_breakout_addon_state(bars)
+    supplemental_hit = bool(stock["stock_gate"] and market_gate)
+    active = bool(base_hit or supplemental_hit)
+    if base_hit and supplemental_hit:
+        source = "base_and_breakout_addon"
+    elif base_hit:
+        source = "base_leg"
+    elif supplemental_hit:
+        source = "breakout_addon"
+    else:
+        source = None
+    signal_date = str(bars[-1].get("date") or "") if bars else None
+    return {
+        "code": "P1",
+        "name": "P1超额优先复合确认",
+        "version": P1_VERSION,
+        "replaced_on": P1_REPLACED_ON,
+        "signal_date": signal_date,
+        "active": active,
+        "hit": active,
+        "source": source,
+        "base_leg_hit": bool(base_hit),
+        "supplemental_hit": supplemental_hit,
+        "market_gate": bool(market_gate),
+        "breakout_addon_state": stock,
+        "eod_only": True,
+        "score_weight": ACCUM_MODEL_WEIGHTS["p1"],
+        "production_replacement": True,
+    }
+
+
+def _pat_low_consolidation(
+    bars: List[Dict[str, Any]],
+    ctx: Dict[str, Any],
+    p1_market_gate: bool = False,
+) -> bool:                                  # P1 超额优先复合确认
+    return bool(_p1_rule_state(bars, p1_market_gate)["active"])
+
+
+def _p1_rule_params() -> Dict[str, Any]:
+    """正式P1生产/回测共用的可审计参数快照。"""
+    return {
+        "code": "P1",
+        "name": "P1超额优先复合确认",
+        "version": P1_VERSION,
+        "replaced_on": P1_REPLACED_ON,
+        "scope": "leader_and_hotmoney",
+        "validated_scope": "leader_and_hotmoney",
+        "primary_horizons": list(VERIFY_HORIZONS),
+        "etf_policy": "base_leg_only; breakout addon is disabled pending ETF-specific validation",
+        "production_replacement": True,
+        "eod_only": True,
+        "score_weight": ACCUM_MODEL_WEIGHTS["p1"],
+        "holding_days": 10,
+        "union_rule": "base leg OR supplemental breakout leg",
+        "base_leg": {
+            "position60_max_exclusive": P1_POSITION_60_MAX,
+            "abs_ret20_max": P1_ABS_RET_20_MAX,
+            "close_over_ma20_min": P1_MA20_FLOOR,
+            "close_at_or_above_open": True,
+            "day_volume_ratio": [P1_DAY_VOLUME_RATIO_MIN, P1_DAY_VOLUME_RATIO_MAX],
+            "confirmation_days": P1_CONFIRM_DAYS,
+            "event_rule": "first day on which the raw state has held for two consecutive bars",
+        },
+        "supplemental_leg": {
+            "breakout_close_days": P1_BREAKOUT_DAYS,
+            "event_rule": (
+                "today close is strictly above the prior 10-close high and "
+                "yesterday was not itself above its prior 10-close high"
+            ),
+            "position60_max_exclusive": P1_ADDON_POSITION_60_MAX,
+            "abs_ret20_max": P1_ADDON_ABS_RET_20_MAX,
+            "close_over_ma20_min": P1_ADDON_MA20_FLOOR,
+            "day_volume_ratio": [
+                P1_ADDON_DAY_VOLUME_RATIO_MIN,
+                P1_ADDON_DAY_VOLUME_RATIO_MAX,
+            ],
+            "green_candle_required": False,
+        },
+        "day_volume_ratio_base_days": CHIP_WINNER_RISK_VOLUME_BASE_WIN,
+        "day_volume_source": "turnover if PIT window coverage >=70%, otherwise volume",
+        "market_gate": {
+            "applies_to": "supplemental_leg_only",
+            "index": MARKET_REGIME_INDEX,
+            "value_source": "nav_acc preferred, nav fallback",
+            "same_date_required": True,
+            "minimum_history": 60,
+            "close_over_ma20_min": P1_MARKET_MA20_FLOOR,
+            "close_over_ma60_min": P1_MARKET_MA60_FLOOR,
+            "ret5": [P1_MARKET_RET5_MIN, P1_MARKET_RET5_MAX],
+            "ret20": [P1_MARKET_RET20_MIN, P1_MARKET_RET20_MAX],
+            "ma20_slope5_min": P1_MARKET_MA20_SLOPE5_MIN,
+            "failure_policy": "fail_closed",
+        },
+        "chip_gate": None,
+        "backtest_snapshot": {
+            "leader": {
+                "events": 9528,
+                "coverage": 0.005185,
+                "win_rate_10d": 0.5479,
+                "excess_10d": 0.00464,
+                "hac_t": 3.21,
+            },
+            "hotmoney": {
+                "events": 2552,
+                "coverage": 0.005085,
+                "win_rate_10d": 0.5756,
+                "excess_10d": 0.01297,
+                "hac_t": 3.24,
+            },
+        },
+    }
+
+
+def _pat_low_shadows(bars, ctx):                 # P2 低位真实长下影+温和缩量承接
     if ctx["pos"] is None or ctx["pos"] >= 0.40 or len(bars) < P2_WINDOW + 1:
+        return False
+    day_volume_ratio = ctx.get("p26_volume_ratio")
+    if day_volume_ratio is None:
+        volume = ctx.get("vol")
+        if volume is None:
+            volume, _source = _volume_series(bars)
+        day_volume_ratio = _p26_volume_ratio(volume)
+    if (
+        day_volume_ratio is None
+        or day_volume_ratio < P2_DAY_VOLUME_RATIO_MIN
+        or day_volume_ratio > P2_DAY_VOLUME_RATIO_MAX
+    ):
         return False
     matched: List[bool] = []
     for i in range(len(bars) - P2_WINDOW, len(bars)):
         body, low = _kl_body(bars, i), _kl_lower(bars, i)
-        matched.append(bool(_kl_doji(bars, i) or (body and low and low > 2 * body and low > 0.015)))
+        matched.append(bool(
+            body is not None
+            and low is not None
+            and low >= P2_SHADOW_BODY_RATIO_MIN * body
+            and low >= P2_LOWER_SHADOW_MIN
+        ))
     return matched[-1] and sum(matched) >= P2_MIN_COUNT
 
 
-def _pat_shakedown_absorb(bars, ctx):            # P3 隐性收集(缩量阴线打压吸筹)
+def _pat_shakedown_absorb(bars, ctx):            # P3 隐性收集(缩量收盘大跌后首次收复)
     pos, vol, closes = ctx["pos"], ctx["vol"], ctx["closes"]
-    if pos is None or pos >= 0.35 or len(bars) < 30:
+    if pos is None or pos >= P3_POSITION_MAX or len(bars) < 30:
         return False
-    current_base = _mean([value for value in vol[-21:-1] if value])
-    current_volume = vol[-1] if vol else None
-    if not current_base or not current_volume or current_volume > 1.30 * current_base:
+    confirm_volume_ratio = ctx.get("p26_volume_ratio")
+    if confirm_volume_ratio is None:
+        confirm_volume_ratio = _p26_volume_ratio(vol)
+    if confirm_volume_ratio is None or confirm_volume_ratio > P3_CONFIRM_VOLUME_RATIO_MAX:
         return False
-    for i in range(len(bars) - 2, len(bars) - 10, -1):
-        chg, event_volume = bars[i]["chg"], vol[i]
-        event_base_values = [value for value in vol[i - 20:i] if value]
+    for i in range(len(bars) - 2, len(bars) - P3_EVENT_WINDOW - 2, -1):
         pre_drop, drop_close = closes[i - 1], closes[i]
         if (
-            chg is None or chg > -4.5
-            or not event_volume or not event_base_values
-            or event_volume >= 0.85 * _mean(event_base_values)
-            or not pre_drop or not drop_close or pre_drop <= drop_close
+            not pre_drop or not drop_close
+            or drop_close > pre_drop * (1.0 - P3_DROP_MIN)
         ):
             continue
-        # 必须在 8 日内首次完整收复跌前收盘；同一次打压不会连续多日重复命中。
+        # 绝大多数交易日并非大跌事件：先做O(1)价格门，再计算该事件日前20日均量。
+        event_volume = vol[i]
+        event_base = _avg_vol(vol, i - 20, i)
+        if (
+            not event_volume or not event_base
+            or event_volume >= P3_EVENT_VOLUME_RATIO_MAX * event_base
+        ):
+            continue
+        # 真正首次收复：事件后到昨日从未站回跌前收盘；同时保留宽松的6%破底保护。
         if not closes[-1] or not closes[-2] or closes[-1] < pre_drop or closes[-2] >= pre_drop:
             continue
-        path = [value for value in closes[i:] if value]
-        if len(path) != len(closes[i:]) or min(path) < drop_close * 0.97:
+        if any(
+            not value
+            or value >= pre_drop
+            or value < drop_close * (1.0 - P3_UNDERCUT_MAX)
+            for value in closes[i + 1:-1]
+        ):
             continue
         return True
     return False
 
 
-def _pat_absorption(bars, ctx):                  # P4 量增价稳(吸收)
+def _p4_absorption_state(bars: List[Dict[str, Any]]) -> Optional[bool]:
+    """P4核心状态；固定180日窗口，数据不足返回None以便首次事件严格失效。"""
+    if len(bars) < LOOKBACK:
+        return None
+    current_bars = bars[-LOOKBACK:]
+    _, pos = _score_position(current_bars)
+    volume, _source = _volume_series(current_bars)
+    _, volume_ratio = _score_volume_ratio(volume)
+    _, drift = _score_absorption(current_bars)
+    _, cmf = _score_cmf(current_bars, volume)
+    if any(value is None for value in (pos, volume_ratio, drift, cmf)):
+        return None
+    return bool(
+        pos < P4_POSITION_MAX
+        and P4_VOLUME_RATIO_MIN < volume_ratio <= P4_VOLUME_RATIO_MAX
+        and abs(drift) < P4_ABS_DRIFT_MAX
+        and cmf > P4_CMF_MIN
+    )
+
+
+def _p4_current_state(ctx: Dict[str, Any]) -> bool:
     pos, vr, drift, cmf = ctx["pos"], ctx["vol_ratio"], ctx["drift"], ctx["cmf"]
-    return (pos is not None and pos < 0.60 and vr is not None and vr > 1.2
-            and drift is not None and abs(drift) < 0.06 and cmf is not None and cmf > 0)
+    return bool(
+        pos is not None
+        and pos < P4_POSITION_MAX
+        and vr is not None
+        and P4_VOLUME_RATIO_MIN < vr <= P4_VOLUME_RATIO_MAX
+        and drift is not None
+        and abs(drift) < P4_ABS_DRIFT_MAX
+        and cmf is not None
+        and cmf > P4_CMF_MIN
+    )
 
 
-def _pat_bottom_formation(bars, ctx):            # P5 底部形态构筑(双底/W底·低点抬高)
-    """低位筑底：近端两个摆动低点等高或低点抬高、中间有像样反弹(颈线)，当前价正从二次探底
-    回升但尚未显著突破颈线（突破后归 P11/拉升）。可选筹码不发散增强可信度。"""
-    pos, closes, chip = ctx["pos"], ctx["closes"], ctx["chip"]
-    if pos is None or pos >= 0.45:
+def _pat_absorption(bars, ctx):                  # P4 量增价稳(首次观察事件)
+    """只报核心状态由昨日不成立到今日成立，避免同一放量平台逐日重复命中。"""
+    if len(bars) < LOOKBACK + 1 or not _p4_current_state(ctx):
         return False
-    cs = [c for c in closes[-60:] if c]
+    previous_state = _p4_absorption_state(bars[:-1])
+    return previous_state is False
+
+
+def _p4_rule_params() -> Dict[str, Any]:
+    """P4生产/回测共用的可审计参数快照。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "validation_status": "observation_only",
+        "position60_max_exclusive": P4_POSITION_MAX,
+        "volume_ratio": {
+            "min_exclusive": P4_VOLUME_RATIO_MIN,
+            "max_inclusive": P4_VOLUME_RATIO_MAX,
+            "recent_days": SHORT_WIN,
+            "base_days": BASE_WIN,
+        },
+        "abs_ret20_max_exclusive": P4_ABS_DRIFT_MAX,
+        "cmf20_min_exclusive": P4_CMF_MIN,
+        "event_rule": "first day on which the core state changes from false to true",
+        "unknown_previous_state": "fail_closed",
+        "additional_requirement_count": 1,
+        "signal_semantics": "neutral observation; does not drive bullish phase",
+    }
+
+
+def _pat_bottom_formation(bars, ctx):            # P5 双底右腿确认
+    """低位W底的右腿确认事件，而不是二底后每天重复成立的状态。
+
+    两个新增要求均为短窗口价格比较：二底须在近8日，且今日由“昨日未突破”切换为突破
+    前3日收盘高点。原有“二底回升”下界收紧为触及颈线；不再重建筹码分布。
+    """
+    pos, closes = ctx["pos"], ctx["closes"]
+    if pos is None or pos >= P5_POSITION_MAX:
+        return False
+    cs = []
+    for value in closes[-60:]:
+        try:
+            close = float(value)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(close) or close <= 0:
+            return False
+        cs.append(close)
     if len(cs) < 40:
         return False
     lows = _swing_lows(cs, k=3)
@@ -1574,15 +2242,47 @@ def _pat_bottom_formation(bars, ctx):            # P5 底部形态构筑(双底/
     if i2 - i1 < 5:                               # 两底间隔太近不算结构
         return False
     l1, l2 = cs[i1], cs[i2]
-    if not -0.04 <= l2 / l1 - 1 <= 0.08:          # 等高(±)或低点抬高，排除二次破位
+    second_low_return = l2 / l1 - 1.0
+    if (second_low_return < P5_SECOND_LOW_RETURN_MIN - P5_FLOAT_EPSILON
+            or second_low_return > P5_SECOND_LOW_RETURN_MAX + P5_FLOAT_EPSILON):
         return False
     neck = max(cs[i1:i2 + 1])                     # 两底之间的反弹高点=颈线
-    if neck / min(l1, l2) - 1 < 0.06:             # 中间反弹太弱，是平台不是双底
+    if neck / min(l1, l2) - 1 < P5_NECK_REBOUND_MIN - P5_FLOAT_EPSILON:
         return False
+    if len(cs) - 1 - i2 > P5_SECOND_LOW_RECENCY_MAX:
+        return False                               # 只看二底确认后的近端右腿
     c = cs[-1]
-    if c <= l2 or c / neck - 1 > 0.03:            # 已回升但还没显著突破颈线(突破归拉升)
+    neck_ratio = c / neck
+    if (neck_ratio < P5_NECK_RATIO_MIN - P5_FLOAT_EPSILON
+            or neck_ratio > P5_NECK_RATIO_MAX + P5_FLOAT_EPSILON):
         return False
-    return chip is None or chip["concentration"] >= 0.35
+    win = P5_RIGHT_LEG_BREAKOUT_WIN
+    current_breakout = c > max(cs[-win - 1:-1])
+    previous_breakout = cs[-2] > max(cs[-win - 2:-2])
+    return current_breakout and not previous_breakout
+
+
+def _p5_rule_params() -> Dict[str, Any]:
+    """P5生产/回测共用的可审计参数快照。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "validation_status": "10d_observation",
+        "holding_days": 10,
+        "position60_max_exclusive": P5_POSITION_MAX,
+        "swing_low_k": 3,
+        "second_low_return": [P5_SECOND_LOW_RETURN_MIN, P5_SECOND_LOW_RETURN_MAX],
+        "neck_rebound_min": P5_NECK_REBOUND_MIN,
+        "second_low_recency_max": P5_SECOND_LOW_RECENCY_MAX,
+        "neck_ratio": [P5_NECK_RATIO_MIN, P5_NECK_RATIO_MAX],
+        "right_leg_breakout_window": P5_RIGHT_LEG_BREAKOUT_WIN,
+        "event_rule": "today closes above the prior 3-close high after yesterday did not",
+        "additional_requirement_count": 2,
+        "additional_requirements": [
+            "second swing low occurred within the latest 8 trading days",
+            "3-close-high breakout changes from false yesterday to true today",
+        ],
+        "chip_gate": None,
+    }
 
 
 def _confirmed_new_state(bars, predicate, days=PATTERN_CONFIRM_DAYS):
@@ -1598,13 +2298,85 @@ def _confirmed_new_state(bars, predicate, days=PATTERN_CONFIRM_DAYS):
     return not predicate(bars[:-days])
 
 
-def _pat_compression(bars, ctx):                 # P23 箱体波动压缩(酝酿)
-    """中低位 + 近20日振幅 < 0.80×近60日振幅：波动收窄、蓄势待发。"""
-    pos = ctx["pos"]
-    if pos is None or pos >= 0.60:
-        return False
+def _p23_compression_state(bars: List[Dict[str, Any]]) -> Optional[bool]:
+    """P23核心状态；数据不足返回None，避免把未知误当成“昨日未压缩”。"""
+    if len(bars) < HIGH_WIN + 1:                 # 60个振幅至少需要61根bar
+        return None
+    _, pos = _score_position(bars)
     ratio = _amp_ratio(bars)
-    return ratio is not None and ratio < COMPRESS_AMP_RATIO
+    if pos is None or ratio is None:
+        return None
+    return pos < P23_POSITION_60_MAX and ratio < COMPRESS_AMP_RATIO
+
+
+def _p23_confirmation_state(
+    bars: List[Dict[str, Any]],
+) -> Optional[bool]:
+    """P23结构确认状态：低位压缩且略站上MA20；数据不足返回None。"""
+    core_state = _p23_compression_state(bars)
+    if core_state is not True:
+        return core_state
+
+    current_bars = bars[-LOOKBACK:]
+    closes = [_safe(bar.get("close")) for bar in current_bars[-20:]]
+    if len(closes) < 20 or any(value is None or value <= 0 for value in closes):
+        return None
+    numeric_closes = [float(value) for value in closes if value is not None]
+    ma20 = _mean(numeric_closes)
+    close_over_ma20 = numeric_closes[-1] / ma20 if ma20 and ma20 > 0 else None
+    return bool(close_over_ma20 is not None and close_over_ma20 >= P23_MA20_FLOOR)
+
+
+def _p23_temperate_volume_state(
+    bars: List[Dict[str, Any]],
+    ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """P23信号日量能门；不参与结构状态去重，避免量比进出区间造成重复触发。"""
+    if ctx is not None and "p26_volume_ratio" in ctx:
+        day_volume_ratio = ctx.get("p26_volume_ratio")
+    else:
+        current_bars = bars[-LOOKBACK:]
+        volume, _source = _volume_series(current_bars)
+        day_volume_ratio = _p26_volume_ratio(volume)
+    if day_volume_ratio is None:
+        return None
+    return bool(
+        P23_DAY_VOLUME_RATIO_MIN <= day_volume_ratio <= P23_DAY_VOLUME_RATIO_MAX
+    )
+
+
+def _pat_compression(bars, ctx):                 # P23 低位压缩温和量能转强
+    """结构确认状态由False切为True后再检查当日量能；同一连续状态只报告一次。"""
+    if len(bars) < HIGH_WIN + 2:                 # 昨日状态也必须有完整60个振幅
+        return False
+    current_state = _p23_confirmation_state(bars)
+    if current_state is not True:
+        return False
+    if _p23_confirmation_state(bars[:-1]) is not False:
+        return False
+    return _p23_temperate_volume_state(bars, ctx=ctx) is True
+
+
+def _p23_rule_params() -> Dict[str, Any]:
+    """P23生产/回测共用的可审计参数快照。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "validated_scope": "experimental_dual_pool",
+        "holding_days": 10,
+        "position60_max_exclusive": P23_POSITION_60_MAX,
+        "amp20_over_amp60_max_exclusive": COMPRESS_AMP_RATIO,
+        "close_over_ma20_min": P23_MA20_FLOOR,
+        "day_volume_ratio": [P23_DAY_VOLUME_RATIO_MIN, P23_DAY_VOLUME_RATIO_MAX],
+        "day_volume_ratio_base_days": CHIP_WINNER_RISK_VOLUME_BASE_WIN,
+        "day_volume_source": "turnover if trailing-180 PIT coverage >=70%, otherwise volume",
+        "event_rule": "first day entering the compression + MA20 structural state",
+        "volume_gate_scope": "signal day only; excluded from event-state deduplication",
+        "max_extra_requirements": 2,
+        "incremental_requirement_count_vs_previous_p23": 1,
+        "incremental_requirements": [
+            "signal-day volume over prior-20-day mean must be within [0.40, 1.20]",
+        ],
+    }
 
 
 def _p24_obv_divergence_state(bars):
@@ -1642,10 +2414,10 @@ def _pat_obv_divergence(bars, ctx):              # P24 OBV底背离(价弱量增
     return _confirmed_new_state(bars, _p24_obv_divergence_state)
 
 
-def _pat_bottom_base_ignition(bars, ctx):         # P25 低位横盘缩量后启动
-    """120日低位 + 60日严格横盘缩量，随后量能启动并接近20日平台。
+def _pat_bottom_base_ignition(bars, ctx):         # P25 低位缩量平台转强
+    """120日中低位 + 60日横盘缩量，随后价格小幅转强并接近20日平台。
 
-    统一使用严格缩量底部判据；所有股票池口径相同。
+    用价格确认替代旧版爆量确认；所有股票池口径相同，计算量不增加。
     """
     if len(bars) < 120:
         return False
@@ -1671,18 +2443,18 @@ def _pat_bottom_base_ignition(bars, ctx):         # P25 低位横盘缩量后启
     abs_ret60 = abs(close / closes[-61] - 1.0)
     if range60 > P25_RANGE_60_MAX or abs_ret60 > P25_ABS_RET_60_MAX:
         return False
+    ret20 = close / closes[-21] - 1.0
+    if ret20 < P25_RET_20_MIN:
+        return False
 
     volumes = [b.get("volume") for b in bars]
     if any(value is None or value <= 0 for value in volumes[-64:]):
         return False
     early40 = _mean(volumes[-60:-20])
     recent20 = _mean(volumes[-20:])
-    previous20 = _mean(volumes[-21:-1])
-    if not early40 or not recent20 or not previous20:
+    if not early40 or not recent20:
         return False
     if recent20 / early40 > P25_VOLUME_CONTRACT_MAX:
-        return False
-    if volumes[-1] / previous20 < P25_VOLUME_IGNITION_MIN:
         return False
 
     volume_ma5 = [_mean(volumes[i - 4:i + 1]) for i in range(len(volumes) - 60, len(volumes))]
@@ -1700,13 +2472,79 @@ def _pat_bottom_base_ignition(bars, ctx):         # P25 低位横盘缩量后启
     return breakout20 >= P25_BREAKOUT_20_MIN
 
 
-def _pat_chip_winner_risk(bars, ctx):             # P26 获利盘风险
-    """获利筹码拥挤/快速转盈且当日放量，提示兑现或派发风险。"""
-    winner = ctx.get("chip_winner")
-    prior = ctx.get("chip_winner_prior")
+def _p25_rule_params() -> Dict[str, Any]:
+    """P25生产/回测共用的可审计参数快照。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "validation_status": "experimental_dual_pool_directional",
+        "position120_max": P25_POSITION_120_MAX,
+        "range60_max": P25_RANGE_60_MAX,
+        "abs_ret60_max": P25_ABS_RET_60_MAX,
+        "volume_contract_20_60_max": P25_VOLUME_CONTRACT_MAX,
+        "volume_slope60_max": P25_VOLUME_SLOPE_60_MAX,
+        "ret20_min": P25_RET_20_MIN,
+        "breakout20_min": P25_BREAKOUT_20_MIN,
+        "anti_chase": {"ret5_max": 0.08, "max_change3_pct_exclusive": 6.0},
+        "replaced_requirements": [
+            "volume_last_vs_prev20 >= 1.5 -> ret20 >= 0.005",
+            "breakout20 >= -0.02 -> breakout20 >= -0.04",
+        ],
+        "additional_requirement_count": 0,
+        "primary_horizons": [10, 20],
+    }
+
+
+def _p26_peak_drawdown_confirmed(
+    close: Optional[float],
+    peak_high: Optional[float],
+) -> bool:
+    """P26峰值回撤边界；研究脚本使用相同的乘法表达式。"""
+    return bool(
+        close is not None
+        and close > 0.0
+        and peak_high is not None
+        and peak_high > 0.0
+        and close <= (1.0 - P26_PEAK_DRAWDOWN_MIN) * peak_high
+    )
+
+
+def _p26_price_reversal_confirmed(
+    bars: Sequence[Dict[str, Any]],
+    ctx: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """P26廉价价格门：先快速拉升，再从近端盘中高点明确回撤。"""
+    if len(bars) < max(P26_PEAK_HIGH_DAYS, 6):
+        return False
+    closes = list((ctx or {}).get("closes") or [bar.get("close") for bar in bars])
+    ret5 = _ret_k(closes, 5)
+    close = _safe(bars[-1].get("close"))
+    recent_highs = [
+        value
+        for value in (
+            _safe(bar.get("high")) for bar in bars[-P26_PEAK_HIGH_DAYS:]
+        )
+        if value is not None and value > 0.0
+    ]
+    return bool(
+        ret5 is not None
+        and ret5 >= P26_RET_5_MIN
+        and recent_highs
+        and _p26_peak_drawdown_confirmed(close, max(recent_highs))
+    )
+
+
+def _pat_chip_winner_risk(bars, ctx):             # P26 获利盘冲高回撤风险
+    """获利筹码拥挤/快速转盈、极端放量且冲高回撤，提示兑现或派发风险。"""
     volume_ratio = ctx.get("p26_volume_ratio")
     if volume_ratio is None or volume_ratio < CHIP_WINNER_RISK_VOLUME_RATIO_MIN:
         return False
+    # 先检查O(1)/固定10根的价格门，再做昂贵的筹码重建。稳态上升和放量续涨
+    # 不应仅因获利盘高而过早卖出；已有冲高、且价格离开峰值后才升级风险。
+    if not _p26_price_reversal_confirmed(bars, ctx=ctx):
+        return False
+    _ensure_pattern_chip_context(ctx, include_prior=True)
+    winner = ctx.get("chip_winner")
+    prior = ctx.get("chip_winner_prior")
     return bool(
         (winner is not None and winner >= CHIP_WINNER_RISK_HIGH)
         or (
@@ -1715,6 +2553,38 @@ def _pat_chip_winner_risk(bars, ctx):             # P26 获利盘风险
             and winner >= CHIP_WINNER_RISK_CURRENT_MIN
         )
     )
+
+
+def _p26_rule_params() -> Dict[str, Any]:
+    """P26冻结生产口径，供实时结果、回测和测试共同审计。"""
+    return {
+        "code": "P26",
+        "name": "P26获利盘冲高回撤风险",
+        "scope": "leader_and_hotmoney",
+        "signal": "sell",
+        "chip_union": {
+            "winner_min_inclusive": CHIP_WINNER_RISK_HIGH,
+            "jump_prior_max_exclusive": CHIP_WINNER_RISK_PRIOR_MAX,
+            "jump_current_min_inclusive": CHIP_WINNER_RISK_CURRENT_MIN,
+            "lookback_sessions": CHIP_WINNER_RISK_DAYS,
+        },
+        "day_volume_ratio_min_inclusive": CHIP_WINNER_RISK_VOLUME_RATIO_MIN,
+        "day_volume_ratio_base_days": CHIP_WINNER_RISK_VOLUME_BASE_WIN,
+        "day_volume_ratio_min_observations": CHIP_WINNER_RISK_VOLUME_MIN_OBS,
+        "day_volume_source": (
+            "turnover if trailing-180 PIT coverage >=70%, otherwise volume"
+        ),
+        "ret5_min_inclusive": P26_RET_5_MIN,
+        "peak_high_days": P26_PEAK_HIGH_DAYS,
+        "peak_window_includes_signal_day": True,
+        "peak_drawdown_min_inclusive": P26_PEAK_DRAWDOWN_MIN,
+        "additional_indicator_count": 2,
+        "additional_indicators": [
+            "five-session close return >= 5%",
+            "close <= 97% of the highest high in the latest 10 sessions",
+        ],
+        "primary_horizons": list(VERIFY_HORIZONS),
+    }
 
 
 # --- 试盘 🟡hold ---
@@ -1742,7 +2612,7 @@ def _pat_bottom_spike(bars, ctx):                # P7 底部异动放量
 
 # --- 洗盘 🟡buy ---
 def _pat_pullback_shakeout(bars, ctx):           # P8 缩量回踩洗盘(挖坑)
-    closes, vol, ma20, chip = ctx["closes"], ctx["vol"], ctx["ma20"], ctx["chip"]
+    closes, vol, ma20 = ctx["closes"], ctx["vol"], ctx["ma20"]
     if ma20 is None or len(bars) < 12:
         return False
     c = closes[-1]
@@ -1757,6 +2627,7 @@ def _pat_pullback_shakeout(bars, ctx):           # P8 缩量回踩洗盘(挖坑)
             if bars[i]["chg"] is not None and bars[i]["chg"] > 0 and vol[i]]
     if not down_v or not up_v:
         return False
+    chip = _ensure_pattern_chip_context(ctx)
     conc_ok = chip is None or chip["concentration"] >= 0.40
     return (sum(down_v) / len(down_v)) < (sum(up_v) / len(up_v)) and conc_ok
 
@@ -1772,9 +2643,11 @@ def _pat_climb_wash(bars, ctx):                  # P9 边拉边洗
 
 
 def _pat_high_turnover_wash(bars, ctx):          # P10 高换手洗盘(筹码峰不发散)
-    vr, ma20, closes, chip = ctx["vol_ratio"], ctx["ma20"], ctx["closes"], ctx["chip"]
-    return (vr is not None and vr > 1.5 and ma20 and closes[-1] and closes[-1] > ma20
-            and chip is not None and chip["concentration"] >= 0.45)
+    vr, ma20, closes = ctx["vol_ratio"], ctx["ma20"], ctx["closes"]
+    if not (vr is not None and vr > 1.5 and ma20 and closes[-1] and closes[-1] > ma20):
+        return False
+    chip = _ensure_pattern_chip_context(ctx)
+    return bool(chip is not None and chip["concentration"] >= 0.45)
 
 
 # --- 突破 🟠hold ---
@@ -1811,38 +2684,230 @@ def _pat_high_vol_stall(bars, ctx):              # P14 高位放量滞涨
     return r5 is not None and r5 <= 0.02 and up is not None and up > 0.02
 
 
-def _pat_vol_price_div(bars, ctx):               # P15 量价背离
-    closes, vr = ctx["closes"], ctx["vol_ratio"]
-    win = [c for c in closes[-60:] if c]
-    if len(win) < 30 or vr is None or closes[-1] is None:
+def _p15_original_event(
+    bars: Sequence[Dict[str, Any]],
+    vol: Optional[Sequence[Optional[float]]] = None,
+) -> bool:
+    """复现旧P15的新高量背离状态，仅作为潜在顶部事件而非卖点。"""
+    if len(bars) < P15_EVENT_HIGH_DAYS:
         return False
-    if closes[-1] < max(win):
+    event_bars = list(bars[-LOOKBACK:])
+    if vol is None:
+        event_vol, _ = _volume_series(event_bars)
+    else:
+        if len(vol) != len(bars):
+            return False
+        event_vol = list(vol[-LOOKBACK:])
+    closes = [_safe(bar.get("close")) for bar in event_bars]
+    recent = [value for value in closes[-P15_EVENT_HIGH_DAYS:] if value]
+    close = closes[-1]
+    if len(recent) < 30 or close is None or close < max(recent):
         return False
-    r5 = _ret_k(closes, 5)
-    return vr < 1.0 or (vr > 1.8 and r5 is not None and r5 < 0.01)
+    _, volume_ratio = _score_volume_ratio(event_vol)
+    if volume_ratio is None:
+        return False
+    ret5 = _ret_k(closes, 5)
+    return bool(
+        volume_ratio < P15_EVENT_LOW_VOLUME_RATIO_MAX
+        or (
+            volume_ratio > P15_EVENT_HIGH_VOLUME_RATIO_MIN
+            and ret5 is not None
+            and ret5 < P15_EVENT_RET5_MAX
+        )
+    )
 
 
-def _pat_bearish_max_vol(bars, ctx):             # P16 阴天量(近期最大量收阴)
+def _pat_vol_price_div(bars, ctx):               # P15 新高量背离放量回撤确认
+    """旧P15事件后15日内出现放量回撤，才升级为卖出信号。
+
+    旧P15中约99%的命中来自“缩量收盘新高”，单独看更像供给枯竭后的
+    趋势延续。因此新规则保留它作为潜在顶部事件，但把信号日后移到
+    价格和成交共同确认转弱的当日，避免未来数据回填到事件日。
+    """
+    # 需要完整保留“当前180日上下文 + 事件回看15日”，否则较早事件日的
+    # 换手率覆盖率量源可能只基于截短历史，导致研究与线上口径漂移。
+    required = PATTERN_EVAL_BARS
+    day_volume_ratio = _safe(ctx.get("day_volume_ratio"))
+    if (
+        len(bars) < required
+        or day_volume_ratio is None
+        or day_volume_ratio <= P15_DAY_VOLUME_RATIO_MIN
+    ):
+        return False
+
+    close = _safe(bars[-1].get("close"))
+    recent_highs = [
+        _safe(bar.get("high")) for bar in bars[-P15_PULLBACK_HIGH_DAYS:]
+    ]
+    if (
+        close is None
+        or close <= 0.0
+        or len(recent_highs) != P15_PULLBACK_HIGH_DAYS
+        or any(value is None or value <= 0.0 for value in recent_highs)
+    ):
+        return False
+    peak = max(float(value) for value in recent_highs if value is not None)
+    if close > peak * (1.0 - P15_PULLBACK_MIN):
+        return False
+
+    for lag in range(1, P15_EVENT_LOOKBACK_DAYS + 1):
+        event_end = len(bars) - lag
+        if _p15_original_event(bars[:event_end]):
+            return True
+    return False
+
+
+def _p15_rule_params() -> Dict[str, Any]:
+    """P15生产/回测共用的可审计参数快照。"""
+    return {
+        "code": "P15",
+        "name": "新高量背离放量回撤",
+        "scope": "leader_and_hotmoney",
+        "validated_scope": "leader_and_hotmoney",
+        "minimum_history_bars": PATTERN_EVAL_BARS,
+        "event_new_close_high_days": P15_EVENT_HIGH_DAYS,
+        "event_lookback_days": P15_EVENT_LOOKBACK_DAYS,
+        "event_signal_day_excluded": True,
+        "event_low_volume_ratio_max_exclusive": P15_EVENT_LOW_VOLUME_RATIO_MAX,
+        "event_high_volume_ratio_min_exclusive": P15_EVENT_HIGH_VOLUME_RATIO_MIN,
+        "event_high_volume_ret5_max_exclusive": P15_EVENT_RET5_MAX,
+        "event_volume_ratio_recent_days": SHORT_WIN,
+        "event_volume_ratio_base_days": BASE_WIN,
+        "confirmation_peak_high_days": P15_PULLBACK_HIGH_DAYS,
+        "confirmation_peak_includes_signal_day": True,
+        "confirmation_drawdown_min_inclusive": P15_PULLBACK_MIN,
+        "confirmation_day_volume_ratio_min_exclusive": P15_DAY_VOLUME_RATIO_MIN,
+        "confirmation_day_volume_base_days": P15_DAY_VOLUME_BASE_DAYS,
+        "confirmation_day_volume_min_valid_observations": P15_DAY_VOLUME_MIN_OBS,
+        "volume_source": (
+            "turnover if trailing-180 PIT coverage >=70%, otherwise volume"
+        ),
+        "additional_indicator_count": 2,
+        "additional_indicators": [
+            "signal-day close drawdown from the inclusive 10-session intraday high",
+            "signal-day measure divided by the preceding 20-session mean",
+        ],
+        "event_to_signal_policy": (
+            "the original P15 is only a latent event; the sell signal is dated on "
+            "the later confirmation day, never backfilled"
+        ),
+        "p22_overlap_share": {"leader": 0.13715596, "hotmoney": 0.18760234},
+        "p15_only_coverage": {"leader": 0.00515987, "hotmoney": 0.00693590},
+        "backtest_snapshot": {
+            "leader": {
+                "hits": 10900,
+                "coverage": 0.00598008,
+                "win_rates": [0.45706422, 0.45348624, 0.44908257, 0.45495413, 0.43798165],
+                "excess_returns": [-0.00382091, -0.00485528, -0.00682607, -0.00728918, -0.01138214],
+                "effective_at": list(VERIFY_HORIZONS),
+            },
+            "hotmoney": {
+                "hits": 4275,
+                "coverage": 0.00853757,
+                "win_rates": [0.40187135, 0.38877193, 0.37052632, 0.37754386, 0.39111111],
+                "excess_returns": [-0.01095574, -0.01885232, -0.02974947, -0.03924387, -0.03942149],
+                "effective_at": list(VERIFY_HORIZONS),
+            },
+        },
+    }
+
+
+def _pat_bearish_max_vol(bars, ctx):             # P16 阴天量回撤确认
     pos, vol = ctx["pos"], ctx["vol"]
-    if pos is None or pos < 0.80 or len(bars) < 40:
+    if (
+        pos is None
+        or pos < P16_POSITION_MIN
+        or len(bars) < P16_MAX_VOLUME_DAYS
+        or len(vol) < P16_MAX_VOLUME_DAYS
+    ):
         return False
-    mx = max([v for v in vol[-40:] if v] or [0])
-    for i in range(len(bars) - 5, len(bars)):
+
+    # 40日最大量只说明出现了高位分歧；当前收盘较近10日盘中高点至少回撤3%，
+    # 才确认分歧已经演变为价格走弱。高点窗口含当前日，允许识别当日冲高回落。
+    close = _safe(bars[-1].get("close"))
+    recent_highs = [
+        value
+        for value in (_safe(bar.get("high")) for bar in bars[-P16_PEAK_HIGH_DAYS:])
+        if value is not None and value > 0.0
+    ]
+    if (
+        close is None
+        or close <= 0.0
+        or not recent_highs
+        or close > (1.0 - P16_PEAK_DRAWDOWN_MIN) * max(recent_highs)
+    ):
+        return False
+
+    mx = max([v for v in vol[-P16_MAX_VOLUME_DAYS:] if v] or [0])
+    for i in range(len(bars) - P16_EVENT_RECENCY_DAYS, len(bars)):
         if vol[i] and vol[i] >= mx and bars[i]["chg"] is not None and bars[i]["chg"] < 0:
             return True
     return False
 
 
+def _p16_rule_params() -> Dict[str, Any]:
+    """P16 冻结生产口径，供回测结果、接口和测试审计。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "position_min_inclusive": P16_POSITION_MIN,
+        "max_volume_days": P16_MAX_VOLUME_DAYS,
+        "bearish_event_recency_days": P16_EVENT_RECENCY_DAYS,
+        "bearish_event_change_max_exclusive": 0.0,
+        "peak_high_days": P16_PEAK_HIGH_DAYS,
+        "peak_drawdown_min_inclusive": P16_PEAK_DRAWDOWN_MIN,
+        "peak_window_includes_signal_day": True,
+        "additional_indicator_count": 1,
+        "additional_indicator": "close <= 97% of the highest high in the latest 10 sessions",
+    }
+
+
 def _pat_inverted_v(bars, ctx):                  # P17 倒V反转
     pos, closes = ctx["pos"], ctx["closes"]
-    if pos is None or pos < 0.80 or len(bars) < 16:
+    required = P17_RECENT_DAYS + P17_BASE_DAYS
+    if (
+        pos is None
+        or pos < P17_POSITION_MIN
+        or len(bars) < required
+        or len(closes) < required
+    ):
         return False
-    recent = [c for c in closes[-10:] if c]
-    base = [c for c in closes[-16:-10] if c]
+    recent_window = closes[-P17_RECENT_DAYS:]
+    recent = [c for c in recent_window if c]
+    base = [c for c in closes[-required:-P17_RECENT_DAYS] if c]
     if len(recent) < 8 or not base:
         return False
     peak = max(recent)
-    return (peak / min(base) - 1 > 0.15) and (closes[-1] / peak - 1 <= -0.08)
+    last, previous = closes[-1], closes[-2]
+    if not last or not previous or not peak:
+        return False
+    first_peak_index = next(
+        index for index, close in enumerate(recent_window) if close == peak
+    )
+    return bool(
+        peak / min(base) - 1 > P17_RUNUP_MIN
+        and last / peak - 1 <= -P17_PULLBACK_MIN
+        and first_peak_index >= P17_RECENT_DAYS - P17_PEAK_RECENCY_BARS
+        and last <= previous
+    )
+
+
+def _p17_rule_params() -> Dict[str, Any]:
+    """P17 冻结生产口径，供回测结果、接口和测试审计。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "position60_min_inclusive": P17_POSITION_MIN,
+        "recent_peak_days": P17_RECENT_DAYS,
+        "base_days": P17_BASE_DAYS,
+        "runup_min_exclusive": P17_RUNUP_MIN,
+        "pullback_from_peak_min_inclusive": P17_PULLBACK_MIN,
+        "peak_first_seen_within_bars": P17_PEAK_RECENCY_BARS,
+        "signal_day_close_not_above_previous": True,
+        "additional_requirement_count": 2,
+        "additional_requirements": [
+            "the first occurrence of the 10-day peak is within the latest 5 bars",
+            "signal-day close is not above the previous close",
+        ],
+    }
 
 
 def _pat_bearish_engulf(bars, ctx):              # P18 顶部大阴包阳
@@ -1867,35 +2932,156 @@ def _pat_dump_bigbear(bars, ctx):                # P19 灌压出货(巨量大阴
 
 
 def _ma_breakdown(closes: List[Optional[float]], vol_ratio: Optional[float]) -> bool:
-    """均线放量破位判定：收盘跌破MA20 + 5日前还在MA20上方 + 量比>1.2。
-    P20 形态与吸筹分的「破位惩罚」共用此单一判据，避免两处逻辑漂移。"""
+    """P20：跌破MA20 + 第5根bar仍在MA20上方 + 放量 + 当日确认下跌。"""
     ma20 = _ma_last(closes, 20)
     if ma20 is None or len(closes) < 25 or vol_ratio is None:
         return False
-    c = closes[-1]
-    if not c or c >= ma20:
+    c, previous = closes[-1], closes[-2]
+    if not c or not previous or c >= ma20:
         return False
     prior, ma20_prior = closes[-5], _ma_last(closes[:-4], 20)
-    return bool(prior and ma20_prior and prior > ma20_prior and vol_ratio > 1.2)
+    day_return = c / previous - 1.0
+    return bool(
+        prior
+        and ma20_prior
+        and prior > ma20_prior
+        and vol_ratio > P20_VOLUME_RATIO_MIN
+        and day_return <= P20_DAY_RETURN_MAX
+    )
 
 
 def _pat_ma_breakdown(bars, ctx):                # P20 均线放量破位
     return _ma_breakdown(ctx["closes"], ctx["vol_ratio"])
 
 
-def _pat_spring_reclaim(bars, ctx):              # P21 假跌破收回(Wyckoff spring·挖坑收回)
-    """近5日最低跌穿前40日箱体下沿×0.985(假摔)，但当前收盘又站回箱体下沿之上。沿用早期形态研究。"""
-    if len(bars) < 45:
+def _p20_rule_params() -> Dict[str, Any]:
+    """P20 冻结生产口径，供回测结果和测试审计。"""
+    return {
+        "scope": "leader_and_hotmoney",
+        "ma_days": 20,
+        "prior_bar_index": -5,
+        "prior_sessions_ago": 4,
+        "volume_ratio_recent_days": SHORT_WIN,
+        "volume_ratio_base_days": BASE_WIN,
+        "volume_ratio_min_exclusive": P20_VOLUME_RATIO_MIN,
+        "day_return_max_inclusive": P20_DAY_RETURN_MAX,
+        "incremental_requirement_count": 1,
+        "incremental_requirement": "signal-day close-to-close return <= -1%",
+    }
+
+
+def _p21_spring_state(bars: List[Dict[str, Any]]) -> Optional[bool]:
+    """P21价格主体：近5日深破前40日箱底至少2.5%，当前收盘重新站回。
+
+    固定按交易日切片，不跳过缺失 low 后再错位补数；数据不足或窗口内有脏值时返回
+    ``None`` 并关闭信号。该主体刻意保留为最多5日的有效状态，而不是独立事件：专项
+    复测中 False→True 事件化会把双池覆盖压到0.5%以下，且近期小盘超额转负。
+    """
+    required = P21_BOX_DAYS + P21_RECLAIM_DAYS
+    if len(bars) < required:
+        return None
+    window = bars[-required:]
+    box_lows = [_safe(bar.get("low")) for bar in window[:P21_BOX_DAYS]]
+    recent_lows = [_safe(bar.get("low")) for bar in window[P21_BOX_DAYS:]]
+    close = _safe(window[-1].get("close"))
+    if (
+        close is None
+        or close <= 0.0
+        or any(value is None or value <= 0.0 for value in box_lows + recent_lows)
+    ):
+        return None
+    numeric_box_lows = [float(value) for value in box_lows if value is not None]
+    numeric_recent_lows = [float(value) for value in recent_lows if value is not None]
+    box_low = min(numeric_box_lows)
+    recent_low = min(numeric_recent_lows)
+    return bool(
+        recent_low < box_low * P21_UNDERCUT_RATIO_MAX
+        and close > box_low
+    )
+
+
+def _p21_temperate_volume_state(
+    bars: List[Dict[str, Any]],
+    ctx: Optional[Dict[str, Any]] = None,
+) -> Optional[bool]:
+    """P21供给枯竭确认：信号日量能不高于此前20日均值的75%。"""
+    if ctx is not None and "p26_volume_ratio" in ctx:
+        day_volume_ratio = ctx.get("p26_volume_ratio")
+    else:
+        current_bars = bars[-LOOKBACK:]
+        volume, _source = _volume_series(current_bars)
+        day_volume_ratio = _p26_volume_ratio(volume)
+    if day_volume_ratio is None:
+        return None
+    return bool(day_volume_ratio <= P21_DAY_VOLUME_RATIO_MAX)
+
+
+def _pat_spring_reclaim(bars, ctx):              # P21 深破缩量收回(Wyckoff spring)
+    """深破2.5%后站回箱底，并以不超过0.75倍量确认抛压枯竭。"""
+    if len(bars) < P21_MIN_HISTORY_BARS:
         return False
-    lows = [b["low"] for b in bars if b["low"] is not None]
-    if len(lows) < 45:
-        return False
-    box_low_prior = min(lows[-45:-5])            # 前40日(不含近5日)箱体下沿
-    recent_low = min(lows[-5:])
-    c = ctx["closes"][-1]
-    if not box_low_prior or not recent_low or not c:
-        return False
-    return recent_low < box_low_prior * 0.985 and c > box_low_prior
+    return bool(
+        _p21_spring_state(bars) is True
+        and _p21_temperate_volume_state(bars, ctx=ctx) is True
+    )
+
+
+def _p21_rule_params() -> Dict[str, Any]:
+    """P21生产/回测共用的可审计参数快照。"""
+    return {
+        "code": "P21",
+        "name": "深破缩量收回",
+        "scope": "leader_and_hotmoney",
+        "validated_scope": "leader_and_hotmoney",
+        "primary_horizons": [10, 20, 40],
+        "minimum_history_bars": P21_MIN_HISTORY_BARS,
+        "box_days": P21_BOX_DAYS,
+        "reclaim_window_days": P21_RECLAIM_DAYS,
+        "undercut_ratio_max_exclusive": P21_UNDERCUT_RATIO_MAX,
+        "minimum_undercut_pct_exclusive": round(
+            1.0 - P21_UNDERCUT_RATIO_MAX, 6
+        ),
+        "close_must_reclaim_box_low": True,
+        "day_volume_ratio_max_inclusive": P21_DAY_VOLUME_RATIO_MAX,
+        "day_volume_ratio_base_days": CHIP_WINNER_RISK_VOLUME_BASE_WIN,
+        "day_volume_source": (
+            "turnover if trailing-180 PIT coverage >=70%, otherwise volume"
+        ),
+        "additional_indicator_count": 1,
+        "additional_indicator": "signal-day volume / prior-20-day mean",
+        "state_rule": (
+            "daily while the latest 5-day window still contains the qualifying "
+            "undercut, close remains above the box low, and signal-day volume passes"
+        ),
+        "eventized": False,
+        "eventized_rejection": (
+            "False-to-True coverage was 0.2585%/0.4051% in leader/hotmoney, "
+            "below the 0.5% product floor"
+        ),
+        "maximum_undercut": None,
+        "maximum_undercut_rejection": (
+            "a 5% depth cap reduced leader coverage below 0.5% and weakened "
+            "development results"
+        ),
+        "backtest_snapshot": {
+            "leader": {
+                "hits": 11402,
+                "coverage": 0.006236,
+                "win_rate_10d": 0.5453,
+                "excess_10d": 0.00332,
+                "win_rate_20d": 0.5644,
+                "excess_20d": 0.00510,
+            },
+            "hotmoney": {
+                "hits": 4566,
+                "coverage": 0.009125,
+                "win_rate_10d": 0.5644,
+                "excess_10d": 0.00421,
+                "win_rate_20d": 0.6378,
+                "excess_20d": 0.01327,
+            },
+        },
+    }
 
 
 def _pat_failed_breakout(bars, ctx):             # P22 放量假突破(高位拒绝)
@@ -1918,11 +3104,11 @@ def _pat_failed_breakout(bars, ctx):             # P22 放量假突破(高位拒
 
 # (code, 名称, 阶段, 信号方向, 匹配函数)
 PATTERNS: List[Tuple[str, str, str, str, Any]] = [
-    ("P1", "低位底盘吸筹确认", "吸筹", "buy", _pat_low_consolidation),
+    ("P1", "超额优先复合确认", "吸筹", "buy", _pat_low_consolidation),
     ("P2", "低位影线吸筹", "吸筹", "buy", _pat_low_shadows),
     ("P3", "缩量打压首次收复", "吸筹", "buy", _pat_shakedown_absorb),
-    ("P4", "量增价稳吸收", "吸筹", "buy", _pat_absorption),
-    ("P5", "底部形态构筑", "吸筹", "buy", _pat_bottom_formation),
+    ("P4", "量增价稳观察", "吸筹", "observe", _pat_absorption),
+    ("P5", "双底右腿确认", "吸筹", "buy", _pat_bottom_formation),
     ("P6", "试盘长上影", "试盘", "hold", _pat_test_upper_shadow),
     ("P7", "底部异动放量", "试盘", "hold", _pat_bottom_spike),
     ("P8", "缩量回踩洗盘", "洗盘", "buy", _pat_pullback_shakeout),
@@ -1932,27 +3118,27 @@ PATTERNS: List[Tuple[str, str, str, str, Any]] = [
     ("P12", "连板拉升", "拉升", "hold", _pat_consecutive_limit),
     ("P13", "首板卡位", "拉升", "hold", _pat_first_board),
     ("P14", "高位放量滞涨", "出货", "sell", _pat_high_vol_stall),
-    ("P15", "量价背离", "出货", "sell", _pat_vol_price_div),
+    ("P15", "新高量背离放量回撤", "出货", "sell", _pat_vol_price_div),
     ("P16", "阴天量", "出货", "sell", _pat_bearish_max_vol),
     ("P17", "倒V反转", "出货", "sell", _pat_inverted_v),
     ("P18", "顶部大阴包阳", "出货", "sell", _pat_bearish_engulf),
     ("P19", "灌压巨量大阴", "出货", "sell", _pat_dump_bigbear),
     ("P20", "均线放量破位", "出货", "sell", _pat_ma_breakdown),
-    ("P21", "假跌破收回", "洗盘", "buy", _pat_spring_reclaim),       # 当前统一复测未纳入有效集
+    ("P21", "深破缩量收回", "洗盘", "buy", _pat_spring_reclaim),     # 双池10~40日正向，核心洗盘买点
     ("P22", "放量假突破", "出货", "sell", _pat_failed_breakout),     # 全历史逐日复测：双池2~40日风控有效
-    ("P23", "箱体波动压缩", "吸筹", "buy", _pat_compression),        # 状态型观察标签，不进入核心有效集
+    ("P23", "低位压缩温和量能转强", "吸筹", "buy", _pat_compression),  # 10日实验信号，不进入核心有效集
     ("P24", "OBV底背离", "吸筹", "buy", _pat_obv_divergence),        # 强OBV背离，连续5日后一次性确认
-    ("P25", "低位横盘缩量后启动", "吸筹", "buy", _pat_bottom_base_ignition),
+    ("P25", "中低位缩量平台转强", "吸筹", "buy", _pat_bottom_base_ignition),
     ("P26", "获利盘风险", "出货", "sell", _pat_chip_winner_risk),
 ]
 
 # 每个形态的命中条件一句话（供前端「命中形态解释」模块；与文件头总表口径一致）。
 PATTERN_DESC: Dict[str, str] = {
-    "P1": "双池计算并进入吸筹分5%，但仅小盘池回测有效：120日低分位≤45%、60日振幅≤25%且涨跌≤8%、20日横盘/波动压缩、低点不再下移，连续3日首次确认；确认日筹码集中且贴近低位成本峰，并要求沪深300 ETF处于MA60上方或MA20连续修复。小盘10日胜率58.4%、同池超额+1.08%、HAC t=2.11；龙头10日超额-0.32%",
-    "P2": "位置<0.40 + 当日为十字星/长下影 + 近10日合计≥5根：反复探底当日再次确认",
-    "P3": "位置<0.35 + 近8日缩量大阴跌≥4.5%，不深破底且首次完整收复跌前收盘；最新复测leader 2日/hotmoney 5日通过FDR",
-    "P4": "位置<0.60 + 量比>1.2 + |20日涨跌|<6% + CMF>0：放量但价稳、资金净流入",
-    "P5": "位置<0.45 + 近端两摆动低点等高/低点抬高 + 中间反弹≥6%(颈线)：双底/W底",
+    "P1": "原低位缩量企稳两日首次确认，或低位首次突破前10日最高收盘并通过510310日终风险门；当前全历史复测覆盖率leader/hotmoney 0.5185%/0.5085%，10日胜率54.79%/57.56%、同池超额+0.464%/+1.297%、HAC t=3.21/3.24；小盘更有效（hotmoney池效果更强），进入吸筹分10%",
+    "P2": "位置<0.40 + 近10日真实长下影≥2根(下影≥2×实体且≥2%) + 当日量能/此前20日均量0.4~1.0：温和缩量探底承接；全历史复测双池10/20日正超额；大盘更有效（leader池效果更强），进入吸筹分5%",
+    "P3": "位置<0.32 + 近10日收盘跌≥4.2%且量低于此前20日均量，事件后收盘最多再破底6%，确认量比≤1.35并真正首次完整收复；全历史复测双池命中率0.1005%/0.2002%，2~40日超额均为正",
+    "P4": "位置<0.60 + 近5日/前20日量比1.2~2.5 + |20日涨跌|<6% + CMF>0，仅在核心状态首次进入时报告；覆盖率约1.17%/1.06%，双池留出未验证为买点，保留中性结构观察且不驱动绿色吸筹阶段",
+    "P5": "位置<0.45 + 两摆动低点(-2%~+10%) + 颈线反弹≥5% + 二底后8日内；今日触及颈线且由昨日未突破切换为突破前3日收盘高点。双池全历史复测命中率0.116%/0.131%，10日胜率55.2%/63.8%、同池超额+0.35%/+0.84%；小盘更有效（hotmoney池效果更强），按产品决定暂时纳入核心有效集并进入吸筹分5%",
     "P6": "近8日长上影(>3%且>2×实体)创20日新高后收盘缩回：探顶又压回；保留形态观测，不作为有效因子",
     "P7": "位置<0.40 + 量比>1.5 + 近5日最大振幅>7%：低位突然放量异动；保留形态观测，不作为有效因子",
     "P8": "站上MA20 + 回踩近10日高点-2%~-15% + 跌日量<涨日量 + 筹码集中≥0.40：挖坑不破位",
@@ -1962,38 +3148,78 @@ PATTERN_DESC: Dict[str, str] = {
     "P12": "连续涨停 streak≥2；全历史逐日复测：2日动量有效，hotmoney 池10~40日转为反转风险",
     "P13": "今日首板(近20日无涨停) + 换手10%~45%；全历史逐日复测：2日动量有效，20~40日转为反转风险",
     "P14": "位置≥0.85 + 量比>1.5 + 近5日涨幅≤2% + 上影>2%：高位放量不涨；全历史逐日复测：双池2~40日风控有效",
-    "P15": "创60日新高却缩量(量比<1.0)、或放量(>1.8)却5日涨幅<1%：量价背离顶",
-    "P16": "位置≥0.80 + 近5日出现40日最大量且收阴：天量收阴；全历史逐日复测：双池2~40日风控有效",
-    "P17": "位置≥0.80 + 较前期冲高>15%后从峰值回落≤-8%：冲高倒V；全历史逐日复测：双池2~40日持续负超额",
+    "P15": "前15日内曾出现旧P15新高量背离，当前收盘较含当日的近10日盘中高点回撤至少4%，且当日量能/此前20日均量>1.5；信号记在确认日。全历史复测命中率leader/hotmoney为0.598%/0.854%，双池2~40日胜率<50%且同池超额均为负",
+    "P16": "位置≥0.80 + 近3日出现40日最大量且相对昨收下跌 + 当前收盘较近10日最高价回撤≥3%：天量分歧后的价格走弱确认；全历史复测双池命中率0.596%/0.926%，2~40日胜率与同池超额均低于旧版",
+    "P17": "位置≥0.80 + 较前期冲高>16%后从峰值回落≤-8%，且峰值首次出现于最近5根、信号日不反弹：新鲜倒V；全历史复测双池命中率约0.67%/1.41%，2~40日胜率与超额均低于旧版",
     "P18": "位置≥0.80 + 昨阳今阴且今实体完全吞没昨实体：顶部看跌吞没",
     "P19": "位置≥0.70 + 量比>1.8 + 实体跌>6%且收在当日价区下1/4：巨量灌压大阴；全历史逐日复测：双池2~40日持续负超额",
-    "P20": "收盘跌破MA20(5日前还在MA20上方) + 量比>1.2：放量破位；全历史逐日复测：双池2~40日风控有效",
-    "P21": "近5日最低假摔穿前40日箱体下沿×0.985、收盘又站回：假跌破收回(Wyckoff spring)",
+    "P20": "收盘跌破MA20(第5根bar仍在当时MA20上方) + 近5/此前20日量能比>1.3 + 当日跌≥1%：确认放量破位；全历史复测双池命中率1.08%/1.41%，2~40日胜率<50%且负超额",
+    "P21": "近5日最低价深破前40日箱底至少2.5%，当前收盘重新站回，且信号日量能不高于此前20日均值的0.75倍：供给枯竭后的Wyckoff spring；全历史复测双池10/20/40日胜率与同池超额均为正，进入吸筹分10%",
     "P22": "今日盘中破前40日高但收盘没站上 + 当日放量>1.8×：放量假突破(高位拒绝)；全历史逐日复测：双池2~40日风控有效",
-    "P23": "中低位 + 近20日振幅<0.80×近60日：箱体波动压缩、蓄势酝酿",
+    "P23": "位置<0.36 + 近20/60日振幅比<0.96 + 收盘≥1.005×MA20，只在该结构状态首次成立且信号日量能/此前20日均量在0.4~1.2时触发；冻结快照复核覆盖率leader/hotmoney 0.678%/0.749%，10日胜率51.83%/52.19%、同池超额+0.331%/+0.529%，继续作10日实验信号并进入吸筹分5%",
     "P24": "位置<0.50 + 30日涨幅≤3% + 量纲化OBV>0.10 + OBV价差>0.25，连续5日后仅首次确认；最新复测双池10日有效",
-    "P25": "双池计算并进入吸筹分5%，但仅小盘池回测有效：120日价格分位≤45% + 60日振幅≤25%且涨跌≤8% + 近20日/前40日均量≤70% + 量能斜率≤-1% + 当日量≥前20日均量1.5倍 + 距20日平台≤2%；小盘20日胜率63.1%、同池超额+1.36%，龙头20日超额-0.78%",
-    "P26": "获利盘比例≥90%，或5个交易日前<40%且当前≥60%，并要求当日量能≥此前20日均量1.5倍：获利筹码拥挤/快速转盈后的放量兑现风险；全历史复测双池2~40日均通过HAC与FDR，所有池统一计算",
+    "P25": "双池计算并进入吸筹分5%：120日价格分位≤65% + 60日振幅≤35%且涨跌≤16% + 近20日/前40日均量≤70% + 量能斜率≤-0.5% + 20日涨幅≥0.5% + 距20日平台≤4%；全历史命中率leader/hotmoney 1.326%/1.254%，10日胜率52.4%/53.7%、同池超额+0.24%/+0.55%，方向跨早晚段为正但leader HAC未显著",
+    "P26": "获利盘比例≥90%，或5个交易日前<40%且当前≥60%；同时要求当日量能≥此前20日均量2倍、近5日涨幅≥5%、当前收盘较近10日盘中高点回撤≥3%：只把急涨后的极端放量回撤升级为兑现风险。全历史复测命中率leader/hotmoney 0.631%/0.995%，双池2~40日胜率均<50%且同池超额均为负；leader 40日HAC尚未显著",
 }
 
-# 2026-07-12 全历史逐日滚动、双池均通过 HAC + BH FDR 的核心有效形态（前端高亮）：
-#   P12/P13 为超短动量，P24 为10日吸筹买点，P26为获利盘兑现风险，其余为负向风险/出货风控；
-#   P1/P25 双池触发并各占吸筹分5%，但仅小盘池回测有效，均不进入跨池核心集。
-PATTERN_EFFECTIVE = {"P3", "P11", "P12", "P13", "P14", "P16", "P17", "P19", "P20", "P22", "P24", "P26"}
+# 当前生产核心有效形态（前端高亮）：P1/P2按2026-07-13双池复测与产品决定加入；
+#   P12/P13 为超短动量，P1/P2/P3/P5/P21/P24 为吸筹/洗盘买点，P26为获利盘兑现风险，
+#   其余为负向风险/出货风控；P1/P3/P21各占吸筹分10%，
+#   P2/P5/P23/P24/P25各占5%；P23/P25仍保留实验标签。
+PATTERN_EFFECTIVE = {"P1", "P2", "P3", "P5", "P11", "P12", "P13", "P14", "P15", "P16", "P17", "P19", "P20", "P21", "P22", "P24", "P26"}
+# “有效卖出形态”取核心有效集与结构 sell 信号的交集。P11 虽为统计负向
+# risk 样式，但原始结构是 hold；P18 仍只作形态观察。
+PATTERN_EFFECTIVE_SELL = frozenset(
+    code
+    for code, _name, _phase, signal, _matcher in PATTERNS
+    if code in PATTERN_EFFECTIVE and signal == "sell"
+)
 PATTERN_EFFECTIVE_STYLE = {
+    "P1": "bullish",
+    "P2": "bullish",
     "P3": "bullish",
+    "P5": "bullish",
     "P11": "risk",
     "P12": "momentum",
     "P13": "momentum",
     "P14": "risk",
+    "P15": "risk",
     "P16": "risk",
     "P17": "risk",
     "P19": "risk",
     "P20": "risk",
+    "P21": "bullish",
     "P22": "risk",
     "P24": "bullish",
     "P26": "risk",
 }
+
+
+def distribution_warning_rule_metadata() -> Dict[str, Any]:
+    """返回列表与形态回测共用的出货预警触发口径。"""
+    return {
+        "type": "any_of",
+        "operator": "or",
+        "pattern_codes": sorted(DISTRIBUTION_WARNING_PATTERN_CODES),
+        "trigger_on_any_pattern": True,
+        "effective_pattern_count_threshold": (
+            DISTRIBUTION_WARNING_EFFECTIVE_SELL_THRESHOLD
+        ),
+        "points_threshold": DISTRIBUTION_WARNING_POINTS_THRESHOLD,
+        "conditions": [
+            {
+                "type": "effective_sell_pattern_count",
+                "operator": "gte",
+                "threshold": DISTRIBUTION_WARNING_EFFECTIVE_SELL_THRESHOLD,
+            },
+            {
+                "type": "distribution_warning_points",
+                "operator": "gte",
+                "threshold": DISTRIBUTION_WARNING_POINTS_THRESHOLD,
+            },
+        ],
+        "points_explanation_only": False,
+    }
 
 
 def pattern_catalog() -> List[Dict[str, Any]]:
@@ -2005,15 +3231,17 @@ def pattern_catalog() -> List[Dict[str, Any]]:
             score_usage = f"吸筹分 {round(ACCUM_MODEL_WEIGHTS[key] * 100)}%"
         elif key in DIST_MODEL_WEIGHTS:
             score_usage = f"出货分 {round(DIST_MODEL_WEIGHTS[key] * 100)}%"
-        elif code in DISTRIBUTION_WARNING_POINTS:
+        elif code in DISTRIBUTION_WARNING_PATTERN_CODES:
             score_usage = "出货预警"
         else:
             score_usage = "阶段标签"
 
         if code in PATTERN_EFFECTIVE:
             validation_status, validation_label = "core", "核心有效"
-        elif code in {"P1", "P25"}:
-            validation_status, validation_label = "experimental", "仅小盘有效"
+        elif code == "P23":
+            validation_status, validation_label = "experimental", "双池10日实验"
+        elif code == "P25":
+            validation_status, validation_label = "experimental", "双池10/20日正向"
         else:
             validation_status, validation_label = "observation", "形态观察"
 
@@ -2033,20 +3261,26 @@ def scoring_model_catalog() -> Dict[str, Any]:
         "chip": ("筹码集中", "低位筹码峰越集中、当前价越接近主要成本区，分数越高。"),
         "position": ("价格位置", "当前价格在近60日区间越靠下，分数越高；它偏向低位反转。"),
         "cmf_eff": ("CMF反向分", "高买压在历史中更像短期过热，因此只惩罚过高买压。"),
-        "p3": ("P3 缩量打压首次收复", "低位缩量大阴后没有深破底，并首次完整收回下跌前收盘。"),
+        "p2": ("P2 低位长下影承接", "低位反复出现真实长下影，并由温和缩量确认；大盘更有效，命中按5分计入。"),
+        "p3": ("P3 缩量打压首次收复", "低位缩量收盘大跌后，事件后从未站回且收盘最多再破底6%，当日首次完整收回下跌前收盘。"),
+        "p5": ("P5 双底右腿确认", "二底形成后回到颈线，并首次突破近3日收盘高点；小盘更有效，按产品决定暂时纳入核心有效集，命中计5分。"),
+        "p21": ("P21 深破缩量收回", "价格深破前40日箱底后重新站回，且信号日缩量；命中按10分计入。"),
+        "p23": ("P23 低位压缩温和量能转强（实验）", "低位波动压缩后站上MA20，并由温和量能确认；命中按5分计入。"),
         "p24": ("P24 OBV底背离", "价格仍在低位，量纲化OBV持续走强并连续确认后首次触发。"),
-        "p1": ("P1 低位底盘确认（仅小盘有效）", "双池命中均计5分；长期低位底盘、筹码成本和市场修复共同确认。回测仅小盘池为正，龙头池同池超额为负。"),
-        "p25": ("P25 缩量平台启动（仅小盘有效）", "双池命中均计5分；长期低位缩量平台出现量能启动。回测仅小盘池较好，龙头池同池超额为负。"),
+        "p1": ("P1 超额优先复合确认", "原低位缩量企稳两日首次确认，或低位首次突破前10日最高收盘并通过510310日终风险门；小盘更有效，双池命中计10分。"),
+        "p25": ("P25 缩量平台转强（双池实验）", "双池命中均计5分；中低位缩量平台的20日价格开始转正并接近平台。双池10/20日胜率和同池超额方向为正，但leader尚未达到HAC显著。"),
         "holder_change": ("股东户数变化", "户数下降得分更高；-15%映射100分、+15%映射0分，缺失按50分。"),
         "repurchase": ("近90日回购", "近90个自然日有回购公告得100分，否则0分。"),
     }
     distribution = {
         "p14": ("P14 高位放量滞涨", "处于高位、明显放量，但价格不再有效上涨。"),
-        "p16": ("P16 阴天量", "高位附近出现阶段最大量并收阴。"),
-        "p17": ("P17 倒V反转", "高位冲高后从峰值快速回落，趋势结构转弱。"),
+        "p15": ("P15 新高量背离放量回撤", "前15日出现新高量背离事件后，当前放量并从近10日盘中高点明显回撤，确认顶部风险。"),
+        "p16": ("P16 阴天量回撤确认", "高位出现阶段最大量收跌后，仅在3日时效内且价格已从近10日高点回撤至少3%时确认。"),
+        "p17": ("P17 新鲜倒V反转", "高位冲高后从新近峰值快速回落，且信号日继续走弱，过滤陈旧或反弹中的倒V状态。"),
         "p19": ("P19 灌压巨量大阴", "高位巨量长阴且收在日内低位，反映集中抛压。"),
         "p20": ("P20 均线放量破位", "此前位于MA20上方，随后放量跌破均线。"),
         "p22": ("P22 放量假突破", "盘中突破前高但收盘未站稳，同时明显放量。"),
+        "p26": ("P26 获利盘冲高回撤风险", "获利盘拥挤或快速转盈后出现极端放量；近5日已有快速拉升、当前又从近10日盘中高点回撤至少3%，确认强势延续已转为兑现风险。"),
         "lhb_recent": ("近90日龙虎榜", "近期上榜常伴随异动和交易拥挤，作为反转避雷信号。"),
         "technical": ("连续技术派发", "高位门控后，综合20日涨幅和高位放量计算连续风险分。"),
         "divergence": ("原始量价背离", "成交投入大而价格反馈弱，说明资金推动效率下降。"),
@@ -2062,7 +3296,7 @@ def scoring_model_catalog() -> Dict[str, Any]:
         {
             "key": "pattern_phase",
             "label": "阶段标签与把握度",
-            "description": "P1–P26先汇总为吸筹、试盘、洗盘、突破、拉升或出货阶段；阶段汇总本身不计分，但P1/P3/P24/P25会分别按生产权重进入吸筹分。",
+            "description": "P1–P26先决定吸筹、试盘、洗盘、突破、拉升或出货阶段；买入把握沿用形态强度、吸筹分与出货冲突分，出货把握采用PIT时间留出实验校准后的吸筹分/连续出货分概率。",
         },
         {
             "key": "market_regime",
@@ -2096,32 +3330,78 @@ def scoring_model_catalog() -> Dict[str, Any]:
             "description": "吸筹原始分与出货原始分分别在当前候选池内转换为0–100横截面百分位；同分共享平均名次。出货最多折掉50%的吸筹强度。",
             "example": {"accumulation_percentile": 90, "distribution_percentile": 40, "opportunity_score": 72},
         },
-        "accumulation": {"formula": "原始特征分 × 权重后求和", "factors": rows(ACCUM_MODEL_WEIGHTS, accumulation)},
-        "distribution": {"formula": "特征值(0–1) × 权重 × 100后求和", "factors": rows(DIST_MODEL_WEIGHTS, distribution)},
+        "accumulation": {
+            "formula": "原始特征分 × 权重后求和",
+            "factors": rows(ACCUM_MODEL_WEIGHTS, accumulation),
+            "suspect_threshold": SUSPECT_ACCUM_SCORE,
+            "suspect_rule": "完全未命中任何形态且吸筹分达到阈值",
+        },
+        "distribution": {
+            "formula": "特征值(0–1) × 权重 × 100后求和",
+            "factors": rows(DIST_MODEL_WEIGHTS, distribution),
+            "warning_rule": distribution_warning_rule_metadata(),
+        },
         "reversal": {"formula": "过热因子横截面排名后反向加权，再做近3日EMA", "smooth_days": REVERSAL_SMOOTH_DAYS,
                      "factors": rows(REVERSAL_WEIGHTS, reversal)},
         "auxiliary": auxiliary,
-        "sorting": {"leader": "细分龙头池按机会分排序", "hotmoney": "游资小盘池按反转分排序，机会分仅辅助观察"},
+        "sorting": {
+            "leader": "细分龙头池按机会分排序",
+            "hotmoney": "游资小盘池按反转分排序，机会分仅辅助观察",
+            "etf": "ETF 池按技术机会分排序；公司行为因子不适用",
+        },
+        "pool_overrides": {
+            "etf": {
+                "accumulation_weights": accumulation_model_weights("etf"),
+                "distribution_weights": distribution_model_weights("etf"),
+                "excluded_factors": list(ETF_ACCUM_EXCLUDED + ETF_DIST_EXCLUDED),
+                "validation": "technical_heuristic_unvalidated_for_etf",
+            }
+        },
     }
 
 
 def match_patterns(code: str, bars: List[Dict[str, Any]],
                    ctx: Optional[Dict[str, Any]] = None,
                    pool: Optional[str] = None,
-                   p1_market_gate: bool = False) -> List[Dict[str, str]]:
+                   p1_market_gate: bool = False,
+                   p1_override: Optional[bool] = None,
+                   patterns: Optional[Sequence[Tuple[str, str, str, str, Any]]] = None,
+                   ) -> List[Dict[str, str]]:
     """对一段日线窗口匹配全部形态，返回命中列表（PIT 安全）。"""
     if len(bars) < MIN_BARS:
         return []
     ctx = ctx or _build_pattern_context(code, bars)
     current_bars = bars[-LOOKBACK:]
     fired: List[Dict[str, str]] = []
-    for pcode, name, phase, signal, fn in PATTERNS:
-        # P1 双池计算并参与吸筹分，但回测只有 hotmoney 池有效；市场数据缺失时
-        # fail closed，避免把旧的高频“普通横盘”标签重新放回实时或历史结果。
-        if pcode == "P1" and not p1_market_gate:
-            continue
+    selected_patterns = PATTERNS if patterns is None else patterns
+    for pcode, name, phase, signal, fn in selected_patterns:
+        # 事件型P1/P4需要让昨日状态也能使用完整180日量度来源窗口；P15
+        # 需要按过去15日各事件当日的量源复算；P21额外保留正式回测相同的
+        # 185根资格窗口；其余形态只看统一LOOKBACK窗口。
+        if pcode == "P1":
+            pattern_bars = bars[-(LOOKBACK + P1_CONFIRM_DAYS):]
+        elif pcode == "P4":
+            pattern_bars = bars[-(LOOKBACK + 1):]
+        elif pcode == "P15":
+            pattern_bars = bars[-(LOOKBACK + P15_EVENT_LOOKBACK_DAYS):]
+        elif pcode == "P21":
+            pattern_bars = bars[-P21_MIN_HISTORY_BARS:]
+        else:
+            pattern_bars = current_bars
         try:
-            if fn(current_bars, ctx):
+            if pcode == "P1" and fn is _pat_low_consolidation:
+                matched = (
+                    bool(p1_override)
+                    if p1_override is not None
+                    else fn(
+                        pattern_bars,
+                        ctx,
+                        p1_market_gate if pool != "etf" else False,
+                    )
+                )
+            else:
+                matched = fn(pattern_bars, ctx)
+            if matched:
                 fired.append({"code": pcode, "name": name, "phase": phase, "signal": signal})
         except Exception:
             continue
@@ -2129,23 +3409,39 @@ def match_patterns(code: str, bars: List[Dict[str, Any]],
 
 
 def _distribution_warning_points(fired: Sequence[Dict[str, str]]) -> int:
-    """命中出货形态的累计预警积分；同一形态最多计一次。"""
+    """命中有效出货证据的风险积分；按形态代码去重。"""
     codes = {str(pattern.get("code") or "") for pattern in fired}
     return sum(DISTRIBUTION_WARNING_POINTS.get(code, 0) for code in codes)
 
 
-def _pattern_phase(fired: List[Dict[str, str]], score: Optional[float] = None) -> str:
-    """命中形态汇总成主导阶段（优先级：出货积分达标 > 突破 > 买入区 > 拉升 > 试盘）。
+def _effective_sell_pattern_count(fired: Sequence[Dict[str, str]]) -> int:
+    """命中的出货预警形态数；按代码去重（兼容既有字段名）。"""
+    codes = {str(pattern.get("code") or "") for pattern in fired}
+    return len(codes & DISTRIBUTION_WARNING_PATTERN_CODES)
 
-    出货预警只统计 P14/P16/P17/P19/P20/P22，累计达到
-    DISTRIBUTION_WARNING_THRESHOLD 才触发；P15/P18 保留观察但不计预警积分。
+
+def _distribution_warning_triggered(fired: Sequence[Dict[str, str]]) -> bool:
+    """统一出货预警规则：预警集合内任一形态命中即触发。"""
+    return (
+        _effective_sell_pattern_count(fired)
+        >= DISTRIBUTION_WARNING_EFFECTIVE_SELL_THRESHOLD
+        or _distribution_warning_points(fired)
+        >= DISTRIBUTION_WARNING_POINTS_THRESHOLD
+    )
+
+
+def _pattern_phase(fired: List[Dict[str, str]], score: Optional[float] = None) -> str:
+    """命中形态汇总成主导阶段（优先级：出货预警达标 > 突破 > 买入区 > 拉升 > 试盘）。
+
+    出货预警只统计 DISTRIBUTION_WARNING_PATTERN_CODES：任一形态命中即触发。
+    P11 是 hold 风险，P18 不在预警集合内，不会单独触发。
     突破=放量右进买点，最 actionable，仅次于达标的出货风控示警、优先于被动的吸筹/洗盘；
     买入区按类别细分吸筹 / 洗盘（两类都中则合并标注）；剩余 hold 区拉升中 > 试盘；
     无任何形态命中：吸筹分≥SUSPECT_ACCUM_SCORE → 疑似吸筹(待确认)，否则 → 观望(场外不参与)。
     """
     sigs = {p["signal"] for p in fired}
     cats = {p["phase"] for p in fired}
-    if _distribution_warning_points(fired) >= DISTRIBUTION_WARNING_THRESHOLD:
+    if _distribution_warning_triggered(fired):
         return "出货预警🔴"
     if "突破" in cats:
         return "▲突破🟠"
@@ -2158,7 +3454,7 @@ def _pattern_phase(fired: List[Dict[str, str]], score: Optional[float] = None) -
         return "吸筹🟢"
     if "hold" in sigs:                # 此时仅剩 拉升 / 试盘
         return "拉升中🟠" if "拉升" in cats else "试盘🟡"
-    if score is not None and score >= SUSPECT_ACCUM_SCORE:
+    if not fired and score is not None and score >= SUSPECT_ACCUM_SCORE:
         return "疑似吸筹(待确认)🟢"
     return "观望⚪"
 
@@ -2189,11 +3485,13 @@ def _distribution_model_features(
     codes = set(pattern_codes or [])
     return {
         "p14": 1.0 if "P14" in codes else 0.0,
+        "p15": 1.0 if "P15" in codes else 0.0,
         "p16": 1.0 if "P16" in codes else 0.0,
         "p17": 1.0 if "P17" in codes else 0.0,
         "p19": 1.0 if "P19" in codes else 0.0,
         "p20": 1.0 if "P20" in codes else 0.0,
         "p22": 1.0 if "P22" in codes else 0.0,
+        "p26": 1.0 if "P26" in codes else 0.0,
         "lhb_recent": 1.0 if lhb_recent else 0.0,
         "technical": _clip01((technical_distribution_score or 0.0) / 100.0),
         "divergence": _clip01((divergence_score or 0.0) / 100.0),
@@ -2206,20 +3504,48 @@ def _distribution_model_score(features: Dict[str, float],
     return round(100.0 * sum(weights.get(k, 0.0) * features.get(k, 0.0) for k in weights), 1)
 
 
-def _apply_distribution_model(row: Dict[str, Any]) -> None:
+def _pool_model_weights(base: Dict[str, float], pool: str,
+                        excluded_for_etf: Sequence[str]) -> Dict[str, float]:
+    """ETF 剔除公司行为因子后，把剩余技术权重重新归一到 1。"""
+    if pool != "etf":
+        return dict(base)
+    excluded = set(excluded_for_etf)
+    total = sum(float(weight) for key, weight in base.items() if key not in excluded)
+    if total <= 0:
+        return {}
+    return {
+        key: float(weight) / total
+        for key, weight in base.items()
+        if key not in excluded
+    }
+
+
+def accumulation_model_weights(pool: str = DEFAULT_POOL) -> Dict[str, float]:
+    return _pool_model_weights(ACCUM_MODEL_WEIGHTS, pool, ETF_ACCUM_EXCLUDED)
+
+
+def distribution_model_weights(pool: str = DEFAULT_POOL) -> Dict[str, float]:
+    return _pool_model_weights(DIST_MODEL_WEIGHTS, pool, ETF_DIST_EXCLUDED)
+
+
+def _apply_distribution_model(row: Dict[str, Any], pool: str = DEFAULT_POOL) -> None:
     signals = row.setdefault("signals", {})
     pattern_codes = row.get("patterns") or []
-    features = _distribution_model_features(
+    raw_features = _distribution_model_features(
         signals.get("technical_distribution_score", row.get("distribution_score")),
         pattern_codes,
         bool(row.get("lhb_recent")),
         (row.get("sub_scores") or {}).get("divergence"),
     )
-    score = _distribution_model_score(features)
+    weights = distribution_model_weights(pool)
+    features = {key: raw_features[key] for key in weights}
+    score = _distribution_model_score(features, weights)
     row["distribution_score"] = score
     signals["distribution_score"] = score
     signals["distribution_model_features"] = {k: round(v, 4) for k, v in features.items()}
-    signals["distribution_model_weights"] = {k: round(float(DIST_MODEL_WEIGHTS.get(k, 0.0)), 4) for k in DIST_FEATURES}
+    signals["distribution_model_weights"] = {k: round(float(v), 4) for k, v in weights.items()}
+    if pool == "etf":
+        signals["distribution_model_excluded"] = list(ETF_DIST_EXCLUDED)
 
 
 def _score_bars(
@@ -2245,7 +3571,7 @@ def _score_bars(
     sealed, streak = int(ctx.get("sealed") or 0), int(ctx.get("streak") or 0)
     triggered, trigger = bool(ctx.get("triggered")), ctx.get("trigger")
 
-    # CMF 在九因子模型中反向计入：高买压是反转风险，低/中性买压最多给50分。
+    # CMF 在十因子模型中反向计入：高买压是反转风险，低/中性买压最多给50分。
     cmf_eff = min(50.0, 100.0 - s_cmf) if s_cmf is not None else None
     technical_dist = _score_distribution(close_pctile, drift, vol_ratio)
     turnover_pctile = _turnover_pctile(bars)              # 最新换手率分位（拥挤度，仅展示）
@@ -2288,15 +3614,19 @@ def _score_bars(
     }
 
 
-def _state_label(score: Optional[float], sealed: int, streak: int, triggered: bool = False) -> str:
+def _state_label(score: Optional[float], sealed: int, streak: int,
+                 triggered: bool = False, phase: Optional[str] = None) -> str:
+    """兼容旧 state 字段；疑似吸筹以主阶段判定为准，纯分数档位不复用同名标签。"""
     if sealed > 0 or streak >= 4:
         return "已启动(封板/连板,非吸筹)"
     if score is None:
         return "数据不足"
     if triggered and score >= 40:
         return "放量突破(右进)"      # 事件标记；verify 显示截面不占优，慎追
+    if phase and "疑似吸筹" in phase:
+        return "疑似吸筹(待确认)"
     if score >= 65:
-        return "疑似吸筹"
+        return "吸筹特征较强"
     if score >= 40:
         return "吸筹特征中等"
     return "平淡"
@@ -2324,7 +3654,7 @@ def _phase_confidence(phase: str, fired: List[Dict[str, str]],
 
     阶段标签由形态负责；把握度衡量“这个阶段判断是否被分数确认”：
       - 吸筹/洗盘：看买入形态 + 吸筹分，出货分高则扣分；
-      - 出货：看 sell 形态 + 出货分，吸筹分高则略扣；
+      - 出货：形态负责触发；把握用PIT样本外校准后的吸筹分/连续出货分Logistic概率；
       - 突破/拉升/试盘：看 hold 形态 + 低出货风险，避免把追高形态机械给高分；
       - 疑似吸筹/观望：无形态时分别按“弱吸筹确认”和“无明显阶段信号”计算。
     """
@@ -2339,9 +3669,18 @@ def _phase_confidence(phase: str, fired: List[Dict[str, str]],
         return round(_clip_score(100.0 - 1.15 * signal_strength, 0.0, 85.0), 1)
 
     if "出货" in phase:
-        shape = _phase_pattern_strength(fired, {"sell"})
-        conflict_penalty = max(0.0, ambush - dist) * 0.12
-        return round(_clip_score(0.55 * shape + 0.45 * dist - conflict_penalty), 1)
+        logit = (
+            PHASE_CONFIDENCE_SELL_INTERCEPT
+            + PHASE_CONFIDENCE_SELL_ACCUMULATION_COEF * ambush / 100.0
+            + PHASE_CONFIDENCE_SELL_DISTRIBUTION_COEF * dist / 100.0
+        )
+        # 数值稳定的 sigmoid；正常0~100输入对应的logit远未到溢出区，但保留保护。
+        if logit >= 0.0:
+            probability = 1.0 / (1.0 + math.exp(-min(logit, 60.0)))
+        else:
+            exp_logit = math.exp(max(logit, -60.0))
+            probability = exp_logit / (1.0 + exp_logit)
+        return round(100.0 * probability, 1)
 
     if "突破" in phase or "拉升" in phase or "试盘" in phase:
         shape = _phase_pattern_strength(fired, {"hold"})
@@ -2392,11 +3731,14 @@ def _evidence(res: Dict[str, Any], fired: List[Dict[str, str]],
         add("高位买压(反转风险)", "bearish")
     if (sub.get("chip") or 0) >= 60:
         add("低位筹码集中", "bullish")
+    fired_codes = {pattern.get("code") for pattern in fired}
     pos = sig.get("close_pctile")
-    if bars is not None and pos is not None and pos < 0.60:
+    if "P23" in fired_codes:
+        add("低位压缩温和量能转强", "bullish")
+    elif bars is not None and pos is not None and pos < P23_POSITION_60_MAX:
         ratio = _amp_ratio(bars)
         if ratio is not None and ratio < COMPRESS_AMP_RATIO:
-            add("波动压缩(酝酿)", "bullish")
+            add("波动压缩(待企稳确认)", "neutral")
     if sig.get("triggered"):
         add("放量突破(追高风险)", "bearish")       # P11 全历史逐日复测为双池负向风险
     streak = sig.get("limit_streak") or 0
@@ -2407,7 +3749,7 @@ def _evidence(res: Dict[str, Any], fired: List[Dict[str, str]],
     tp = sig.get("turnover_pctile")
     if tp is not None and tp > 0.84:
         add("换手拥挤", "bearish")
-    if "P26" in {pattern.get("code") for pattern in fired}:
+    if "P26" in fired_codes:
         winner = sig.get("chip_winner")
         change = sig.get("chip_winner_5d_change")
         if winner is not None and winner >= CHIP_WINNER_RISK_HIGH:
@@ -2426,29 +3768,58 @@ def _score_candidate_from_bars(
     bars: List[Dict[str, Any]],
     pool: str = DEFAULT_POOL,
     p1_market_gate: bool = False,
+    p1_state_override: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """给单只候选按给定 bars 打分；离线/实时路径共用同一套形态逻辑。"""
     out = dict(cand)
     current_bars = bars[-LOOKBACK:]
     if len(current_bars) < MIN_BARS:
+        p1_state = (
+            dict(p1_state_override)
+            if isinstance(p1_state_override, dict)
+            else _p1_rule_state(bars, p1_market_gate if pool != "etf" else False)
+        )
         out.update({"ambush_score": None, "score_status": "INSUFFICIENT_DATA",
-                    "state": "数据不足", "last_date": bars[-1]["date"] if bars else None})
+                    "state": "数据不足", "last_date": bars[-1]["date"] if bars else None,
+                    "p1_rule_state": p1_state})
         return out
     pattern_context = _build_pattern_context(cand["code"], bars)
     res = _score_bars(cand["code"], current_bars, ctx=pattern_context)
     if res is None:
+        p1_state = (
+            dict(p1_state_override)
+            if isinstance(p1_state_override, dict)
+            else _p1_rule_state(bars, p1_market_gate if pool != "etf" else False)
+        )
         out.update({"ambush_score": None, "score_status": "INSUFFICIENT_DATA",
-                    "state": "数据不足", "last_date": bars[-1]["date"] if bars else None})
+                    "state": "数据不足", "last_date": bars[-1]["date"] if bars else None,
+                    "p1_rule_state": p1_state})
         return out
+    p1_state = (
+        dict(p1_state_override)
+        if isinstance(p1_state_override, dict)
+        else _p1_rule_state(bars, p1_market_gate if pool != "etf" else False)
+    )
     fired = match_patterns(
         cand["code"], bars, ctx=pattern_context, pool=pool,
-        p1_market_gate=p1_market_gate,
+        p1_market_gate=p1_market_gate if pool != "etf" else False,
+        p1_override=bool(p1_state.get("active")),
     )
     winner = pattern_context.get("chip_winner")
     winner_prior = pattern_context.get("chip_winner_prior")
     winner_change = pattern_context.get("chip_winner_change")
+    effective_p1_market_gate = bool(
+        p1_state.get("market_gate")
+        if isinstance(p1_state_override, dict)
+        else (p1_market_gate if pool != "etf" else False)
+    )
     res["signals"].update({
-        "p1_market_gate": bool(p1_market_gate),
+        "p1_market_gate": effective_p1_market_gate,
+        "p1_signal_date": p1_state.get("signal_date"),
+        "p1_source": p1_state.get("source"),
+        "p1_base_leg_hit": bool(p1_state.get("base_leg_hit")),
+        "p1_breakout_addon_hit": bool(p1_state.get("supplemental_hit")),
+        "p1_eod_only": True,
         "chip_winner": round(winner, 2) if winner is not None else None,
         "chip_winner_5d_ago": round(winner_prior, 2) if winner_prior is not None else None,
         "chip_winner_5d_change": round(winner_change, 3) if winner_change is not None else None,
@@ -2458,26 +3829,34 @@ def _score_candidate_from_bars(
     })
     pattern_codes = [p["code"] for p in fired]
     distribution_warning_points = _distribution_warning_points(fired)
+    distribution_warning_effective_sell_count = _effective_sell_pattern_count(fired)
+    distribution_warning_triggered = _distribution_warning_triggered(fired)
     res["patterns"] = pattern_codes
-    _apply_distribution_model(res)
+    _apply_distribution_model(res, pool=pool)
     score_features = {
         "sub_scores": res.get("sub_scores") or {},
         "patterns": pattern_codes,
         "holder_change": out.get("holder_change"),
         "repurchase_recent": bool(out.get("repurchase_recent")),
     }
-    score = _accumulation_model_score(_accumulation_raw_features(score_features))
+    weights = accumulation_model_weights(pool)
+    raw_score_features = _accumulation_raw_features(score_features)
+    active_score_features = {key: raw_score_features[key] for key in weights}
+    score = _accumulation_model_score(active_score_features, weights)
     phase = _pattern_phase(fired, score)
     out.update({
         "ambush_score": score,
         "distribution_score": res["distribution_score"],
         "score_status": "OK",
         "triggered": res["triggered"],
-        "state": _state_label(score, res["sealed"], res["streak"], res["triggered"]),
+        "state": _state_label(score, res["sealed"], res["streak"], res["triggered"], phase),
         "last_date": bars[-1]["date"],
         "patterns": pattern_codes,
         "pattern_detail": fired,
+        "p1_rule_state": p1_state,
         "distribution_warning_points": distribution_warning_points,
+        "distribution_warning_effective_sell_count": distribution_warning_effective_sell_count,
+        "distribution_warning_triggered": distribution_warning_triggered,
         "pattern_phase": phase,
         "phase_confidence": _phase_confidence(phase, fired, score, res["distribution_score"]),
         "invalidations": _phase_invalidations(phase),
@@ -2486,7 +3865,26 @@ def _score_candidate_from_bars(
         "sub_scores": res["sub_scores"],
     })
     out["signals"]["distribution_warning_points"] = distribution_warning_points
-    out["signals"]["distribution_warning_threshold"] = DISTRIBUTION_WARNING_THRESHOLD
+    out["signals"]["distribution_warning_points_explanation_only"] = False
+    out["signals"]["distribution_warning_points_threshold"] = (
+        DISTRIBUTION_WARNING_POINTS_THRESHOLD
+    )
+    out["signals"]["distribution_warning_effective_sell_count"] = (
+        distribution_warning_effective_sell_count
+    )
+    out["signals"]["distribution_warning_effective_sell_threshold"] = (
+        DISTRIBUTION_WARNING_EFFECTIVE_SELL_THRESHOLD
+    )
+    out["signals"]["distribution_warning_rule"] = distribution_warning_rule_metadata()
+    out["signals"]["distribution_warning_triggered"] = distribution_warning_triggered
+    out["signals"]["factor_applicability"] = {
+        "company_capital": pool != "etf",
+        "chip": out["signals"].get("chip_concentration") is not None,
+        "technical": True,
+    }
+    if pool == "etf":
+        out["signals"]["accumulation_model_excluded"] = list(ETF_ACCUM_EXCLUDED)
+        out["signals"]["distribution_model_excluded"] = list(ETF_DIST_EXCLUDED)
     out.update({f"rev_{k}": v for k, v in _reversal_raw_features(cand["code"], current_bars).items()})
     if pool == "hotmoney" and REVERSAL_SMOOTH_DAYS > 1:
         # 近 N 日各自的原始过热因子(0=今日)；PIT：第 k 日窗口=砍掉最后 k 根 bar，仍 ≤ as_of。
@@ -2512,23 +3910,32 @@ def score_candidate(
     as_of 给定时只用该日期及以前的 bar（PIT 防泄漏，供历史复盘）。
     pool='hotmoney' 且开启平滑(REVERSAL_SMOOTH_DAYS>1)时附 rev_hist(近 N 日原始过热因子,供 EMA 平滑)。
     """
-    bars = _recent_bars(conn, cand["code"], limit=LOOKBACK + CHIP_WINNER_RISK_DAYS, as_of=as_of)
+    bars = _recent_bars(conn, cand["code"], limit=PATTERN_EVAL_BARS, as_of=as_of)
     if p1_market_gate is None:
         signal_date = str(bars[-1].get("date") or "") if bars else ""
         p1_market_gate = _p1_market_gate_by_date(conn, [signal_date]).get(signal_date, False)
     return _score_candidate_from_bars(
-        cand, bars, pool=pool, p1_market_gate=bool(p1_market_gate)
+        cand,
+        bars,
+        pool=pool,
+        p1_market_gate=bool(p1_market_gate),
     )
 
 
 # ── 输出 ──────────────────────────────────────────────────────
 
-def base_payload(mode: str, candidate_count: int) -> Dict[str, Any]:
+def base_payload(mode: str, candidate_count: int,
+                 pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+    sources = {
+        "leader": "sw3_member.is_leader (细分行业龙头池)",
+        "hotmoney": "sw3_member.is_hot_money (游资小盘池)",
+        "etf": "stock_etf_pool.py fund_index (ETF配置池)",
+    }
     return {
         "schema": SCHEMA,
         "mode": mode,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "source": "sw3_member.is_leader (细分行业龙头池)",
+        "source": sources.get(pool, sources[DEFAULT_POOL]),
         "candidate_count": candidate_count,
     }
 
@@ -2676,7 +4083,11 @@ def _accumulation_raw_features(row: Dict[str, Any]) -> Dict[str, float]:
         "chip": float(sub.get("chip") or 0.0),
         "position": float(sub.get("position") or 0.0),
         "cmf_eff": float(sub.get("cmf_eff") or 0.0),
+        "p2": 100.0 if "P2" in pattern_codes else 0.0,
         "p3": 100.0 if "P3" in pattern_codes else 0.0,
+        "p5": 100.0 if "P5" in pattern_codes else 0.0,
+        "p21": 100.0 if "P21" in pattern_codes else 0.0,
+        "p23": 100.0 if "P23" in pattern_codes else 0.0,
         "p24": 100.0 if "P24" in pattern_codes else 0.0,
         "p1": 100.0 if "P1" in pattern_codes else 0.0,
         "p25": 100.0 if "P25" in pattern_codes else 0.0,
@@ -2745,17 +4156,25 @@ def _opportunity_score(accumulation_percentile: Optional[float],
     return round(_clip_score(accumulation) * (1.0 - penalty * dist / 100.0), 1)
 
 
-def _apply_accumulation_model(rows: List[Dict[str, Any]]) -> None:
+def _apply_accumulation_model(rows: List[Dict[str, Any]],
+                              pool: str = DEFAULT_POOL) -> None:
     """吸筹/出货保留原始解释分；机会分使用横截面百分位合成。"""
+    weights = accumulation_model_weights(pool)
     for r in rows:
         signals = r.setdefault("signals", {})
-        features = _accumulation_raw_features(r)
-        score = _accumulation_model_score(features)
+        raw_features = _accumulation_raw_features(r)
+        features = {key: raw_features[key] for key in weights}
+        score = _accumulation_model_score(features, weights)
         r["ambush_score"] = score
         signals["accumulation_model_features"] = {k: round(v, 1) for k, v in features.items()}
-        signals["accumulation_model_weights"] = {k: round(float(ACCUM_MODEL_WEIGHTS.get(k, 0.0)), 4) for k in ACCUM_FEATURES}
-        signals["holder_change_score"] = round(features["holder_change"], 1)
-        signals["repurchase_score"] = round(features["repurchase"], 1)
+        signals["accumulation_model_weights"] = {k: round(float(v), 4) for k, v in weights.items()}
+        if pool == "etf":
+            signals["accumulation_model_excluded"] = list(ETF_ACCUM_EXCLUDED)
+            signals.pop("holder_change_score", None)
+            signals.pop("repurchase_score", None)
+        else:
+            signals["holder_change_score"] = round(features["holder_change"], 1)
+            signals["repurchase_score"] = round(features["repurchase"], 1)
 
     accumulation_percentiles = _cross_section_percentiles(rows, "ambush_score")
     distribution_percentiles = _cross_section_percentiles(rows, "distribution_score")
@@ -2782,6 +4201,7 @@ def _apply_accumulation_model(rows: List[Dict[str, Any]]) -> None:
             int(signals.get("sealed_recent") or 0),
             int(signals.get("limit_streak") or 0),
             bool(r.get("triggered")),
+            phase,
         )
 
 
@@ -2937,58 +4357,103 @@ def _market_regime_series(
 
 
 def _p1_market_gate_metrics(values: Sequence[float]) -> Dict[str, Any]:
-    """P1市场门：中期趋势向上，或MA20相对5个交易日前正在修复。"""
-    if len(values) < 60:
+    """P1 突破补充腿的五条件 510310 风险门（包含边界、缺失即关闭）。"""
+    clean = [_safe(value) for value in values]
+    if (
+        len(clean) < 60
+        or any(value is None or value <= 0 for value in clean[-60:])
+    ):
         return {
             "available": False,
             "gate": False,
+            "latest": None,
+            "close_over_ma20": None,
+            "close_over_ma60": None,
+            "ret5": None,
+            "ret20": None,
+            "ma20_slope5": None,
             "ma20": None,
             "ma20_5d_ago": None,
             "ma60": None,
             "above_ma60": False,
             "ma20_rising_5d": False,
             "reason": "insufficient_history",
+            "failed_checks": ["history"],
         }
-    latest = float(values[-1])
-    ma20 = sum(values[-20:]) / 20.0
-    ma20_5d_ago = sum(values[-25:-5]) / 20.0
-    ma60 = sum(values[-60:]) / 60.0
+    latest = float(clean[-1])
+    ma20 = _mean([float(value) for value in clean[-20:]])
+    ma20_5d_ago = _mean([float(value) for value in clean[-25:-5]])
+    ma60 = _mean([float(value) for value in clean[-60:]])
+    close_over_ma20 = latest / ma20 if ma20 and ma20 > 0 else None
+    close_over_ma60 = latest / ma60 if ma60 and ma60 > 0 else None
+    ret5 = latest / float(clean[-6]) - 1.0
+    ret20 = latest / float(clean[-21]) - 1.0
+    ma20_slope5 = ma20 / ma20_5d_ago - 1.0 if ma20 and ma20_5d_ago else None
     above_ma60 = latest > ma60
     ma20_rising_5d = ma20 > ma20_5d_ago
-    reason = "above_ma60" if above_ma60 else ("ma20_rising_5d" if ma20_rising_5d else "closed")
+    checks = {
+        "close_over_ma20": bool(
+            close_over_ma20 is not None
+            and close_over_ma20 >= P1_MARKET_MA20_FLOOR
+        ),
+        "close_over_ma60": bool(
+            close_over_ma60 is not None
+            and close_over_ma60 >= P1_MARKET_MA60_FLOOR
+        ),
+        "ret5": P1_MARKET_RET5_MIN <= ret5 <= P1_MARKET_RET5_MAX,
+        "ret20": P1_MARKET_RET20_MIN <= ret20 <= P1_MARKET_RET20_MAX,
+        "ma20_slope5": bool(
+            ma20_slope5 is not None
+            and ma20_slope5 >= P1_MARKET_MA20_SLOPE5_MIN
+        ),
+    }
+    failed = [name for name, passed in checks.items() if not passed]
     return {
         "available": True,
-        "gate": bool(above_ma60 or ma20_rising_5d),
+        "gate": not failed,
+        "latest": latest,
         "ma20": ma20,
         "ma20_5d_ago": ma20_5d_ago,
         "ma60": ma60,
+        "close_over_ma20": close_over_ma20,
+        "close_over_ma60": close_over_ma60,
+        "ret5": ret5,
+        "ret20": ret20,
+        "ma20_slope5": ma20_slope5,
         "above_ma60": above_ma60,
         "ma20_rising_5d": ma20_rising_5d,
-        "reason": reason,
+        "reason": "open" if not failed else "closed",
+        "failed_checks": failed,
     }
 
 
 def _p1_market_gate_by_date(
-    conn: sqlite3.Connection, dates: Sequence[str]
+    conn: sqlite3.Connection,
+    dates: Sequence[str],
+    require_exact_date: bool = True,
 ) -> Dict[str, bool]:
-    """为历史截面批量生成严格PIT的P1市场门，避免逐股票重复读取ETF。"""
+    """按信号日生成 PIT 市场门；缺少同日 510310 数据时默认关闭。"""
     targets = sorted(dict.fromkeys(str(date) for date in dates if date))
     if not targets:
         return {}
     series, _fallback_count = _market_regime_series(conn)
     gates: Dict[str, bool] = {}
     values: List[float] = []
+    source_date: Optional[str] = None
     index = 0
     for target in targets:
         while index < len(series) and series[index][0] <= target:
+            source_date = series[index][0]
             values.append(series[index][1])
             index += 1
-        gates[target] = bool(_p1_market_gate_metrics(values)["gate"])
+        same_date = source_date == target
+        gate = bool(_p1_market_gate_metrics(values)["gate"])
+        gates[target] = bool(gate and (same_date or not require_exact_date))
     return gates
 
 
 def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dict[str, Any]:
-    """市场状态(PIT)：保留原MA20反转状态，并附P1的MA60/MA20修复交易门。"""
+    """市场状态(PIT)：MA20反转状态及正式P1突破补充腿风险门。"""
     series, fallback_count = _market_regime_series(conn, as_of=as_of)
     if len(series) < 21:
         return {
@@ -3011,6 +4476,12 @@ def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dic
         "p1_trade_gate_available": bool(p1["available"]),
         "p1_trade_gate": bool(p1["gate"]),
         "p1_trade_gate_reason": p1["reason"],
+        "p1_trade_gate_failed_checks": p1["failed_checks"],
+        "p1_trade_gate_close_over_ma20": p1["close_over_ma20"],
+        "p1_trade_gate_close_over_ma60": p1["close_over_ma60"],
+        "p1_trade_gate_ret5": p1["ret5"],
+        "p1_trade_gate_ret20": p1["ret20"],
+        "p1_trade_gate_ma20_slope5": p1["ma20_slope5"],
         "ma60": round(p1["ma60"], 4) if p1["ma60"] is not None else None,
         "ma20_5d_ago": round(p1["ma20_5d_ago"], 4) if p1["ma20_5d_ago"] is not None else None,
         "above_ma60": bool(p1["above_ma60"]),
@@ -3018,8 +4489,8 @@ def _market_regime(conn: sqlite3.Connection, as_of: Optional[str] = None) -> Dic
         "note": ("大盘站上MA20：适合做多反转分(top档3日≈+0.83%)"
                  if above else "大盘跌破MA20：反转分做多收益骤降(≈+0.13%,接刀)，宜观望/对冲"),
         "p1_note": (
-            "P1市场门开启：累计净值站上MA60或MA20较5个交易日前上行"
-            if p1["gate"] else "P1市场门关闭：中期趋势和短期修复条件均未满足"
+            "P1突破补充腿市场门开启"
+            if p1["gate"] else "P1突破补充腿市场门关闭"
         ),
     }
 
@@ -3185,7 +4656,7 @@ def realtime_rescore_payload(
     codes = [str(row.get("code")).zfill(6) for row in stocks]
     conn = stock_storage.connect(DB_FILE)
     try:
-        bars_by_code = _bulk_recent_bars(conn, codes, LOOKBACK + CHIP_WINNER_RISK_DAYS)
+        bars_by_code = _bulk_recent_bars(conn, codes, PATTERN_EVAL_BARS)
         market_regime = _market_regime(conn) if pool == "hotmoney" else None
         gate_dates = {
             str(bars[-1].get("date") or "")
@@ -3195,7 +4666,10 @@ def realtime_rescore_payload(
             str(quote.get("quote_date") or "")[:10]
             for quote in quotes.values() if quote.get("quote_date")
         )
-        p1_market_gates = _p1_market_gate_by_date(conn, sorted(gate_dates))
+        p1_market_gates = (
+            {} if pool == "etf"
+            else _p1_market_gate_by_date(conn, sorted(gate_dates))
+        )
     finally:
         conn.close()
 
@@ -3216,7 +4690,7 @@ def realtime_rescore_payload(
         if history_gap:
             history_gap_count += 1
         merged_bars, used_quote = _merge_realtime_quote_bars(
-            bars, quote, LOOKBACK + CHIP_WINNER_RISK_DAYS
+            bars, quote, PATTERN_EVAL_BARS
         )
         if not merged_bars:
             missing_history += 1
@@ -3225,14 +4699,43 @@ def realtime_rescore_payload(
             rescored.append(row)
             continue
         signal_date = str(merged_bars[-1].get("date") or "")
+        p1_state_override: Optional[Dict[str, Any]] = None
+        if used_quote:
+            if isinstance(old.get("p1_rule_state"), dict):
+                p1_state_override = dict(old["p1_rule_state"])
+            else:
+                # 老版本离线 payload 没有状态快照时，至少按其正式 P1 标签锁定日终结果；
+                # 盘中 K 线不得新触发或撤销这个只在收盘后确认的事件。
+                offline_hit = "P1" in set(old.get("patterns") or [])
+                old_signals = old.get("signals") or {}
+                p1_state_override = {
+                    "code": "P1",
+                    "name": "P1超额优先复合确认",
+                    "version": P1_VERSION,
+                    "replaced_on": P1_REPLACED_ON,
+                    "signal_date": old.get("last_date"),
+                    "active": offline_hit,
+                    "hit": offline_hit,
+                    "source": old_signals.get("p1_source") or "offline_snapshot",
+                    "base_leg_hit": bool(old_signals.get("p1_base_leg_hit")),
+                    "supplemental_hit": bool(old_signals.get("p1_breakout_addon_hit")),
+                    "market_gate": bool(old_signals.get("p1_market_gate")),
+                    "breakout_addon_state": None,
+                    "eod_only": True,
+                    "score_weight": ACCUM_MODEL_WEIGHTS["p1"],
+                    "production_replacement": True,
+                }
         row = _score_candidate_from_bars(
             old, merged_bars, pool=pool,
             p1_market_gate=p1_market_gates.get(signal_date, False),
+            p1_state_override=p1_state_override,
         )
         if quote:
             row["realtime_price"] = quote.get("price")
             row["realtime_change_pct"] = quote.get("change_pct")
             row["realtime_quote_time"] = quote.get("quote_time")
+            if pool == "etf" and quote.get("fund_scale_yi") is not None:
+                row["fund_scale_yi"] = quote.get("fund_scale_yi")
             if used_quote and merged_bars:
                 row["realtime_adjusted_close"] = merged_bars[-1].get("close")
                 row["realtime_price_adjust"] = merged_bars[-1].get("price_adjust")
@@ -3244,19 +4747,20 @@ def realtime_rescore_payload(
                 row["realtime_volume_elapsed_minutes"] = merged_bars[-1].get("volume_elapsed_minutes")
                 row["realtime_volume_projected"] = merged_bars[-1].get("volume_projected")
                 row["realtime_volume_projection_method"] = merged_bars[-1].get("volume_projection_method")
-            if quote.get("market_cap_yi") is not None:
+            if pool != "etf" and quote.get("market_cap_yi") is not None:
                 row["market_cap_yi"] = quote.get("market_cap_yi")
         row["realtime_status"] = (
             "LOCAL_HISTORY_GAP" if history_gap else ("UPDATED" if used_quote else "LOCAL_BARS_ONLY")
         )
         if used_quote:
             used_realtime += 1
-        _apply_distribution_model(row)
-        _attach_capital_evidence(row)
+        _apply_distribution_model(row, pool=pool)
+        if pool != "etf":
+            _attach_capital_evidence(row)
         rescored.append(row)
 
     ranked = [row for row in rescored if row.get("ambush_score") is not None]
-    _apply_accumulation_model(ranked)
+    _apply_accumulation_model(ranked, pool=pool)
     if pool == "hotmoney":
         _apply_reversal_model(ranked)
         ranked.sort(key=lambda r: (r.get("reversal_score") or 0.0), reverse=True)
@@ -3294,21 +4798,21 @@ def _score_ambush_candidates(
     as_of: Optional[str],
     pool: str,
 ) -> List[Dict[str, Any]]:
-    """按每只股票实际最后bar日期套P1市场门，停牌股不会被最新市场状态追溯点亮。"""
+    """批量评分；每只候选按自身最后交易日获取 PIT 市场门。"""
     rows = [
         (
             cand,
             _recent_bars(
                 conn, cand["code"],
-                limit=LOOKBACK + CHIP_WINNER_RISK_DAYS,
+                limit=PATTERN_EVAL_BARS,
                 as_of=as_of,
             ),
         )
         for cand in candidates
     ]
-    p1_market_gates = _p1_market_gate_by_date(
-        conn,
-        [str(bars[-1].get("date") or "") for _cand, bars in rows if bars],
+    dates = [str(bars[-1].get("date") or "") for _cand, bars in rows if bars]
+    p1_market_gates = (
+        {} if pool == "etf" else _p1_market_gate_by_date(conn, dates)
     )
     return [
         _score_candidate_from_bars(
@@ -3334,22 +4838,33 @@ def run_ambush(as_of: Optional[str] = None,
         candidates = load_candidates(conn, pool, max_cap=max_cap)
         market_regime = _market_regime(conn, as_of) if pool == "hotmoney" else None
         scored = _score_ambush_candidates(conn, candidates, as_of, pool)
-        capital_map, capital_available = _load_capital_map(conn, as_of)
+        if pool == "etf":
+            capital_map, capital_available = {}, False
+        else:
+            capital_map, capital_available = _load_capital_map(conn, as_of)
     finally:
         conn.close()
 
     # 资金面维度：股东户数↓/回购=吸筹侧原始分、龙虎榜上榜=出货侧避雷。
     for r in scored:
-        info = capital_map.get(r["code"])
-        r["holder_change"] = info.get("holder_change") if info else None
-        r["repurchase_recent"] = bool(info and info.get("repurchase_recent"))
-        r["lhb_recent"] = bool(info and info.get("lhb_recent"))
-        _apply_distribution_model(r)
-        _attach_capital_evidence(r)
+        if pool != "etf":
+            info = capital_map.get(r["code"])
+            r["holder_change"] = info.get("holder_change") if info else None
+            r["repurchase_recent"] = bool(info and info.get("repurchase_recent"))
+            r["lhb_recent"] = bool(info and info.get("lhb_recent"))
+        _apply_distribution_model(r, pool=pool)
+        if pool != "etf":
+            _attach_capital_evidence(r)
 
     # PIT 防泄漏：theme_candidates.json 是「最新日」快照，历史 as-of 复盘时用它会泄露未来题材热度，
     # 故只在 as_of=None（实时跑）时才挂题材/行业热度映射；历史复盘留空，避免未来热度泄漏。
-    if as_of is None:
+    if pool == "etf":
+        theme_map, sw2_heat_map = {}, {}
+        theme_meta = {
+            "available": False,
+            "skipped_reason": "ETF 使用配置分类，不挂载个股申万行业/题材数据",
+        }
+    elif as_of is None:
         theme_map, theme_meta, sw2_heat_map = _load_theme_map()
     else:
         theme_map, sw2_heat_map = {}, {}
@@ -3366,7 +4881,7 @@ def run_ambush(as_of: Optional[str] = None,
             r["theme_heat_pctile"] = info["heat_pctile"]
 
     ranked = [r for r in scored if r.get("ambush_score") is not None]
-    _apply_accumulation_model(ranked)
+    _apply_accumulation_model(ranked, pool=pool)
     if pool == "hotmoney":
         _apply_reversal_model(ranked)              # 游资池主排序=超短反转分(纪要14)
         ranked.sort(key=lambda r: (r.get("reversal_score") or 0.0), reverse=True)
@@ -3374,23 +4889,41 @@ def run_ambush(as_of: Optional[str] = None,
         ranked.sort(key=lambda r: (r.get("opportunity_score") or 0.0, r.get("ambush_score") or 0.0), reverse=True)
     skipped = len(scored) - len(ranked)
 
-    payload = base_payload("ambush", len(candidates))
+    accum_weights = accumulation_model_weights(pool)
+    dist_weights = distribution_model_weights(pool)
+    payload = base_payload("ambush", len(candidates), pool=pool)
     payload.update({
         "status": "ok" if candidates else "empty",
-        "description": "细分龙头机会分：吸筹分、出货分展示原始模型分；仅计算机会分时把二者转为候选池百分位后做出货风险折扣。",
+        "description": (
+            "ETF 技术机会分：仅使用行情、量价、换手和技术形态；公司行为因子已剔除并对剩余权重重新归一。"
+            if pool == "etf" else
+            "细分龙头机会分：吸筹分、出货分展示原始模型分；仅计算机会分时把二者转为候选池百分位后做出货风险折扣。"
+        ),
         "params": {
             "lookback": LOOKBACK,
             "cmf_full": CMF_FULL, "chip_band": CHIP_BAND, "pos_low": POS_LOW, "pos_high": POS_HIGH,
             "p1": _p1_rule_params(),
+            "p4": _p4_rule_params(),
+            "p5": _p5_rule_params(),
+            "p15": _p15_rule_params(),
+            "p16": _p16_rule_params(),
+            "p20": _p20_rule_params(),
+            "p21": _p21_rule_params(),
+            "p26": _p26_rule_params(),
             "accumulation_model": {
-                "weights": ACCUM_MODEL_WEIGHTS,
-                "features": list(ACCUM_FEATURES),
-                "missing_holder_change_score": 50.0,
+                "weights": accum_weights,
+                "features": list(accum_weights),
+                "excluded_features": list(ETF_ACCUM_EXCLUDED) if pool == "etf" else [],
+                "missing_holder_change_score": None if pool == "etf" else 50.0,
+                "suspect_threshold": SUSPECT_ACCUM_SCORE,
+                "suspect_rule": "patterns为空且吸筹分达到阈值",
                 "experiment_file": display_path(ACCUM_EXPERIMENT_FILE),
             },
             "distribution_model": {
-                "weights": DIST_MODEL_WEIGHTS,
-                "features": list(DIST_FEATURES),
+                "weights": dist_weights,
+                "features": list(dist_weights),
+                "excluded_features": list(ETF_DIST_EXCLUDED) if pool == "etf" else [],
+                "warning_rule": distribution_warning_rule_metadata(),
                 "experiment_file": display_path(DIST_EXPERIMENT_FILE),
             },
             "opportunity_model": {
@@ -3401,6 +4934,11 @@ def run_ambush(as_of: Optional[str] = None,
         },
         "as_of": as_of,
         "pool": pool,
+        "asset_type": "etf" if pool == "etf" else "stock",
+        "analysis_scope": (
+            "technical_heuristic_unvalidated_for_etf"
+            if pool == "etf" else "validated_stock_pool"
+        ),
         "market_regime": market_regime,
         "reversal_model": ({"weights": REVERSAL_WEIGHTS, "features": list(REVERSAL_FEATURES),
                             "smooth_days": REVERSAL_SMOOTH_DAYS,
@@ -3412,9 +4950,14 @@ def run_ambush(as_of: Optional[str] = None,
         "skipped_count": skipped,
         "triggered_count": sum(1 for r in ranked if r.get("triggered")),
         "phase_counts": dict(Counter(r.get("pattern_phase") for r in ranked)),
-        "max_market_cap_yi": max_cap,
+        "max_market_cap_yi": None if pool == "etf" else max_cap,
         "theme_source": theme_meta,
+        "capital_applicable": pool != "etf",
         "capital_available": capital_available,
+        "company_data_skipped": (
+            ["financials", "valuation", "pledge", "shareholder_count", "repurchase", "lhb"]
+            if pool == "etf" else []
+        ),
         "capital_counts": {
             "holder_down": sum(1 for r in ranked if (r.get("holder_change") or 0) < 0),
             "repurchase": sum(1 for r in ranked if r.get("repurchase_recent")),
@@ -3422,8 +4965,15 @@ def run_ambush(as_of: Optional[str] = None,
         },
         "stocks": ranked,
     })
+    if pool == "etf":
+        payload["notes"] = [
+            "ETF 使用技术观察口径；P1-P26 的历史有效性来自股票双池，尚未做 ETF 专项回测。",
+            "已跳过财报、估值、质押、股东户数、公司回购、龙虎榜和个股题材数据。",
+        ]
     if not candidates:
-        payload["notes"] = ["候选池为空：先运行 python stock_crawl_segment_leaders.py crawl 选龙头并回写 is_leader。"]
+        payload["notes"] = (["ETF 配置为空：请编辑 stock_etf_pool.py 中的 fund_index。"]
+                            if pool == "etf" else
+                            ["候选池为空：先运行 python stock_crawl_segment_leaders.py crawl 选龙头并回写 is_leader。"])
     if write:
         write_payload(AMBUSH_RESULT_FILE, payload)
     if print_summary:
@@ -3498,7 +5048,12 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
     dist = " · ".join(f"{ph}{counts[ph]}" for ph in PHASE_ORDER if counts.get(ph))
     as_of_note = f" · 数据截至 {payload['as_of']}(历史复盘·禁题材缓存)" if payload.get("as_of") else ""
     cap = payload.get("max_market_cap_yi")
-    pool_note = f"≤{cap:g}亿小中盘龙头" if cap else "全市值龙头(含大盘)"
+    if payload.get("pool") == "etf":
+        pool_note = "ETF配置池·技术口径"
+    elif payload.get("pool") == "hotmoney":
+        pool_note = "游资小盘池"
+    else:
+        pool_note = f"≤{cap:g}亿小中盘龙头" if cap else "全市值龙头(含大盘)"
     print(f"  生成时间: {payload['generated_at']}{as_of_note} · 候选({pool_note}): "
           f"{payload['candidate_count']} · 已打分: {payload.get('scored_count', 0)}")
     print(f"  阶段分布(游资操作顺序): {dist}")
@@ -3544,7 +5099,7 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
 
 def _collect_verify_samples(conn: sqlite3.Connection, candidates: List[Dict[str, Any]],
                             pool: str = DEFAULT_POOL) -> Dict[str, Any]:
-    """对每只候选滑动取历史截面，PIT 重算九因子吸筹分并配对未来前向收益。
+    """对每只候选滑动取历史截面，PIT 重算十因子吸筹分并配对未来前向收益。
 
     返回 {samples, dates, codes}。samples 每项 = {date, code, score, rets:{h:ret}}。
     PIT：打分只用截止 as-of 当日的 LOOKBACK 根 bar；前向收益用其后第 h 根 bar 的收盘价。
@@ -3741,10 +5296,10 @@ def run_verify(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dic
 
     samples = collected["samples"]
     by_horizon = _aggregate_verify(samples) if samples else {}
-    payload = base_payload("verify", len(candidates))
+    payload = base_payload("verify", len(candidates), pool=pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "九因子吸筹分后验回测：PIT 重算吸筹分 vs 未来前向收益（分位单调性 / 截面RankIC / 多空价差）。",
+        "description": "十因子吸筹分后验回测：PIT 重算吸筹分 vs 未来前向收益（分位单调性 / 截面RankIC / 多空价差）。",
         "params": {
             "horizons": list(VERIFY_HORIZONS), "step": VERIFY_STEP,
             "window_days": VERIFY_WINDOW_DAYS, "buckets": VERIFY_BUCKETS,
@@ -3823,30 +5378,44 @@ def _collect_pattern_samples(conn: sqlite3.Connection, candidates: List[Dict[str
     samples 每项 = {date, fired:set(形态code), rets:{h:ret}}。PIT 安全：形态只用截止当日窗口。
     """
     max_h = max(VERIFY_HORIZONS)
-    series: Dict[str, Tuple[List[Dict[str, Any]], Dict[str, int]]] = {}
+    series: Dict[str, List[Dict[str, Any]]] = {}
     for cand in candidates:
         bars = _all_bars(conn, cand["code"])
         if len(bars) < LOOKBACK + CHIP_WINNER_RISK_DAYS + max_h + 1:
             continue
-        series[cand["code"]] = (bars, {b["date"]: i for i, b in enumerate(bars)})
+        series[cand["code"]] = bars
     if not series:
         return {"samples": [], "dates": [], "codes": []}
 
-    all_dates = sorted({d for bars, _ in series.values() for d in (b["date"] for b in bars)})
+    all_dates = sorted({b["date"] for bars in series.values() for b in bars})
     as_of_dates = _verify_as_of_dates(all_dates[:-max_h])
+    as_of_set = set(as_of_dates)
     p1_market_gates = _p1_market_gate_by_date(conn, as_of_dates)
     samples: List[Dict[str, Any]] = []
     used_dates: set = set()
-    for d in as_of_dates:
-        for code, (bars, idx_map) in series.items():
-            i = idx_map.get(d)
-            if i is None or i < LOOKBACK + CHIP_WINNER_RISK_DAYS - 1 or i + max_h >= len(bars):
+    first_index = LOOKBACK + CHIP_WINNER_RISK_DAYS - 1
+    for code, bars in series.items():
+        # P26 使用的“5 日前筹码”与同股 i-5 锚点的当前筹码完全相同。
+        # 按股票顺序扫描可直接复用，逐日全量回测时把筹码重建从每锚点2次降到约1次。
+        chip_by_index: Dict[int, Optional[Dict[str, float]]] = {}
+        for i in range(first_index, len(bars) - max_h):
+            d = bars[i]["date"]
+            if d not in as_of_set:
                 continue
-            window = bars[i - LOOKBACK - CHIP_WINNER_RISK_DAYS + 1:i + 1]
+            window = bars[max(0, i - PATTERN_EVAL_BARS + 1):i + 1]
+            cached_prior = chip_by_index.get(i - CHIP_WINNER_RISK_DAYS, _PRIOR_CHIP_UNSET)
+            ctx = _build_pattern_context(
+                code,
+                window,
+                prior_chip=cached_prior,
+                defer_chip=True,
+            )
             fired = match_patterns(
-                code, window, pool=pool,
+                code, window, ctx=ctx, pool=pool,
                 p1_market_gate=p1_market_gates.get(d, False),
             )
+            if ctx.get("_chip_computed"):
+                chip_by_index[i] = ctx.get("chip")
             close_i = bars[i]["close"]
             if not close_i:
                 continue
@@ -3865,10 +5434,196 @@ def _collect_pattern_samples(conn: sqlite3.Connection, candidates: List[Dict[str
     return {"samples": samples, "dates": sorted(used_dates), "codes": list(series.keys())}
 
 
+def _pattern_date_plan(
+    conn: sqlite3.Connection,
+    candidates: List[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[str], Dict[str, int]]:
+    """用轻量 SQL 生成形态回测日期与工作量计划，避免父进程加载全部日线。"""
+    codes = list(dict.fromkeys(str(candidate["code"]) for candidate in candidates))
+    min_bars = LOOKBACK + CHIP_WINNER_RISK_DAYS + max(VERIFY_HORIZONS) + 1
+    counts: Dict[str, int] = {}
+    for start in range(0, len(codes), 500):
+        chunk = codes[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT code, COUNT(*) AS n FROM stock_history "
+            f"WHERE code IN ({placeholders}) AND daily_close IS NOT NULL "
+            f"AND daily_volume IS NOT NULL GROUP BY code",
+            chunk,
+        ).fetchall()
+        counts.update({str(row["code"]): int(row["n"]) for row in rows})
+
+    eligible = [candidate for candidate in candidates if counts.get(str(candidate["code"]), 0) >= min_bars]
+    eligible_codes = [str(candidate["code"]) for candidate in eligible]
+    dates: set = set()
+    for start in range(0, len(eligible_codes), 500):
+        chunk = eligible_codes[start:start + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"SELECT DISTINCT date FROM stock_history WHERE code IN ({placeholders}) "
+            f"AND daily_close IS NOT NULL AND daily_volume IS NOT NULL",
+            chunk,
+        ).fetchall()
+        dates.update(str(row["date"]) for row in rows)
+    ordered_dates = sorted(dates)
+    as_of_dates = _verify_as_of_dates(ordered_dates[:-max(VERIFY_HORIZONS)])
+    anchor_counts = {
+        code: max(0, counts.get(code, 0) - (LOOKBACK + CHIP_WINNER_RISK_DAYS - 1) - max(VERIFY_HORIZONS))
+        for code in eligible_codes
+    }
+    return eligible, as_of_dates, anchor_counts
+
+
+def _pattern_aggregate_worker(task: Tuple[Any, ...]) -> Dict[str, Any]:
+    """按股票分片回测并在进程内聚合，避免跨进程传输逐股票日明细。"""
+    db_file, candidates, pool, as_of_dates, pattern_codes = task
+    selected_codes = set(pattern_codes)
+    selected_patterns = [pattern for pattern in PATTERNS if pattern[0] in selected_codes]
+    horizon_count = len(VERIFY_HORIZONS)
+    max_h = max(VERIFY_HORIZONS)
+    as_of_set = set(as_of_dates)
+    first_index = LOOKBACK + CHIP_WINNER_RISK_DAYS - 1
+    by_date: Dict[str, Any] = {}
+    sample_count = 0
+    scored_codes = 0
+
+    conn = stock_storage.connect(db_file)
+    try:
+        p1_market_gates = _p1_market_gate_by_date(conn, as_of_dates)
+        for candidate in candidates:
+            code = str(candidate["code"])
+            bars = _all_bars(conn, code)
+            if len(bars) < LOOKBACK + CHIP_WINNER_RISK_DAYS + max_h + 1:
+                continue
+            scored_codes += 1
+            chip_by_index: Dict[int, Optional[Dict[str, float]]] = {}
+            for index in range(first_index, len(bars) - max_h):
+                date = bars[index]["date"]
+                if date not in as_of_set:
+                    continue
+                window = bars[max(0, index - PATTERN_EVAL_BARS + 1):index + 1]
+                cached_prior = chip_by_index.get(index - CHIP_WINNER_RISK_DAYS, _PRIOR_CHIP_UNSET)
+                context = _build_pattern_context(
+                    code,
+                    window,
+                    prior_chip=cached_prior,
+                    defer_chip=True,
+                )
+                fired = match_patterns(
+                    code,
+                    window,
+                    ctx=context,
+                    pool=pool,
+                    p1_market_gate=p1_market_gates.get(date, False),
+                    patterns=selected_patterns,
+                )
+                if context.get("_chip_computed"):
+                    chip_by_index[index] = context.get("chip")
+                close = bars[index]["close"]
+                if not close:
+                    continue
+                future_closes = [bars[index + horizon]["close"] for horizon in VERIFY_HORIZONS]
+                if any(not value for value in future_closes):
+                    continue
+                returns = [float(value) / close - 1.0 for value in future_closes]
+                if any(not math.isfinite(value) for value in returns):
+                    continue
+
+                # [样本数, 各周期收益和, {形态: [命中数, 各周期收益和, 各周期胜数]}]
+                daily = by_date.setdefault(date, [0, [0.0] * horizon_count, {}])
+                daily[0] += 1
+                sample_count += 1
+                for horizon_index, value in enumerate(returns):
+                    daily[1][horizon_index] += value
+                for pattern in fired:
+                    hit = daily[2].setdefault(
+                        pattern["code"],
+                        [0, [0.0] * horizon_count, [0] * horizon_count],
+                    )
+                    hit[0] += 1
+                    for horizon_index, value in enumerate(returns):
+                        hit[1][horizon_index] += value
+                        if value > 0.0:
+                            hit[2][horizon_index] += 1
+    finally:
+        conn.close()
+    return {
+        "by_date": by_date,
+        "sample_count": sample_count,
+        "scored_codes": scored_codes,
+    }
+
+
+def _merge_pattern_aggregates(parts: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+    horizon_count = len(VERIFY_HORIZONS)
+    merged: Dict[str, Any] = {}
+    sample_count = 0
+    scored_codes = 0
+    for part in parts:
+        sample_count += int(part.get("sample_count", 0))
+        scored_codes += int(part.get("scored_codes", 0))
+        for date, source in part.get("by_date", {}).items():
+            target = merged.setdefault(date, [0, [0.0] * horizon_count, {}])
+            target[0] += source[0]
+            for horizon_index in range(horizon_count):
+                target[1][horizon_index] += source[1][horizon_index]
+            for code, source_hit in source[2].items():
+                target_hit = target[2].setdefault(
+                    code,
+                    [0, [0.0] * horizon_count, [0] * horizon_count],
+                )
+                target_hit[0] += source_hit[0]
+                for horizon_index in range(horizon_count):
+                    target_hit[1][horizon_index] += source_hit[1][horizon_index]
+                    target_hit[2][horizon_index] += source_hit[2][horizon_index]
+    return {
+        "by_date": merged,
+        "dates": sorted(merged),
+        "sample_count": sample_count,
+        "scored_codes": scored_codes,
+    }
+
+
+def _collect_pattern_aggregates(
+    conn: sqlite3.Connection,
+    candidates: List[Dict[str, Any]],
+    pool: str,
+    pattern_codes: Sequence[str],
+    jobs: int = 1,
+) -> Dict[str, Any]:
+    """并行收集形态事件的日期级充分统计量，结果与逐条样本事件研究等价。"""
+    eligible, as_of_dates, anchor_counts = _pattern_date_plan(conn, candidates)
+    if not eligible or not as_of_dates:
+        return {"by_date": {}, "dates": [], "sample_count": 0, "scored_codes": 0, "worker_count": 0}
+
+    worker_count = max(1, min(int(jobs), len(eligible)))
+    buckets: List[List[Dict[str, Any]]] = [[] for _ in range(worker_count)]
+    loads = [0] * worker_count
+    for candidate in sorted(eligible, key=lambda row: anchor_counts.get(str(row["code"]), 0), reverse=True):
+        bucket_index = min(range(worker_count), key=loads.__getitem__)
+        buckets[bucket_index].append(candidate)
+        loads[bucket_index] += anchor_counts.get(str(candidate["code"]), 0)
+    tasks = [
+        (str(DB_FILE), bucket, pool, as_of_dates, list(pattern_codes))
+        for bucket in buckets
+        if bucket
+    ]
+    if len(tasks) == 1:
+        parts = [_pattern_aggregate_worker(tasks[0])]
+    else:
+        with ProcessPoolExecutor(max_workers=len(tasks)) as executor:
+            parts = list(executor.map(_pattern_aggregate_worker, tasks))
+    result = _merge_pattern_aggregates(parts)
+    result["worker_count"] = len(tasks)
+    return result
+
+
 def _horizon_effective(signal: str, hz: Dict[str, Any]) -> bool:
-    """单个(形态,周期)是否有效：buy 超额>0且t≥1.5；sell 超额<0且t≤-1.5；hold 仅看显著(|t|≥1.5)。"""
+    """单个(形态,周期)是否有效；observe只留统计，不可自动升级为交易信号。"""
     em, t = hz.get("excess_mean"), hz.get("excess_t_stat")
     if em is None or t is None:
+        return False
+    if signal == "observe":
         return False
     if signal == "buy":
         return em > 0 and t >= 1.5
@@ -3881,7 +5636,8 @@ def _pattern_event_study(by_date: Dict[str, List[Dict[str, Any]]], pcode: str, h
     """单形态事件研究：命中样本 vs 同日全体的前向收益超额（剔除大盘 beta），跨日平均 + t。"""
     excess: List[float] = []
     hit_rets: List[float] = []
-    for grp in by_date.values():
+    for date in sorted(by_date):
+        grp = by_date[date]
         hit = [g["rets"][h] for g in grp if pcode in g["fired"]]
         if not hit:
             continue
@@ -3906,6 +5662,48 @@ def _pattern_event_study(by_date: Dict[str, List[Dict[str, Any]]], pcode: str, h
         "excess_p_value": round(p_value, 6) if p_value is not None else None,
         "hac_lag": lag,
         "win_rate": round(sum(1 for x in hit_rets if x > 0) / len(hit_rets), 3),
+    }
+
+
+def _pattern_event_study_aggregated(
+    by_date: Dict[str, Any],
+    pattern_code: str,
+    horizon: int,
+) -> Dict[str, Any]:
+    """从日期级充分统计量还原事件研究，避免保留数百万条逐股票日样本。"""
+    horizon_index = VERIFY_HORIZONS.index(horizon)
+    excess: List[float] = []
+    hit_count = 0
+    win_count = 0
+    for date in sorted(by_date):
+        daily = by_date[date]
+        hit = daily[2].get(pattern_code)
+        if not hit or not hit[0] or not daily[0]:
+            continue
+        excess.append(hit[1][horizon_index] / hit[0] - daily[1][horizon_index] / daily[0])
+        hit_count += int(hit[0])
+        win_count += int(hit[2][horizon_index])
+    if not hit_count:
+        return {
+            "n_hits": 0,
+            "n_sections": 0,
+            "excess_mean": None,
+            "excess_t_stat": None,
+            "excess_p_value": None,
+            "hac_lag": max(0, math.ceil(horizon / max(1, VERIFY_STEP)) - 1),
+            "win_rate": None,
+        }
+    excess_mean = _mean(excess)
+    lag = max(0, math.ceil(horizon / max(1, VERIFY_STEP)) - 1)
+    t_stat, p_value = _newey_west_mean_test(excess, lag)
+    return {
+        "n_hits": hit_count,
+        "n_sections": len(excess),
+        "excess_mean": round(excess_mean, 4),
+        "excess_t_stat": round(t_stat, 2) if t_stat is not None else None,
+        "excess_p_value": round(p_value, 6) if p_value is not None else None,
+        "hac_lag": lag,
+        "win_rate": round(win_count / hit_count, 3),
     }
 
 
@@ -3943,23 +5741,44 @@ def _bh_fdr_threshold(values: Sequence[float], q: float) -> Optional[float]:
     return accepted
 
 
-def run_patterns(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+def run_patterns(
+    max_cap: Optional[float] = None,
+    pool: str = DEFAULT_POOL,
+    jobs: int = 1,
+    pattern_min: int = 1,
+    pattern_max: int = 26,
+) -> Dict[str, Any]:
+    pattern_min = max(1, min(26, int(pattern_min)))
+    pattern_max = max(1, min(26, int(pattern_max)))
+    if pattern_min > pattern_max:
+        pattern_min, pattern_max = pattern_max, pattern_min
+    selected_patterns = [
+        pattern for pattern in PATTERNS
+        if pattern_min <= int(pattern[0][1:]) <= pattern_max
+    ]
+    pattern_codes = [pattern[0] for pattern in selected_patterns]
     conn = stock_storage.connect(DB_FILE)
     try:
         candidates = load_candidates(conn, pool, max_cap=max_cap)
-        collected = _collect_pattern_samples(conn, candidates, pool=pool)
+        collected = _collect_pattern_aggregates(
+            conn,
+            candidates,
+            pool=pool,
+            pattern_codes=pattern_codes,
+            jobs=jobs,
+        )
     finally:
         conn.close()
 
-    samples = collected["samples"]
-    by_date: Dict[str, List[Dict[str, Any]]] = {}
-    for s in samples:
-        by_date.setdefault(s["date"], []).append(s)
+    by_date = collected["by_date"]
 
     results = []
     p_values: List[float] = []
-    for pcode, name, phase, signal, _fn in PATTERNS:
-        horizons = {str(h): _pattern_event_study(by_date, pcode, h) for h in VERIFY_HORIZONS}
+    for pcode, name, phase, signal, _fn in selected_patterns:
+        horizons = {
+            str(h): _pattern_event_study_aggregated(by_date, pcode, h)
+            for h in VERIFY_HORIZONS
+        }
         p_values.extend(
             horizons[str(h)].get("excess_p_value")
             if horizons[str(h)].get("excess_p_value") is not None else 1.0
@@ -3984,27 +5803,39 @@ def run_patterns(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> D
                 effective_at.append(h)
         row["effective_at"] = effective_at
 
-    payload = base_payload("patterns", len(candidates))
+    payload = base_payload("patterns", len(candidates), pool=pool)
     payload.update({
-        "status": "ok" if samples else "empty",
+        "status": "ok" if collected["sample_count"] else "empty",
         "pool": pool,
         "description": "游资形态预测力后验：每个形态命中后，未来 N 日相对同日全体的超额收益（剔除大盘 beta）；重叠收益使用 Newey-West HAC，并控制多重检验。",
         "params": {
             "horizons": list(VERIFY_HORIZONS),
             "step": VERIFY_STEP,
             "window_days": VERIFY_WINDOW_DAYS,
+            "pattern_codes": pattern_codes,
+            "worker_count": collected.get("worker_count", 1),
             "p1": _p1_rule_params(),
+            "p4": _p4_rule_params(),
+            "p5": _p5_rule_params(),
+            "p15": _p15_rule_params(),
+            "p16": _p16_rule_params(),
+            "p17": _p17_rule_params(),
+            "p21": _p21_rule_params(),
+            "p23": _p23_rule_params(),
+            "p25": _p25_rule_params(),
+            "p26": _p26_rule_params(),
             "significance": "Newey-West/Bartlett HAC; lag=ceil(horizon/step)-1",
             "multiple_testing": f"Benjamini-Hochberg FDR {PATTERN_FDR_Q:.0%} across patterns x horizons",
         },
         "bh_fdr_q": PATTERN_FDR_Q,
         "bh_fdr_p_threshold": round(fdr_threshold, 6) if fdr_threshold is not None else None,
         "section_count": len(collected["dates"]),
-        "sample_count": len(samples),
+        "sample_count": collected["sample_count"],
+        "scored_codes": collected.get("scored_codes", 0),
         "date_range": [collected["dates"][0], collected["dates"][-1]] if collected["dates"] else None,
         "patterns": results,
     })
-    if not samples:
+    if not collected["sample_count"]:
         payload["notes"] = ["无可回测样本：先确保 sw3_member.is_leader 有龙头、且历史日线足够长。"]
     write_payload(PATTERNS_RESULT_FILE, payload)
     _print_patterns_summary(payload)
@@ -4045,7 +5876,7 @@ def _print_patterns_summary(payload: Dict[str, Any]) -> None:
         print(f"  {r['code']:<6}{_ljust(r['name'], 17)}{_ljust(r['phase'], 5)}{r['signal']:<5}"
               f"{hz[mid].get('n_hits', 0):>6}  {cells}{_rjust(eff_str, 12)}")
     print("-" * 108)
-    print("  有效@ = buy 正超额、sell 负超额、hold 显著；均要求 HAC |t|≥1.5 且通过 BH-FDR 10%。")
+    print("  有效@ = buy 正超额、sell 负超额、hold 显著；observe只统计不升级；其余均要求 HAC |t|≥1.5 且通过 BH-FDR 10%。")
     print("=" * 108)
 
 
@@ -4256,18 +6087,38 @@ def _evaluate_distribution_weights(groups: Dict[int, List[Dict[str, Any]]],
 
 def _distribution_weight_grid(step: float = DIST_EXPERIMENT_GRID_STEP,
                               min_weight: float = DIST_EXPERIMENT_MIN_WEIGHT) -> List[Dict[str, float]]:
+    """P14/P15/P20/P22固定5%，其余七项以10%为下限搜索，且包含生产权重。"""
     units = int(round(1.0 / step))
+    fixed_weights = {
+        feature: 0.05
+        for feature in ("p14", "p15", "p20", "p22")
+        if feature in DIST_FEATURES
+    }
+    fixed_units = {
+        feature: int(round(weight / step)) for feature, weight in fixed_weights.items()
+    }
+    variable_features = [
+        feature for feature in DIST_FEATURES if feature not in fixed_weights
+    ]
     min_units = max(0, int(round(min_weight / step)))
-    if min_units * len(DIST_FEATURES) > units:
+    variable_units = units - sum(fixed_units.values())
+    if min_units * len(variable_features) > variable_units:
         min_units = 0
-    parts = [min_units] * len(DIST_FEATURES)
-    remaining_units = units - min_units * len(DIST_FEATURES)
+    parts = [min_units] * len(variable_features)
+    remaining_units = variable_units - min_units * len(variable_features)
     out: List[Dict[str, float]] = []
 
     def fill(idx: int, remaining: int) -> None:
-        if idx == len(DIST_FEATURES) - 1:
+        if idx == len(variable_features) - 1:
             parts[idx] = min_units + remaining
-            out.append({feature: parts[i] / units for i, feature in enumerate(DIST_FEATURES)})
+            weights = {
+                feature: fixed_units[feature] / units for feature in fixed_units
+            }
+            weights.update({
+                feature: parts[i] / units
+                for i, feature in enumerate(variable_features)
+            })
+            out.append({feature: weights[feature] for feature in DIST_FEATURES})
             return
         for value in range(remaining + 1):
             parts[idx] = min_units + value
@@ -4339,10 +6190,10 @@ def run_distribution_experiment(max_cap: Optional[float] = None, pool: str = DEF
     val_groups = _prepare_distribution_groups(samples, val_dates)
     all_groups = _prepare_distribution_groups(samples, dates)
 
-    payload = base_payload("distribution", len(candidates))
+    payload = base_payload("distribution", len(candidates), pool=pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "出货分权重实验：PIT 组合 P14/P16/P17/P19/P20/P22、近期龙虎榜、technical 和原始 divergence，检验未来超额收益是否随出货分升高而降低。",
+        "description": "出货分权重实验：PIT 组合 P14/P15/P16/P17/P19/P20/P22/P26、近期龙虎榜、technical 和原始 divergence，检验未来超额收益是否随出货分升高而降低。",
         "params": {
             "features": list(DIST_FEATURES),
             "selected_weights": DIST_MODEL_WEIGHTS,
@@ -4374,14 +6225,16 @@ def run_distribution_experiment(max_cap: Optional[float] = None, pool: str = DEF
     ablation_defs = [
         ("technical_only", {"technical": 1.0}),
         ("p14_only", {"p14": 1.0}),
+        ("p15_only", {"p15": 1.0}),
         ("p16_only", {"p16": 1.0}),
         ("p17_only", {"p17": 1.0}),
         ("p19_only", {"p19": 1.0}),
         ("p20_only", {"p20": 1.0}),
         ("p22_only", {"p22": 1.0}),
+        ("p26_only", {"p26": 1.0}),
         ("lhb_recent_only", {"lhb_recent": 1.0}),
         ("divergence_only", {"divergence": 1.0}),
-        ("patterns_equal", {feature: 1 / 6 for feature in ("p14", "p16", "p17", "p19", "p20", "p22")}),
+        ("patterns_equal", {feature: 1 / 8 for feature in ("p14", "p15", "p16", "p17", "p19", "p20", "p22", "p26")}),
         ("all_equal", {feature: 1 / len(DIST_FEATURES) for feature in DIST_FEATURES}),
         ("selected", DIST_MODEL_WEIGHTS),
     ]
@@ -4430,7 +6283,7 @@ def run_distribution_experiment(max_cap: Optional[float] = None, pool: str = DEF
     payload.update({
         "best_weights": top_models[0]["weights"] if top_models else None,
         "recommended_weights": selected_report.get("weights"),
-        "selection_rule": "线上出货分使用人工指定权重；九项特征均保留，单因子/分组消融仅作为报告参考。",
+        "selection_rule": "线上出货分使用人工指定权重；十一项特征均保留，单因子/分组消融仅作为报告参考。",
         "validation_candidate_count": len(candidates_grid),
         "top_models": top_models,
         "validation_top_models": validation_top,
@@ -4486,7 +6339,7 @@ def _print_distribution_summary(payload: Dict[str, Any]) -> None:
     print("=" * 108)
 
 
-# ── accumulation：九原始分吸筹总分权重实验 ─────────────────────
+# ── accumulation：十三原始分吸筹总分权重实验 ────────────────────
 
 def _load_capital_histories(conn: sqlite3.Connection) -> Dict[str, Any]:
     holder_dates: Dict[str, List[str]] = {}
@@ -4539,12 +6392,29 @@ def _holder_change_at(histories: Dict[str, Any], code: str, as_of: str) -> Optio
     return float(histories["holder_values"][code][idx])
 
 
+def _accumulation_capital_at(
+    histories: Dict[str, Any], code: str, as_of: str,
+) -> Dict[str, Any]:
+    """返回单日可见的吸筹资金面特征，供历史评分统一做 PIT 截断。"""
+    if not histories or not as_of:
+        return {"holder_change": None, "repurchase_recent": False}
+    cutoff = (
+        datetime.strptime(as_of, "%Y-%m-%d") - timedelta(days=CAPITAL_EVENT_DAYS)
+    ).strftime("%Y-%m-%d")
+    return {
+        "holder_change": _holder_change_at(histories, code, as_of),
+        "repurchase_recent": _recent_date_hit(
+            histories.get("repurchase_dates") or {}, code, as_of, cutoff,
+        ),
+    }
+
+
 def _collect_accumulation_samples(
     conn: sqlite3.Connection,
     candidates: List[Dict[str, Any]],
     pool: str = DEFAULT_POOL,
 ) -> Dict[str, Any]:
-    """PIT 收集九个吸筹原始特征 + 未来超额收益。"""
+    """PIT 收集十三个吸筹原始特征 + 未来超额收益。"""
     max_h = max(ACCUM_EXPERIMENT_HORIZONS)
     series: Dict[str, Tuple[List[Dict[str, Any]], Dict[str, int]]] = {}
     for cand in candidates:
@@ -4710,9 +6580,13 @@ def _evaluate_accumulation_weights(groups: Dict[int, List[Dict[str, Any]]],
 
 def _accumulation_weight_grid(step: float = ACCUM_EXPERIMENT_GRID_STEP,
                               min_weight: float = ACCUM_EXPERIMENT_MIN_WEIGHT) -> List[Dict[str, float]]:
-    """权重网格：P1/P25按产品口径固定5%，其余七项在剩余90%内搜索。"""
+    """权重网格：生产5%因子固定，其余七项在剩余70%内搜索。"""
     units = int(round(1.0 / step))
-    fixed_weights = {feature: 0.05 for feature in ("p1", "p25") if feature in ACCUM_FEATURES}
+    fixed_weights = {
+        feature: 0.05
+        for feature in ("p2", "p5", "p23", "p24", "p25", "repurchase")
+        if feature in ACCUM_FEATURES
+    }
     fixed_units = {feature: int(round(weight / step)) for feature, weight in fixed_weights.items()}
     variable_features = [feature for feature in ACCUM_FEATURES if feature not in fixed_weights]
     variable_units = units - sum(fixed_units.values())
@@ -4797,10 +6671,10 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
     val_groups = _prepare_accumulation_groups(samples, val_dates)
     all_groups = _prepare_accumulation_groups(samples, dates)
 
-    payload = base_payload("accumulation", len(candidates))
+    payload = base_payload("accumulation", len(candidates), pool=pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "吸筹总分权重实验：用 chip、position、cmf_eff、P1、P3、P24、P25、股东户数变化、公司回购九个原始分直接加权，不用截面 rank 合成线上分数。P1/P25双池计分，但历史证据仅小盘有效。",
+        "description": "吸筹总分权重实验：用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分直接加权，不用截面 rank 合成线上分数。P23/P25保留实验标签，但按生产口径参与计分。",
         "params": {
             "horizons": list(ACCUM_EXPERIMENT_HORIZONS),
             "step": VERIFY_STEP,
@@ -4808,8 +6682,11 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
             "min_names_per_section": VERIFY_MIN_NAMES,
             "grid_step": ACCUM_EXPERIMENT_GRID_STEP,
             "min_weight": ACCUM_EXPERIMENT_MIN_WEIGHT,
-            "min_weight_scope": "除P1/P25外的七项",
-            "fixed_weights": {"p1": 0.05, "p25": 0.05},
+            "min_weight_scope": "除固定5%因子外的七项",
+            "fixed_weights": {
+                "p2": 0.05, "p5": 0.05, "p23": 0.05,
+                "p24": 0.05, "p25": 0.05, "repurchase": 0.05,
+            },
             "features": list(ACCUM_FEATURES),
             "score_formula": "sum(weight_i * raw_feature_i)，raw_feature_i 均为 0~100 原始分",
             "objective": "RankIC + (高分组-低分组超额收益) * 3；rank 只用于评价，不进入线上合成",
@@ -4836,7 +6713,10 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
     def one_hot(feature: str) -> Dict[str, float]:
         return {k: (1.0 if k == feature else 0.0) for k in ACCUM_FEATURES}
 
-    market_structure_features = ("chip", "position", "cmf_eff", "p1", "p3", "p24", "p25")
+    market_structure_features = (
+        "chip", "position", "cmf_eff", "p1", "p2", "p3", "p5",
+        "p21", "p23", "p24", "p25",
+    )
     market_structure_equal = {
         k: (1 / len(market_structure_features) if k in market_structure_features else 0.0)
         for k in ACCUM_FEATURES
@@ -4899,7 +6779,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
         "accumulation": {
             "best_train_weights": top_models[0]["weights"] if top_models else None,
             "recommended_weights": _round_accum_weights(recommended_weights),
-            "selection_rule": "P1/P25固定各5%，其余七项在剩余90%中按5%步长且各自不低于10%搜索；单因子/分组消融仅作为报告参考，不参与推荐。",
+            "selection_rule": "P2/P5/P23/P24/P25/回购固定各5%，其余七项在剩余70%中按5%步长且各自不低于5%搜索；单因子/分组消融仅作为报告参考，不参与推荐。",
             "validation_candidate_count": len(candidates_grid),
             "top_models": top_models,
             "validation_top_models": validation_top,
@@ -4908,7 +6788,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
             "recommended_model": recommended,
         },
         "notes": [
-            "线上吸筹总分使用 chip、position、cmf_eff、P1、P3、P24、P25、股东户数变化、公司回购九个原始分按权重相加；P1/P25双池计分但仅小盘回测有效。",
+            "线上吸筹总分使用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分按权重相加；P23/P25保留实验标签，但按生产口径参与计分。",
             "实验里的 RankIC 仅用于评价分数排序能力；高低差是高分五分位相对低分五分位的未来超额收益差。",
         ],
     })
@@ -4919,7 +6799,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
 
 def _print_accumulation_summary(payload: Dict[str, Any]) -> None:
     print("=" * 112)
-    print("  主力资金雷达 · 九原始分吸筹总分权重实验 (accumulation)")
+    print("  主力资金雷达 · 十三原始分吸筹总分权重实验 (accumulation)")
     rng = payload.get("date_range")
     print(f"  生成时间: {payload['generated_at']} · 候选龙头: {payload['candidate_count']}"
           f" · 截面: {payload.get('section_count', 0)} · 样本: {payload.get('sample_count', 0)}"
@@ -4964,7 +6844,7 @@ def run_watch(max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dict
         candidates = load_candidates(conn, pool, max_cap=max_cap)
     finally:
         conn.close()
-    payload = base_payload("watch", len(candidates))
+    payload = base_payload("watch", len(candidates), pool=pool)
     payload.update({
         "status": "scaffold",
         "description": "实时交易监控框架（待接入实时行情/盘口）。",
@@ -5079,7 +6959,7 @@ def run_latent(as_of: Optional[str] = None, max_cap: Optional[float] = None,
         conn.close()
     survivors.sort(key=lambda x: x["latent_score"], reverse=True)
 
-    payload = base_payload("latent", len(rows))
+    payload = base_payload("latent", len(rows), pool=pool)
     payload.update({
         "status": "ok" if survivors else "empty",
         "description": "潜伏妖股观察名单：左侧低位+安静+吸筹+妖股基因+真吸筹证据。⚠️观察名单非买点触发器(左侧弱/慢)。",
@@ -5154,7 +7034,7 @@ def build_parser() -> argparse.ArgumentParser:
         "mode", nargs="?", choices=MODES, default=DEFAULT_MODE,
         help="运行模式：ambush(默认,吸筹分+形态) / watch(实时监控) / "
              "verify(吸筹分回测) / patterns(形态预测力回测) / "
-             "distribution(出货分权重实验) / accumulation(九原始分吸筹总分权重实验) / "
+             "distribution(出货分权重实验) / accumulation(十三原始分吸筹总分权重实验) / "
              "latent(潜伏妖股观察名单:左侧低位+安静+吸筹+妖股基因, 建议配 --pool hotmoney)",
     )
     parser.add_argument(
@@ -5167,19 +7047,39 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pool", choices=POOLS, default=DEFAULT_POOL,
-        help="候选池：leader=细分龙头(默认) / hotmoney=游资小盘universe(近1年龙虎榜≥5次·流通市值≤100亿)。",
+        help="候选池：leader=细分龙头(默认) / hotmoney=游资小盘 / etf=stock_etf_pool.py 配置池。",
+    )
+    parser.add_argument(
+        "--jobs", type=int, default=1,
+        help="patterns 回测并行进程数；默认1，完整双池建议按CPU情况使用4~6。",
+    )
+    parser.add_argument(
+        "--pattern-min", type=int, default=1, choices=range(1, 27),
+        help="patterns 回测的最小形态编号；与 --pattern-max 组合可只测指定编号区间。",
+    )
+    parser.add_argument(
+        "--pattern-max", type=int, default=26, choices=range(1, 27),
+        help="patterns 回测的最大形态编号；例如24表示仅回测P1-P24。",
     )
     return parser
 
 
 def run_mode(mode: str, as_of: Optional[str] = None,
-             max_cap: Optional[float] = None, pool: str = DEFAULT_POOL) -> Dict[str, Any]:
+             max_cap: Optional[float] = None, pool: str = DEFAULT_POOL,
+             jobs: int = 1, pattern_min: int = 1,
+             pattern_max: int = 26) -> Dict[str, Any]:
     if mode == "watch":
         return run_watch(max_cap=max_cap, pool=pool)
     if mode == "verify":
         return run_verify(max_cap=max_cap, pool=pool)
     if mode == "patterns":
-        return run_patterns(max_cap=max_cap, pool=pool)
+        return run_patterns(
+            max_cap=max_cap,
+            pool=pool,
+            jobs=jobs,
+            pattern_min=pattern_min,
+            pattern_max=pattern_max,
+        )
     if mode == "distribution":
         return run_distribution_experiment(max_cap=max_cap, pool=pool)
     if mode == "accumulation":
@@ -5191,9 +7091,17 @@ def run_mode(mode: str, as_of: Optional[str] = None,
 
 def main(argv: Optional[Sequence[str]] = None) -> Dict[str, Any]:
     args = build_parser().parse_args(argv)
-    # hotmoney 池建池时已按流通市值≤100亿过滤，不再按总市值剔除；市值过滤仅对 leader 池生效
+    # hotmoney 已在建池时过滤；ETF 无公司总市值语义。市值过滤仅对 leader 生效。
     max_cap = MAX_MARKET_CAP_YI if (args.exclude_large_cap and args.pool == "leader") else None
-    return run_mode(args.mode, as_of=args.as_of, max_cap=max_cap, pool=args.pool)
+    return run_mode(
+        args.mode,
+        as_of=args.as_of,
+        max_cap=max_cap,
+        pool=args.pool,
+        jobs=args.jobs,
+        pattern_min=args.pattern_min,
+        pattern_max=args.pattern_max,
+    )
 
 
 if __name__ == "__main__":

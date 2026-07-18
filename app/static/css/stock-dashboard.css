@@ -634,6 +634,53 @@
       color: var(--green);
       font-variant-numeric: tabular-nums;
       white-space: nowrap;
+    }.stock-native td.score-cell {
+      min-width: 106px;
+    }.stock-native .stock-radar-context {
+      display: grid;
+      gap: 5px;
+      min-width: 86px;
+      margin-top: 9px;
+      padding-top: 7px;
+      border-top: 1px solid #e5e7eb;
+    }.stock-native .stock-radar-context.is-missing {
+      color: #9ca3af;
+      font-size: 11px;
+    }.stock-native .stock-radar-rank {
+      display: flex;
+      align-items: baseline;
+      gap: 4px;
+      color: #64748b;
+      font-size: 10px;
+      white-space: nowrap;
+    }.stock-native .stock-radar-rank strong {
+      color: var(--blue);
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }.stock-native .stock-radar-patterns {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 3px;
+    }.stock-native .stock-radar-factor {
+      display: inline-flex;
+      align-items: center;
+      min-height: 18px;
+      padding: 1px 4px;
+      border-radius: 5px;
+      background: #eef2f7;
+      color: #64748b;
+      font-size: 10px;
+      font-weight: 700;
+      line-height: 1;
+    }.stock-native .stock-radar-factor.buy {
+      background: #e7f7ee;
+      color: #16804a;
+    }.stock-native .stock-radar-factor.risk {
+      background: #ffedeb;
+      color: #c23c2e;
+    }.stock-native .stock-radar-empty {
+      color: #9ca3af;
+      font-size: 10px;
     }.stock-native .chips {
       display: flex;
       flex-wrap: wrap;

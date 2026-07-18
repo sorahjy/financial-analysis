@@ -60,6 +60,7 @@ from stock_advanced_strategies import (
     DATA_DIR,
     DEFAULT_CONFIG,
     LONG_FACTORS,
+    LONG_FIXED_ZERO_WEIGHT_KEYS,
     SMALLCAP_FACTORS,
     SMALLCAP_UNIVERSE_VERSION,
     SHORT_FACTORS,
@@ -106,8 +107,8 @@ DEFAULT_OPTIMIZATION_ITERATIONS = 1500
 
 # 长线 walk-forward 回测参数：利用 data/stock_data/*.history 的多年日线，
 # 每 40 个交易日取一折，固定持有 40 个交易日；相邻完整折首尾衔接。
-LONG_HOLD_CHOICES = [40]   # 长线持有期固定为40交易日
-LONG_FOLD_STEP_TD = 40     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
+LONG_HOLD_CHOICES = [60]   # 长线持有期固定为40交易日
+LONG_FOLD_STEP_TD = 60     # 折锚点间隔(交易日)，与持有期一致，避免窗口重叠
 LONG_MAX_LOOKBACK_TD = 2400
 # 小盘独立回测合同：近5年、每20日一折、持有20日，折之间首尾衔接。
 SMALLCAP_HOLD_CHOICES = [20]
@@ -120,14 +121,7 @@ LONG_SOFT_TARGET_FOLDS = 40
 LONG_FOLD_COUNT_PENALTY = 1.25
 LONG_RECENCY_WEIGHT_MIN = 1.0
 LONG_RECENCY_WEIGHT_MAX = 1.0
-LONG_FIXED_ZERO_WEIGHTS = {
-    # 市值/指数成分相关信号按当前要求默认关闭，并从搜索空间中移除。
-    "csi300_current",
-    "csi300_persistence",
-    "market_cap",
-    "size_reversal",
-    "industry_leadership",
-}
+LONG_FIXED_ZERO_WEIGHTS = set(LONG_FIXED_ZERO_WEIGHT_KEYS)
 LONG_SEARCHABLE_FACTORS = [f for f in LONG_FACTORS if f.key not in LONG_FIXED_ZERO_WEIGHTS]
 SMALLCAP_FIXED_ZERO_WEIGHTS = {"industry_leadership"}
 SMALLCAP_SEARCHABLE_FACTORS = [
@@ -158,7 +152,7 @@ RESEARCH_BASIS = [
     "Barra/MSCI-style families: size, value, momentum, volatility, liquidity, growth, leverage and quality.",
     "Conservative formula: low volatility + momentum + payout yield.",
     "WorldQuant-style short-horizon price-volume alphas.",
-    "Long-horizon capital signals: shareholder-count change, buyback announcements and recent Dragon Tiger List avoidance.",
+    "Long-horizon capital signals: shareholder-count change and buyback announcements; recent Dragon Tiger List avoidance is retained as a disabled diagnostic.",
     "A-share Dragon Tiger List event factors: net buy, reason strength, hot-money seat network, institution/hot-money resonance and tradability risk.",
 ]
 
@@ -1822,7 +1816,7 @@ def optimize_long(iterations: int, rng: random.Random, progress_position: int = 
         default_params=_default_long_params(),
         random_config_fn=random_long_config,
         strategy_notes=[
-            "长线候选池限定为 SW3 细分龙头池；市值/指数成分相关信号及行业规模地位在优化中固定为0。",
+            "长线候选池限定为 SW3 细分龙头池；市值/指数成分相关信号、行业规模地位及近期龙虎榜在优化中固定为0。",
             "残留前视：沪深300成分与质押使用当前快照。",
         ],
     )

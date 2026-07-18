@@ -101,7 +101,7 @@ BACKTEST_SIGNAL_FACTORS = MAIN_WAVE_FACTORS + SHORT_SCORE_FACTORS
 # ── 风控层：搬自 stock_hot_money_radar 的高位派发风控因子（P17/P19/P22）──
 # (编号, 名称, 判据函数)。判据函数签名 fn(bars, ctx)->bool，与原文件 PATTERNS 同源。
 RISK_PATTERNS = [
-    ("P17", "倒V反转", hmr._pat_inverted_v),       # 位置≥0.80 + 冲高>15%后从峰值回落≤-8%
+    ("P17", "倒V反转", hmr._pat_inverted_v),       # 高位冲高回撤 + 峰值新鲜 + 信号日不反弹
     ("P19", "灌压巨量大阴", hmr._pat_dump_bigbear),  # 位置≥0.70 + 量比>1.8 + 实体跌>6%且收在下1/4
     ("P22", "放量假突破", hmr._pat_failed_breakout), # 破前40日高但收盘没站上 + 当日放量>1.8×
 ]

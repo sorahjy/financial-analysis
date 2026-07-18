@@ -17,6 +17,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import Any, Dict, Iterable, List, Optional
 
 import stock_storage as ss
@@ -61,15 +62,14 @@ class StepResult:
         }
 
 
-def resolve_python(explicit: Optional[str] = None) -> str:
+def resolve_python(
+    explicit: Optional[str] = None,
+) -> str:
     if explicit:
         return explicit
     env_python = os.getenv("STOCK_REFRESH_PYTHON")
     if env_python:
         return env_python
-    venv_python = ROOT / ".venv" / "bin" / "python"
-    if venv_python.exists():
-        return str(venv_python)
     return sys.executable
 
 
@@ -93,12 +93,19 @@ def run_step(
 
     print(f"[refresh] start {name}: {text}", flush=True)
     try:
+        popen_group_kwargs: Dict[str, Any] = {}
+        # When the web job owns the timeout (the normal full-refresh path),
+        # inherit its process group so an outer timeout reaches this child too.
+        # A standalone per-step timeout still needs its own POSIX group because
+        # terminate_process_tree() sends signals to process.pid's group.
+        if os.name != "nt" and timeout is not None:
+            popen_group_kwargs["start_new_session"] = True
         process = subprocess.Popen(
             cmd,
             cwd=str(ROOT),
             env=env,
             text=True,
-            start_new_session=os.name != "nt",
+            **popen_group_kwargs,
         )
         try:
             returncode = process.wait(timeout=timeout)
@@ -116,6 +123,84 @@ def run_step(
         elapsed = time.time() - start
         print(f"[refresh] error {name}: {exc}", flush=True)
         return StepResult(name, text, False, 127, elapsed, error=str(exc))
+
+
+def _attach_failure_sidecar(step: StepResult, path: Path) -> None:
+    """Attach structured child failures to ``StepResult.meta`` after it exits."""
+    payload = load_json_file(path, None)
+    if isinstance(payload, dict):
+        for key in (
+            "requested",
+            "processed",
+            "write_enqueued",
+            "write_completed",
+            "retry_attempted",
+            "retry_recovered",
+            "retry_failed",
+            "failed",
+            "failure_details",
+        ):
+            if key in payload:
+                step.meta[key] = payload[key]
+        details = payload.get("failure_details")
+        if isinstance(details, list) and details and not step.error:
+            first = details[0] if isinstance(details[0], dict) else {}
+            code = first.get("code") or "全局"
+            stage = first.get("stage") or step.name
+            error = first.get("error") or f"exit={step.returncode}"
+            step.error = f"{code} [{stage}] {error}"
+        elif not step.ok and not step.error:
+            step.error = f"exit={step.returncode}; 子进程失败报告没有异常明细"
+        return
+
+    if not step.ok and not step.error:
+        step.error = f"exit={step.returncode}; 子进程未生成逐股失败报告"
+
+
+def _collect_report_failures(steps: Iterable[StepResult]) -> List[Dict[str, Any]]:
+    failures: List[Dict[str, Any]] = []
+    for step in steps:
+        details = step.meta.get("failure_details") if isinstance(step.meta, dict) else None
+        if isinstance(details, list) and details:
+            for detail in details:
+                if not isinstance(detail, dict):
+                    continue
+                failures.append({"step": step.name, **detail})
+            continue
+        if not step.ok and not step.skipped:
+            failures.append({
+                "step": step.name,
+                "code": None,
+                "name": "",
+                "stage": step.name,
+                "error": step.error or f"exit={step.returncode}",
+            })
+    return failures
+
+
+def _collect_health_failures(health: Dict[str, Any]) -> List[Dict[str, Any]]:
+    failures: List[Dict[str, Any]] = []
+    reference = health.get("hot_money_history_reference_date")
+    cutoff = health.get("hot_money_history_cutoff")
+    details = health.get("hot_money_history_stale_details")
+    if not isinstance(details, list):
+        return failures
+    for detail in details:
+        if not isinstance(detail, dict):
+            continue
+        code = str(detail.get("code") or "").zfill(6)
+        latest_date = detail.get("latest_date") or "无日线"
+        failures.append({
+            "step": "data_health",
+            "code": code,
+            "name": "",
+            "stage": "hot_money_history_freshness",
+            "error": (
+                f"最新日线={latest_date}，早于健康门槛={cutoff}"
+                f"（池内参考日={reference}）"
+            ),
+        })
+    return failures
 
 
 def _history_payload(code: str, name: str, records: List[Dict[str, Any]], source: str) -> Dict[str, Any]:
@@ -305,6 +390,14 @@ def collect_data_health() -> Dict[str, Any]:
             for row in history_rows
             if not row["latest_date"] or not history_cutoff or str(row["latest_date"]) < history_cutoff
         ]
+        stale_history_details = [
+            {
+                "code": str(row["code"]).zfill(6),
+                "latest_date": str(row["latest_date"]) if row["latest_date"] else None,
+            }
+            for row in history_rows
+            if not row["latest_date"] or not history_cutoff or str(row["latest_date"]) < history_cutoff
+        ]
     finally:
         conn.close()
     strategy = load_json_file(DATA_DIR / "stock_advanced_strategy_results.json", {})
@@ -322,6 +415,7 @@ def collect_data_health() -> Dict[str, Any]:
         "hot_money_history_fresh_count": len(history_rows) - len(stale_history_codes),
         "hot_money_history_stale_count": len(stale_history_codes),
         "hot_money_history_stale_sample": stale_history_codes[:20],
+        "hot_money_history_stale_details": stale_history_details,
         "short_signal_count": short_signals.get("count"),
         "short_signal_generated_at": short_signals.get("generated_at"),
         "short_signal_as_of_date": short_signals.get("as_of_date"),
@@ -378,13 +472,23 @@ def refresh_before_server(
     started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     steps: List[StepResult] = []
 
-    history_step = run_step(
-        "segment_leader_history",
-        [python_bin, "-B", "stock_crawl_price_valuation.py"],
-        timeout=timeout,
-        env=env,
-        skip=not full,
-    )
+    with TemporaryDirectory(prefix="stock-segment-refresh-") as tmpdir:
+        failure_sidecar = Path(tmpdir) / "failure-report.json"
+        history_step = run_step(
+            "segment_leader_history",
+            [
+                python_bin,
+                "-B",
+                "stock_crawl_price_valuation.py",
+                "--failure-report",
+                str(failure_sidecar),
+            ],
+            timeout=timeout,
+            env=env,
+            skip=not full,
+        )
+        if full:
+            _attach_failure_sidecar(history_step, failure_sidecar)
     steps.append(history_step)
     steps.append(
         run_step(
@@ -448,7 +552,12 @@ def refresh_before_server(
 
     hot_money_universe_step = run_step(
         "hot_money_small_cap_universe",
-        [python_bin, "-B", "stock_crawl_hot_money_universe.py"],
+        [
+            python_bin,
+            "-B",
+            "stock_crawl_hot_money_universe.py",
+            *(["--enrich-long-factors"] if full else []),
+        ],
         timeout=timeout,
         env=env,
     )
@@ -482,6 +591,8 @@ def refresh_before_server(
     finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     health = collect_data_health()
     ok = all(step.ok for step in steps) and not health.get("hot_money_history_stale_count")
+    failures = _collect_report_failures(steps)
+    failures.extend(_collect_health_failures(health))
     report = {
         "started_at": started_at,
         "finished_at": finished_at,
@@ -489,6 +600,7 @@ def refresh_before_server(
         "python": python_bin,
         "ok": ok,
         "steps": [step.to_dict() for step in steps],
+        "failures": failures,
         "health": health,
     }
     write_json_file(REFRESH_REPORT_FILE, report)
@@ -510,6 +622,16 @@ def main() -> None:
     )
     print(json.dumps(report, ensure_ascii=False, indent=2))
     if not report.get("ok"):
+        # Print concise diagnostics after the large JSON payload so the web
+        # job's retained log tail shows the actual stock/stage/error instead
+        # of ending on unrelated health-report braces.
+        for detail in report.get("failures", [])[:10]:
+            if not isinstance(detail, dict):
+                continue
+            code = detail.get("code") or "全局"
+            stage = detail.get("stage") or detail.get("step") or "stock_refresh"
+            error = detail.get("error") or "unknown error"
+            print(f"[refresh failure] {code} [{stage}] {error}", file=sys.stderr)
         raise SystemExit(1)
 
 

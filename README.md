@@ -1,10 +1,15 @@
 # financial-analysis
 
-一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/小盘/短线策略、龙虎榜/游资行为跟踪、参数搜索和本地可视化配置台。基金报告与 A 股策略台统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
+一些自用的金融量化分析工具，覆盖基金超额收益与技术信号、A 股长线/小盘/短线策略、龙虎榜/游资行为跟踪、ETF 技术雷达、参数搜索和本地可视化配置台。基金报告、A 股策略台和雷达统一整合在一个本地 Flask 工作台中，一条命令即可启动：`python run.py --port 8765`。
 
-当前版本：v3.3.4
+当前版本：v3.4.0
 
 > 仅用于个人研究、复盘和辅助分析，不构成任何投资建议。外部数据源可能延迟、缺失或变更接口，所有结果都应结合原始数据与人工判断复核。
+
+进一步了解项目：
+
+- [ARCHITECTURE.md](ARCHITECTURE.md)：系统边界、数据流、存储模型和关键设计约束。
+- [AGENTS.md](AGENTS.md)：面向后续编码 agent / 维护者的开发、验证和交付规则。
 
 ## 目录
 
@@ -13,13 +18,14 @@
 - [3. 快速开始](#3-快速开始)
 - [4. 基金分析](#4-基金分析)
 - [5. A 股策略配置台](#5-a-股策略配置台)
-- [6. 游资雷达](#6-游资雷达)
+- [6. 主力资金与 ETF 雷达](#6-主力资金与-etf-雷达)
 - [7. 行业周期](#7-行业周期)
 - [8. 输出文件](#8-输出文件)
 - [9. 项目结构](#9-项目结构)
 - [10. 运行提示](#10-运行提示)
 - [11. 更新历史](#11-更新历史)
 - [12. Acknowledgment](#12-acknowledgment)
+- [13. License](#13-license)
 
 ## 1. 项目预览
 
@@ -52,15 +58,26 @@
 | A 股短线策略 | 面向 1-5 个交易日，围绕龙虎榜、游资席位、机构共振、价量和风控因子选股 | 同上 |
 | 参数搜索 | 对长线/小盘/短线策略用三个独立进程并行做 Optuna/TPE 搜索和代理回测，分别写入默认参数 | `data/stock_strategy_optimized_config.json`、`data/stock_strategy_smallcap_optimized_config.json` |
 | 统一 Flask 工作台 | 在本地网页中查看基金报告、调参运行 A 股策略、保存配置、查看入选股票、周 K 小图和关键因子 | `python run.py --port 8765`（`/`、`/fund`、`/stock`、`/radar`） |
-| 游资雷达 | 在细分行业龙头池中跟踪吸筹分、出货预警、形态阶段、题材热度和盘中实时形态重算，并提供 K 线详情与 TopN 导出 | `data/capital/hot_money_ambush.json` |
+| 主力资金雷达 | 在细分行业龙头池或游资小盘池中跟踪吸筹、出货、反转、形态阶段和题材热度，支持盘中实时重算、全历史形态回放和 SW3 三级行业 20 日热度榜 | `data/capital/hot_money_ambush.json`、`data/capital/sw3_industry_heat.json` |
+| ETF 技术雷达 | 对经过主清单校验并入库的 ETF 配置池复用纯技术形态与机会分；自动排除股东、回购、龙虎榜等公司行为因子 | 同一 `/radar` 页面；刷新报告见 `data/etf_pool_refresh_report.json` |
 | 行业周期 | 抓取申万二级行业日线，提取周期位置、聪明资金、景气度和行业强弱特征 | `data/industry_cycle/*.json` |
 
 ## 3. 快速开始
 
-首先安装环境：
+需要 Python 3.10+。macOS、Linux 及基于 Linux/Unix 的国产系统可这样创建环境：
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r requirements.txt
+```
+
+Windows PowerShell 使用对应的虚拟环境入口：
+
+```powershell
+py -3 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r requirements.txt
 ```
 
 直接使用以下命令后台启动 Flask ：
@@ -99,17 +116,19 @@ http://127.0.0.1:8765
 
 ### 4.3 基金分析命令行工具
 
-基金分析报告可以直接运行：
+基金分析报告使用跨平台 Python 入口，Windows、macOS、Linux 及基于 Linux/Unix 的国产系统命令一致：
 
 ```bash
-bash fund_run.sh
+python fund_data_refresh.py
 ```
 
 如果境内数据源通过本地代理容易失败，可以直连运行：
 
 ```bash
-FUND_CRAWL_NO_PROXY=1 bash fund_run.sh
+python fund_data_refresh.py --no-proxy
 ```
+
+`fund_run.sh` 仅保留为 Unix 系统的兼容包装；网页“刷新数据”不再依赖 Bash。刷新器始终复用启动它的 Python 解释器，并通过 `python -m scrapy` 调用 Scrapy。
 
 ## 5. A 股策略配置台
 
@@ -121,7 +140,8 @@ A 股模块分为长线、小盘和短线三套策略，统一由 `stock_advance
 
 - 规模与流动性：成交额、行业规模地位、细分行业龙头分；总市值、小市值弹性等市值因子保留原始字段，但默认权重为 0，优化器不搜索。
 - 质量与盈利：ROE 稳定性、ROA、经营盈利能力、毛利资产比、现金流质量、低应计、Piotroski F 分。
-- 价值与股东回报：账面市值比、盈利收益率、现金流收益率、营收市值比、股息率、连续分红。
+- 价值与股东回报：账面市值比、盈利收益率、现金流收益率、营收市值比、滚动五年年均现金股息率、连续分红。股息率只统计截至最新交易日过去五年已经实施的现金分红，固定按五年年均，未分红期间按 0 计。
+- 资金面：股东户数变化、公司回购；“近期龙虎榜”保留原始值和风险提示，但长线默认权重固定为 0，不参与参数搜索。
 - 风险与稳健性：低波动、低负债、低质押、杠杆改善、资产扩张约束。
 - 价格行为：一月反转、12-1 月动量、52 周高点距离、长期反转、异常换手。
 
@@ -143,7 +163,9 @@ A 股模块分为长线、小盘和短线三套策略，统一由 `stock_advance
 
 v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
 
-股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 随后只补齐龙头股票的基本面，`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
+股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 补齐龙头股票基本面；游资小盘建池完成筛选后，再为本轮最终 `is_hot_money=1` 成员补齐估值、财报、指标、分红和质押。任一小盘成员补齐失败时保留上一份有效股票池，并阻止策略快照更新，避免新池与旧数据混合。`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
+
+当前 schema 通过 `stock_meta.instrument_type` 区分 `stock` 与 `etf`。两者复用 `stock_history` 的前复权行情，但 `list_codes()`、`codes_with_history()` 和 `iter_history()` 默认只返回股票；只有显式传入 `instrument_type=None` 才扫描全部证券。这个隔离保证 ETF 不会进入财报、股东、质押、回购、龙虎榜或股票策略任务。
 
 ### 5.5 参数搜索与可视化
 
@@ -157,7 +179,7 @@ Dashboard 支持：
 - 调整硬过滤参数、因子权重、输出数量和最低分。
 - 运行策略、保存配置、重置参数。
 - 直接触发长线/小盘/短线各 1500 次参数搜索，并查看后台搜索状态。
-- 展示候选数、入选数、平均分、分数区间、数据覆盖率、筛选解释和主要因子贡献。
+- 展示候选数、入选数、平均分、分数区间、按当前正权重计算的加权覆盖率，以及财务/估值、价量、资金面等分项覆盖；筛选解释和主要因子贡献继续使用同一套后端因子结果。
 - 长线专属“策略走势”按钮：默认参数直接展示 `data/stock_strategy_best_fold_paths.svg`，非默认参数会按当前配置重新生成自定义 SVG。
 - “导出”按钮按当前策略的输出数量导出 txt，每行格式为 `股票代码,股票名,`。
 - 三种策略的入选股票表格均内置固定范围简易周 K 线，不提供拖拽或缩放。
@@ -192,47 +214,88 @@ python stock_advanced_strategies.py --strategy short --json
 python stock_strategy_optimizer.py --iterations 1500
 ```
 
-`stock_data_refresh.py` 的 full 流程会先刷新细分行业龙头行情与估值，再补齐龙头股票基本面，随后刷新基准 ETF、指数成分、龙虎榜/游资候选，最后自动运行 `stock_advanced_strategies.py --persist --rebuild-cache` 生成最新策略结果并预构建候选池缓存。申万三级 membership 默认每轮滚动刷新最旧 15 个行业：legulegu 总表可用时优先使用 legulegu 成分接口，成员接口失败才回退官方；总表不可用时直接用官方数据刷新最旧 15 个。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
+单独维护申万三级龙头与行业热度
 
-## 6. 游资雷达
+```bash
+python stock_crawl_segment_leaders.py crawl
+python stock_crawl_segment_leaders.py recrawl
+```
 
-`stock_hot_money_radar.py` 是主力资金雷达入口，按「潜伏吸筹 → 试盘/洗盘 → 突破/拉升 → 出货预警」理解短线资金行为。v3.3.0 起，雷达已经接入 Flask `/radar` 页面：读取 SW3 细分龙头池、A 股日线、板块热度和题材匹配，计算吸筹分、出货分、命中形态、阶段标签、题材热度、市值和 K 线详情。
+`crawl` 和 `recrawl` 在龙头池成功生成后，会同步刷新近 20 个共同交易日的三级行业热度报告；默认 `show` 只读取已有龙头池，不联网、不重算。完整股票刷新通过 `stock_crawl_price_valuation.py` 调用同一流程，因此也会更新该报告。
 
-### 6.1 运行模式
+行业成交额历史仍以申万指数日频数据为主。当申万仅缺少紧邻的一个已收盘交易日时，刷新器会通过无需 Token 的 AkShare `stock_zh_a_spot()` 读取一次新浪全 A 收盘快照，再按当前 SW3 成分汇总该日成交额；这个补位只用于相邻一天，不承担多日历史回补。快照日期、收盘状态、全市场行数、成分完整度和行业覆盖必须全部通过校验，且结果写入独立缓存以避免同一快照重复请求；任何门槛失败都会保留上一份原子报告。
+
+`stock_data_refresh.py` 的 full 流程会先刷新细分行业龙头行情、估值与基本面，随后刷新基准 ETF、指数成分和资本事件；游资小盘筛选完成后，对最终成员补齐长线因子所需的估值与基本面，再刷新席位/技术快照，最后自动运行 `stock_advanced_strategies.py --persist --rebuild-cache` 生成最新策略结果并预构建候选池缓存。申万三级 membership 默认每轮滚动刷新最旧 15 个行业：legulegu 总表可用时优先使用 legulegu 成分接口，成员接口失败才回退官方；总表不可用时直接用官方数据刷新最旧 15 个。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
+
+A 股个股日线按 `新浪 -> 腾讯 -> 东财` 依次回退，全部来源都返回空数据时会把该股票列入首轮失败。等其余股票抓取和首轮写库全部结束后，失败代码会逐只再刷新一次；只有复试后仍失败的股票才写入 `data/stock_data_refresh_report.json`，并记录最终失败阶段与最终异常。报告同时提供 `retry_attempted`、`retry_recovered`、`retry_failed` 统计。ETF 优先使用基金专用行情接口，再回退到同一套公开日线源。
+
+## 6. 主力资金与 ETF 雷达
+
+`stock_hot_money_radar.py` 是雷达计算入口，按「潜伏吸筹 → 试盘/洗盘 → 突破/拉升 → 出货预警」理解股票短线资金行为，同时允许 ETF 配置池复用不依赖公司数据的技术形态。Flask `/radar` 页面负责切换候选池、展示排序与解释、读取 K 线，并按需触发离线计算或全量刷新。
+
+### 6.1 候选池与排序口径
+
+| `--pool` | 成员来源 | 主排序 | 适用边界 |
+| --- | --- | --- | --- |
+| `leader` | `sw3_member.is_leader=1`，即 SW3 细分行业龙头池 | 机会分 | 默认池；结合技术形态、公司资金面与题材解释 |
+| `hotmoney` | `sw3_member.is_hot_money=1`，与 A 股短线策略共用游资小盘池 | 反转分 | 机会分辅助观察；偏向寻找不过热、不拥挤的短线反弹候选 |
+| `etf` | `stock_etf_pool.py` 配置，经 ETF 主清单校验且已以 `instrument_type=etf` 入库 | 技术机会分 | 不抓取或使用财报、股东户数、回购、质押、龙虎榜等公司层数据；当前尚未做 ETF 专项有效性验证 |
+
+机会分不是上涨概率。它先把吸筹原始分和连续出货原始分分别转换为当前候选池内的横截面百分位，再按 `吸筹百分位 ×（1 − 0.5 × 出货百分位 / 100）` 折价。阶段标签只描述当前命中的 P1–P26 结构，不直接等同于排序分。
+
+ETF 池通过 `stock_etf_pool.py` 维护。`stock_crawl_etf_pool.py` 默认先用公开 ETF 主清单严格校验代码，再只抓取前复权 OHLCV、成交额、涨跌幅和换手率；主清单不可用时会停止刷新，不在主清单中的配置则记录为无效并跳过，避免普通股票或 LOF 仅凭六位代码混入。
+
+### 6.2 运行模式
 
 核心模式包括：
 
-- `ambush`：默认模式，读取细分行业龙头池，输出吸筹分、出货分、阶段、形态和题材热度。
+- `ambush`：默认模式，读取 `--pool` 指定的候选池，输出吸筹分、出货分、阶段、形态和题材/分类信息。
 - `patterns`：把游资形态 playbook 落到股票与板块数据上，输出形态匹配与验证结果。
 - `verify`：复盘吸筹分与形态信号的后续收益、分层和 IC。
-- `distribution`：复盘出货分候选特征，做 0.1 步长权重网格搜索和消融实验。
-- `accumulation`：复盘 `chip / position / cmf_eff / P1 / P3 / P24 / P25 / 股东户数变化 / 公司回购` 九个吸筹候选特征；P1/P25 固定各 5%（双池计分、仅小盘有效），其余七项在剩余 90% 中做 0.05 步长权重网格搜索和消融实验。
+- `distribution`：复盘出货分候选特征，做 0.05 步长权重网格搜索和消融实验。
+- `accumulation`：复盘 `chip / position / cmf_eff / P1 / P2 / P3 / P5 / P21 / P23 / P24 / P25 / 股东户数变化 / 公司回购` 十三个吸筹候选特征；P2/P5/P23/P24/P25/公司回购固定各 5%，其余七项在剩余 70% 中按 0.05 步长做权重网格搜索和消融实验。
+- `latent`：在 `ambush` 结果上用低位、低拥挤、吸筹、妖股基因和公司证据筛出左侧观察名单；新闻题材只作催化剂展示，不进入排序。
 - `watch`：预留盘中监控状态文件，当前仍以离线数据推断为主。
 
 ```bash
 python stock_hot_money_radar.py
 python stock_hot_money_radar.py ambush
+python stock_hot_money_radar.py ambush --pool hotmoney
+python stock_hot_money_radar.py ambush --pool etf
 python stock_hot_money_radar.py patterns
+python stock_hot_money_radar.py patterns --pool leader --pattern-max 24 --jobs 6
+python stock_hot_money_radar.py patterns --pool leader --pattern-min 25 --pattern-max 26 --jobs 6
 python stock_hot_money_radar.py watch
 python stock_hot_money_radar.py verify
 python stock_hot_money_radar.py distribution
 python stock_hot_money_radar.py accumulation
-bash stock_radar_fresh_data.sh
+python stock_hot_money_radar.py latent --pool hotmoney
+python stock_crawl_news.py --no-proxy --pool hotmoney
+python stock_crawl_etf_pool.py
+python stock_radar_fresh_data.py
 ```
 
-`stock_radar_fresh_data.sh` 会直连运行全量股票刷新、申万二级板块历史抓取和题材候选生成，适合在打开 `/radar` 前更新底层数据。
+`patterns` 支持用 `--pattern-min` / `--pattern-max` 限定形态编号区间，并用 `--jobs` 按股票并行回测。并行实现会在各进程内先聚合日期级充分统计量，再合并计算逐日超额、胜率、Newey-West HAC 与 BH-FDR，避免传输和保存数百万条逐股票日明细。
 
-### 6.2 前端能力
+`--as-of YYYY-MM-DD` 可让 `ambush` / `latent` 只使用该日及以前的 bar 做 PIT 历史复盘，并禁用最新题材缓存以防信息泄漏。`--exclude-large-cap` 只对 `leader` 池生效；`hotmoney` 已在建池时完成小盘过滤，ETF 没有公司总市值过滤语义。
 
-- `/radar` 展示吸筹分 Top 列表、阶段分布、题材热度、命中形态解释、市值和右侧 K 线详情。
+`stock_radar_fresh_data.py` 是跨平台全量刷新入口，不按候选池拆分：每次都会刷新 `stock_etf_pool.py` 中的 ETF 行情、全量股票、申万二级板块历史和题材候选。ETF 仅抓取行情，不抓取财务、股东户数、回购、龙虎榜等公司层数据。刷新器最后重建默认 `leader` 结果；切到 `hotmoney` 或 `etf` 后需再运行一次雷达，池选择不会缩小底层刷新范围。`stock_radar_fresh_data.sh` 只为 Unix 手工调用保留，网页不依赖它。
+
+### 6.3 前端能力
+
+- `/radar` 可切换细分龙头、游资小盘和 ETF 三类候选池，并按各自生产口径排序。
+- 页面展示机会分、吸筹分、连续出货分/预警、反转分、阶段分布、题材或 ETF 类别、命中形态解释，以及市值或基金规模。
 - “空仓观望”统一改名为“观望”。
 - 支持隐藏出货预警、切换是否包含大盘股、运行刷新结果、重爬数据。
-- 支持盘中实时行情开关：腾讯批量行情优先，新浪批量行情备用，东方财富全 A 快照兜底；开启后每 2 分钟刷新当前雷达股票池，只在页面内重算形态与分数，不写回离线结果文件。
+- 支持盘中实时行情开关：腾讯批量行情优先，新浪批量行情备用，东方财富全 A 快照兜底；开启后页面每 3 分钟刷新当前雷达股票池，只在内存中重算形态与分数，不写回离线结果文件。
 - 实时价格展示保留接口原始现价，形态计算会把当日涨跌幅投影到本地前复权日线基准，避免把不复权实时价直接拼进前复权序列；实时成交量、成交额和换手率保留 `raw_*` 原始累计值，并按内置 A 股 U 型日内成交曲线估算全天值后供量比、换手分位、CMF、筹码和放量形态使用。
 - 二级行业筛选支持多选、热度 Top10、可调热度阈值和当前筛选结果全选，便于在行业数量较多时快速聚焦高热度方向。
-- “导出”按钮按吸筹分导出 TopN 股票，输入框默认 10，每行格式为 `股票代码,股票名,`。
+- “三级行业热度”按钮懒加载 `data/capital/sw3_industry_heat.json`，同时展示全部有效三级行业的近 20 日成交额排名，以及全部满足“末 5 日成交份额增长且 20 日趋势为正”的升温行业；每个行业给出成交额、日均成交额、当前成分市值及覆盖率，并用 20 日热度指数折线展示变化。摘要会标明最新日来源，使用 AkShare/Sina 成分汇总的行业会单独显示汇总天数。两张长榜各自滚动，排名不会因展示而重算。
+- K 线支持日/周/月聚合、拖拽平移、缩放和全历史范围条；“形态回测”会按每日当时可见数据逐日回放生产买卖点，并把普通买点、动量点、疑似吸筹和出货预警标记在日 K 上。
+- ETF 模式会把行业筛选切换为 ETF 类别，并明确标注“股票池实测、ETF 待专项验证”。
+- “导出”按钮按当前候选池的页面排序导出 TopN，输入框默认 10，每行格式为 `股票代码,股票名,`。
 
-### 6.3 输出文件
+### 6.4 输出文件
 
 - `data/capital/hot_money_ambush.json`：吸筹分、出货分、形态阶段和题材热度。
 - `data/capital/hot_money_patterns.json` / `.csv`：形态匹配结果。
@@ -240,15 +303,28 @@ bash stock_radar_fresh_data.sh
 - `data/capital/hot_money_watch.json`：盘中监控状态占位。
 - `data/capital/hot_money_verify.json`：吸筹分复盘结果。
 - `data/capital/hot_money_distribution_experiment.json`：出货分权重网格搜索和消融实验结果。
-- `data/capital/hot_money_accumulation_experiment.json`：九原始分吸筹总分权重网格搜索和消融实验结果。
+- `data/capital/hot_money_accumulation_experiment.json`：十三项原始特征吸筹总分权重网格搜索和消融实验结果。
+- `data/capital/hot_money_latent.json`：低位潜伏观察名单；它不是买点触发器。
+- `data/capital/sw3_industry_heat.json`：申万三级行业统一 20 日成交额、当前成员市值快照、全部有效行业热门排名、全部正向升温行业排名与每日图表序列。
+- `data/capital/sw3_akshare_latest_cache.json`：通过日期、全市场快照与 SW3 membership 校验后的最新单日成分汇总缓存；它不是历史数据源或可展示报告。
+- `data/etf_pool_refresh_report.json`：ETF 配置、主清单校验、无效代码和行情刷新结果。
 
-### 6.4 使用边界
+### 6.5 使用边界
 
 - 盘中没有席位级实时数据，雷达输出是行为推断，不是席位实锤。
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
-- `阶段·把握` 中的阶段来自命中形态；把握度会按阶段混合形态强度、吸筹分和出货分，观望表示“暂无明显阶段信号”的可信度，不再等同于吸筹分或简单形态计数。
-- 吸筹总分候选特征为 `chip / position / cmf_eff / P1 / P3 / P24 / P25 / 股东户数变化 / 公司回购`；当前线上权重为 `0.1*chip + 0.2*position + 0.1*cmf_eff + 0.05*P1 + 0.2*P3 + 0.1*P24 + 0.05*P25 + 0.1*股东户数变化 + 0.1*公司回购`。P1/P3/P24/P25 命中为 100、未命中为 0；P1/P25 双池计分但仅小盘池回测有效，龙头池历史同池超额为负。缺股东户数变化按中性 50，近 90 日无回购按 0。
-- 出货分候选特征为 `technical / P11 / P19 / P20 / 近期龙虎榜 / divergence`；当前线上权重为 `0.2*technical + 0.2*P11 + 0.1*P19 + 0.1*P20 + 0.2*近期龙虎榜 + 0.2*divergence`，其中 `divergence` 使用原始 div 分，不使用吸筹侧反向后的 `div_eff`。
+- 机会分、反转分和阶段把握度都是排序或解释信号，不是未来收益概率，也不构成交易指令。
+- 三级行业“最热门”按统一 20 个交易日成交额排序；“逐渐上升”按行业日成交额占全部有效三级行业的份额，综合末 5 日相对首 5 日增幅和趋势相关性排序。两者都是相对活跃度，不是行业收益预测。
+- 行业市值是当前 SW3 membership 成分的总市值快照。现有 membership 会排除 ST、北交和部分新股，因此报告始终同时给出成员覆盖率；覆盖不完整时页面显示“约”，不能解读为官方完整行业总市值。
+- 个别当前行业在申万“指数详情趋势”接口中可能停更。报告会优先使用精确 `bargainsum`；仅对缺失的近 20 日，用同一官方站点的行业成交额份额和其他精确行业汇总反推估算，并在行业与每日记录中设置 `amount_is_estimate`，页面以“约/含估算”标注。若份额接口本轮临时返回空，只允许续用上一份已通过完整性校验且明确标为估算的日度点，不会把旧 AkShare 派生点滚动成多日历史。
+- AkShare/Sina 只补申万之后紧邻的一个已收盘交易日：成交额来自全 A 收盘快照按 SW3 成分求和，属于“成分汇总”而不是申万指数直接值，也不标成份额反推估算。交易日间隔超过一天、快照不完整或行业成分覆盖不足时不拼接、不补零，并保留旧报告。
+- ETF 当前只复用纯技术启发式并重标剩余权重，股票池中的形态有效性不能直接外推到 ETF；使用前应单独做事件研究。
+- `阶段·把握` 中的阶段来自命中形态。买入阶段继续混合形态强度、吸筹分和出货冲突分；出货阶段的把握已按2017–2026全历史PIT事件做时间切分校准，仅用吸筹分与连续出货分估计未来5/10/20日下跌方向的一致性。观望表示“暂无明显阶段信号”的可信度，不等同于吸筹分或简单形态计数。
+- `出货预警` 在同一交易日命中 P14/P15/P16/P17/P19/P20/P22/P26 中任意一个即触发；每个形态去重后记 1 分，P18/P11 不触发。列表阶段与 K 线“形态回测”卖点共用该口径。
+- `疑似吸筹（待确认）` 要求 P1–P26 全部未命中且吸筹分达到 35 分；“形态回测”从第 40 根 K 线开始按当日可见资金面逐日计算，并以绿色“疑”买点标记。
+- “形态回测”的普通买点为 P1/P2/P3/P5/P21/P23/P24/P25 任意一个命中；P23/P25 虽保留实验标签，仍按当前产品口径标记绿色买点。
+- 吸筹总分的十三项原始特征为 `chip / position / cmf_eff / P1 / P2 / P3 / P5 / P21 / P23 / P24 / P25 / 股东户数变化 / 公司回购`；当前线上公式为 `0.05*公司回购 + 0.10*chip + 0.10*position + 0.10*cmf_eff + 0.10*股东户数变化 + 0.10*(P1+P3+P21) + 0.05*(P2+P5+P23+P24+P25)`。P1/P5 在当前复测中小盘更有效，P2 大盘更有效。形态命中为 100、未命中为 0；缺股东户数变化按中性 50，近 90 日无回购按 0。普通股完全未命中形态时理论最高 40 分，股东数据缺失且有回购时最高 35 分，公司资金面完全缺失时最高 30 分；ETF 排除并重标公司行为权重后最高约 29.4 分。
+- 连续出货分的十一项原始特征为 `P14 / P15 / P16 / P17 / P19 / P20 / P22 / P26 / 近期龙虎榜 / technical / divergence`；当前线上公式为 `0.05*(P14+P15+P20+P22) + 0.10*(P16+P17+P19+P26+近期龙虎榜) + 0.15*technical + 0.15*divergence`。形态与龙虎榜命中值为 1，否则为 0；`technical` 与 `divergence` 为 0–1，其中 `divergence` 使用原始分，不使用吸筹侧反向后的 `div_eff`。
 - 调整出货权重前先跑 `python stock_hot_money_radar.py distribution` 查看 train、validation 与消融结果。
 - 调整吸筹总分权重前先跑 `python stock_hot_money_radar.py accumulation`，并同时检查 train、validation 与消融结果。
 
@@ -288,17 +364,21 @@ python industry_cycle_engine.py --write
 | `data/stock_strategy_smallcap_optimized_config.json` | 小盘独立优化权重；缺失时回退 `meta_data_backup/stock_strategy_smallcap_optimized_config.json`，再回退代码默认值 |
 | `data/stock_strategy_best_fold_paths.svg` | 长线默认参数历史折走势小图矩阵 |
 | `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
-| `data/stock_data.sqlite3` | A 股主数据库：`stock_meta` 存个股财报、指标、分红、日线统计和质押等 meta JSON，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存基准 ETF NAV |
+| `data/capital/sw3_industry_heat.json` | 申万三级行业近 20 个共同交易日热度报告，含成交额、当前成员市值覆盖、全部有效行业热门排名、全部正向升温行业排名和日度图表序列 |
+| `data/capital/sw3_akshare_latest_cache.json` | 通过日期、全市场快照与 SW3 membership 校验后的最新单日成分汇总缓存，不是展示报告 |
+| `data/stock_data.sqlite3` | 股票/ETF 证券主数据库：`stock_meta.instrument_type` 隔离品种，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存策略基准 ETF NAV |
+| `data/etf_pool_refresh_report.json` | ETF 配置池的主清单校验、有效/无效代码和行情刷新结果 |
 | `data/plate_data.sqlite3` | 申万二级行业日线缓存，供题材热度、游资形态和行业周期使用 |
 | `data/stock_data/CN_*.json` | 旧版个股 JSON 缓存；v3.1.4 主流程不再依赖，可通过 `stock_storage.import_stock_data_dir()` 批量导入 SQLite |
-| `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时和失败信息 |
+| `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时、健康检查和结构化失败明细；`failures[]` 记录股票代码、名称、失败阶段与异常内容 |
 | `data/capital/theme_candidates.json` | SW2 板块热度与个股题材跟踪关系 |
 | `data/capital/hot_money_ambush.json` | 主力资金吸筹分、出货分、阶段和形态输出 |
 | `data/capital/hot_money_patterns.json` / `.csv` | 游资形态匹配输出 |
 | `data/capital/hot_money_pattern_verify.json` | 游资形态事件复盘输出 |
 | `data/capital/hot_money_watch.json` | 实时交易监控状态占位 |
 | `data/capital/hot_money_verify.json` | 吸筹分命中验证输出 |
-| `data/capital/hot_money_accumulation_experiment.json` | 九原始分吸筹总分权重实验输出 |
+| `data/capital/hot_money_accumulation_experiment.json` | 十三项原始特征吸筹总分权重实验输出 |
+| `data/capital/hot_money_latent.json` | 低位、安静、吸筹与历史活跃基因构成的潜伏观察名单 |
 | `data/industry_cycle/*.json` | 行业周期位置、聪明资金、景气度、行业强弱和运行报告 |
 
 ## 9. 项目结构
@@ -307,6 +387,8 @@ python industry_cycle_engine.py --write
 .
 ├── app/                           # Flask 统一工作台、路由、模板和静态资源
 ├── run.py                         # Flask 本地启动入口
+├── refresh_workflow.py            # 跨平台子进程环境、日志和失败即停止编排
+├── fund_data_refresh.py           # 基金跨平台全量刷新入口
 ├── fund_*.py                     # 基金数据、技术分析、回测和报告生成
 ├── fund_storage.py                # 基金 SQLite 缓存 schema、读写和导入工具
 ├── funds.py                      # 基金列表和基准配置
@@ -316,13 +398,22 @@ python industry_cycle_engine.py --write
 ├── stock_crawl_common.py          # 股票爬虫公共文件、JSON、历史行情和日线统计工具
 ├── stock_storage.py               # A 股 SQLite 持久化层、schema、导入和读写工具
 ├── stock_crawl_segment_leaders.py # 申万三级行业 membership 与细分行业龙头池
+├── sw3_industry_heat.py            # 申万三级行业20日成交额、趋势榜与原子报告
+├── sw3_akshare_latest.py            # AkShare/Sina 最新相邻交易日成分汇总与质量门槛
 ├── stock_crawl_*.py               # 股票基础数据、指数池、龙虎榜/资金数据抓取
+├── stock_etf_pool.py               # 雷达 ETF 配置、展示名称和分类
+├── stock_crawl_etf_pool.py         # ETF 主清单校验与纯行情刷新
 ├── stock_hot_money_radar.py       # 主力资金吸筹分、形态和验证
+├── stock_hot_money_risk_factors.py # P17/P19/P22 精简风险因子层，供后续研究复用
+├── stock_crawl_news.py             # 潜伏观察模式的可选新闻/题材催化剂数据层
 ├── stock_theme_candidates.py      # SW2 板块热度与个股题材匹配
-├── stock_radar_fresh_data.sh      # 游资雷达重数据刷新脚本
+├── stock_radar_fresh_data.py      # 股票、ETF、板块和雷达跨平台全量刷新入口
+├── stock_radar_fresh_data.sh      # Unix 兼容包装器
 ├── plate_crawl_history.py         # 申万二级行业日线抓取
 ├── plate_storage.py               # 板块/行业 SQLite 持久化层
 ├── industry_cycle_engine.py       # 行业周期位置、景气度和强弱引擎
+├── research_p15_optimization.py   # P15 双池只读 PIT 审计
+├── mf_pilot.py                    # 主力/超大单净占比的断点续爬研究 pilot
 ├── stock_fix_volume_units.py      # stock_history 成交量单位修复工具
 ├── app/routes/radar.py            # 游资雷达 Flask 路由
 ├── app/services/radar_service.py  # 游资雷达页面服务
@@ -335,14 +426,19 @@ python industry_cycle_engine.py --write
 
 ## 10. 运行提示
 
-- 外部数据接口可能很慢或超时，刷新股票全量数据建议给足 `--timeout 1800`。
+- 外部数据接口可能很慢或超时。网页全量刷新任务上限为 3 小时；若单独调试底层 `stock_data_refresh.py`，可用 `python stock_data_refresh.py --mode full --no-proxy --timeout 1800` 将每个外部步骤上限设为 1800 秒。
 - 境内行情接口通过本地代理有时会失败，可使用 `--no-proxy` 或 `FUND_CRAWL_NO_PROXY=1`。
 - Dashboard 日常打开不会自动重算候选池；需要最新数据时用页面按钮或 CLI 手动刷新。
 - 短线策略强依赖龙虎榜/资金数据；游资雷达还依赖 SW3 龙头池、`stock_history`、`plate_data.sqlite3` 和 `theme_candidates.json`。
-- 运行 `stock_radar_fresh_data.sh` 会触发全量股票、板块和题材刷新，耗时明显长于普通页面调参。
+- `stock_radar_fresh_data.py` 不接受 pool 参数，每次都会刷新全量股票、ETF、板块和题材数据。
+- 三级行业热度刷新需要逐个读取约 336 个申万三级指数的日频成交额，并使用 `data/capital/sw3_industry_heat_history_cache.json` 做两小时内的失败续传。申万只落后一个已收盘交易日时才会额外请求一次无需 Token 的 AkShare/Sina 全 A 快照，并复用 `data/capital/sw3_akshare_latest_cache.json`；多日缺口、日期/全市场/成分覆盖校验失败、接口超时或有效行业不足 80% 时都不会覆盖上一份完整报告，页面仍读取旧快照。
+- ETF 与股票共用 `stock_history`，但 `stock_meta.instrument_type` 必须保持正确；股票全库扫描默认排除 ETF，避免误抓公司层数据。
 - 所有策略结果都来自本地缓存和可得数据，缺失数据会影响排序和评分。
 
 ## 11. 更新历史
+
+#### Update v3.4.0  2026.7.18
+雷达新增龙头、游资小盘和 ETF 三池切换、形态回放与潜伏观察；上线 SW3 三级行业热度；刷新链路改为跨平台 Python 编排，并增强行情重试、证券隔离和滚动五年股息口径。
 
 #### Update v1.1  2021.7
 新增该基金的基金经理管理规模提示，小于100亿标红（表示管理规模小），大于300亿标绿（表示管理规模较大）。

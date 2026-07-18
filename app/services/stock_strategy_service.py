@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sys
 import threading
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -17,7 +18,7 @@ SMALLCAP_DEFAULT_CHART_FILENAME = "stock_strategy_smallcap_fold_paths.svg"
 SMALLCAP_CUSTOM_CHART_PREFIX = "stock_strategy_smallcap_fold_paths_custom_"
 STOCK_REFRESH_JOB_ID = "stock-refresh"
 STOCK_OPTIMIZER_JOB_ID = "stock-optimizer"
-STOCK_REFRESH_SCRIPT = "stock_radar_fresh_data.sh"
+STOCK_REFRESH_SCRIPT = "stock_radar_fresh_data.py"
 
 
 def run_stock_strategies(
@@ -117,7 +118,7 @@ def resolve_long_backtest_chart_file(filename: str) -> Path:
 def start_stock_data_refresh() -> bool:
     return start_command_job(
         STOCK_REFRESH_JOB_ID,
-        ["bash", STOCK_REFRESH_SCRIPT],
+        [sys.executable, "-B", STOCK_REFRESH_SCRIPT],
         cwd=ROOT_DIR,
         timeout=10800,
         on_success=_after_stock_data_refresh,

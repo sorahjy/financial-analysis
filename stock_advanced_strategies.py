@@ -44,10 +44,11 @@ OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_optimized_
 SMALLCAP_OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_smallcap_optimized_config.json"
 SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_smallcap_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
-LIVE_CANDIDATE_CACHE_VERSION = 4
+LIVE_CANDIDATE_CACHE_VERSION = 5
 SHORT_UNIVERSE_VERSION = "hotmoney_small_cap_v1"
 SMALLCAP_UNIVERSE_VERSION = SHORT_UNIVERSE_VERSION
 LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
+LONG_DIVIDEND_FACTOR_VERSION = "rolling_realized_5y_v2"
 LONG_CAPITAL_EVENT_DAYS = 90
 HOLDER_TABLE = "shareholder_count"
 REPURCHASE_TABLE = "repurchase"
@@ -103,11 +104,20 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("gross_margin", "毛利率", "long", "盈利", "销售毛利率。", 0.5, "percentile", missing_score=35),
     FactorSpec("net_margin", "净利率", "long", "盈利", "销售净利率。", 0.8, "percentile", missing_score=35),
     FactorSpec("cashflow_quality", "现金流质量", "long", "质量", "经营现金流 / 净利润，1附近及以上更好。", 0.9, "bounded", "high", 0.0, 2.0, 35),
-    FactorSpec("dividend_yield_5y", "五年股息率", "long", "股东回报", "近五年平均每股分红 / 当前股价。", 0.7, "percentile", missing_score=20),
+    FactorSpec(
+        "dividend_yield_5y",
+        "滚动五年年均股息率",
+        "long",
+        "股东回报",
+        "截至最新交易日，过去五年已实施的每股现金分红合计 / 5 / 当前股价；未分红期间按0计。",
+        0.7,
+        "percentile",
+        missing_score=20,
+    ),
     FactorSpec("dividend_consistency", "连续分红", "long", "股东回报", "近三年连续现金分红。", 0.5, "boolean"),
     FactorSpec("holder_count_change", "股东户数变化", "long", "资金面", "最近已公告股东户数增减比例，户数下降代表筹码集中。", 0.7, "percentile", "low", missing_score=50),
     FactorSpec("repurchase_recent", "公司回购", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日有回购公告。", 0.4, "bounded", "high", 0.0, 1.0, 50),
-    FactorSpec("lhb_recent_avoid", "近期龙虎榜", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日上过龙虎榜按避雷处理。", 0.5, "bounded", "low", 0.0, 1.0, 50),
+    FactorSpec("lhb_recent_avoid", "近期龙虎榜", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日上过龙虎榜按避雷处理；长线默认权重为0且不参与参数搜索。", 0.0, "bounded", "low", 0.0, 1.0, 50),
     FactorSpec("debt_safety", "低负债率", "long", "风险", "资产负债率越低越好，银行等行业会由其他质量因子平衡。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("pledge_safety", "低质押", "long", "风险", "股权质押比例越低越好。", 0.4, "percentile", "low", missing_score=60),
     FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.0, "direct", missing_score=40),
@@ -186,11 +196,38 @@ SMALLCAP_EXCLUDED_FACTOR_KEYS = {
     "market_cap",
     "size_reversal",
 }
+SMALLCAP_DEFAULT_WEIGHT_OVERRIDES = {
+    # 本次只关闭长线页的自动搜索；小盘页维持原有默认权重与搜索口径。
+    "lhb_recent_avoid": 0.5,
+}
 SMALLCAP_FACTORS: List[FactorSpec] = [
-    replace(spec, strategy="smallcap")
+    replace(
+        spec,
+        strategy="smallcap",
+        default_weight=SMALLCAP_DEFAULT_WEIGHT_OVERRIDES.get(
+            spec.key, spec.default_weight
+        ),
+    )
     for spec in LONG_FACTORS
     if spec.key not in SMALLCAP_EXCLUDED_FACTOR_KEYS
 ]
+
+
+LONG_PRICE_COVERAGE_KEYS = frozenset({
+    "liquidity",
+    "low_volatility",
+    "reversal_1m",
+    "momentum_12_1",
+    "dist_52w_high",
+    "reversal_long_term",
+    "abnormal_turnover",
+})
+LONG_CAPITAL_COVERAGE_KEYS = frozenset({
+    "holder_count_change",
+    "repurchase_recent",
+    "lhb_recent_avoid",
+    "pledge_safety",
+})
 
 
 FACTOR_REGISTRY: Dict[str, FactorSpec] = {
@@ -200,6 +237,15 @@ FACTOR_REGISTRY: Dict[str, FactorSpec] = {
 LONG_DEFAULT_TOP_N = 20
 SMALLCAP_DEFAULT_TOP_N = 10
 SHORT_DEFAULT_TOP_N = 10
+
+LONG_FIXED_ZERO_WEIGHT_KEYS = {
+    "csi300_current",
+    "csi300_persistence",
+    "market_cap",
+    "size_reversal",
+    "industry_leadership",
+    "lhb_recent_avoid",
+}
 
 
 DEFAULT_CONFIG: Dict[str, Any] = {
@@ -215,7 +261,14 @@ DEFAULT_CONFIG: Dict[str, Any] = {
         "exclude_st": True,
         "hold_years_min": 2,
         "hold_years_max": 5,
-        "weights": {spec.key: spec.default_weight for spec in LONG_FACTORS},
+        "weights": {
+            spec.key: (
+                0.0
+                if spec.key in LONG_FIXED_ZERO_WEIGHT_KEYS
+                else spec.default_weight
+            )
+            for spec in LONG_FACTORS
+        },
     },
     "short": {
         "enabled": True,
@@ -730,35 +783,65 @@ def dividend_yield(
         as_of: Optional[str] = None,
         price: Optional[float] = None,
 ) -> Optional[float]:
-    # 实盘(as_of=None)：直接用预算的 yearly_dividends 与最新收盘。
+    """滚动 years 年的年均现金股息率。
+
+    只统计截至参考日已经实施的现金分红，优先以除权除息日判断是否落入窗口；
+    老数据缺少除权除息日时，仅对“实施”记录回退到公告日。窗口内没有分红时
+    返回 0，只有分红明细本身不可用时才返回 None。
+    """
+    if years <= 0:
+        return None
+    dividends = stock.get("dividends") or {}
+    records = dividends.get("records") if isinstance(dividends, dict) else None
+    if not isinstance(records, list) or not records:
+        return None
+
     if as_of is None:
-        yearly = stock.get("dividends", {}).get("yearly_dividends", {})
         stats = derived_daily_stats(stock)
         ref_price = price if price is not None else first_not_none(
             stats.get("latest_daily_close"), stats.get("latest_close")
         )
-        ref_year = datetime.now().year
+        ref_date = parse_date(stats.get("latest_trade_date")) or datetime.now()
     else:
-        # PIT：只数 announce_date <= as_of 的分红，按公告年聚合每10股派息。
-        yearly = {}
-        for rec in stock.get("dividends", {}).get("records", []) or []:
-            ann = str(rec.get("announce_date") or "")[:10]
-            div = safe_float(rec.get("dividend_per_10"))
-            if len(ann) == 10 and ann <= as_of and div and div > 0:
-                yr = ann[:4]
-                yearly[yr] = yearly.get(yr, 0.0) + div
         ref_price = price
-        ref_year = int(as_of[:4])
-    if not yearly or not ref_price or ref_price <= 0:
+        ref_date = parse_date(as_of)
+    if ref_date is None or not ref_price or ref_price <= 0:
         return None
-    values = []
-    for offset in range(1, years + 1):
-        div = safe_float(yearly.get(str(ref_year - offset)))
-        if div is not None and div > 0:
-            values.append(div / 10.0)
-    if not values:
+
+    try:
+        cutoff = ref_date.replace(year=ref_date.year - years)
+    except ValueError:
+        # 2 月 29 日回看非闰年时落到 2 月 28 日。
+        cutoff = ref_date.replace(year=ref_date.year - years, day=28)
+
+    has_visible_history = False
+    dividend_per_share_sum = 0.0
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        announce_date = parse_date(rec.get("announce_date"))
+        ex_date = parse_date(rec.get("ex_date"))
+        visible_date = announce_date or ex_date
+        if visible_date is None or visible_date > ref_date:
+            continue
+        has_visible_history = True
+
+        dividend_per_10 = safe_float(rec.get("dividend_per_10"))
+        if dividend_per_10 is None or dividend_per_10 <= 0:
+            continue
+        if ex_date is not None:
+            event_date = ex_date
+        elif "实施" in str(rec.get("progress") or ""):
+            event_date = announce_date
+        else:
+            # 预案或尚未实施的现金分红不计入已实现股东回报。
+            continue
+        if event_date is not None and cutoff <= event_date <= ref_date:
+            dividend_per_share_sum += dividend_per_10 / 10.0
+
+    if not has_visible_history:
         return None
-    return (sum(values) / len(values)) / ref_price
+    return (dividend_per_share_sum / years) / ref_price
 
 
 def consecutive_dividend_asof(stock: Dict[str, Any], as_of: str, years: int = 3) -> bool:
@@ -929,6 +1012,17 @@ def latest_value(records: List[Dict[str, Any]], field: str) -> Optional[float]:
     if not records:
         return None
     return safe_float(records[0].get(field))
+
+
+def latest_available_value(records: List[Dict[str, Any]], field: str) -> Optional[float]:
+    """Return the newest non-null reported value, independent of input ordering."""
+    dated = _dated_financial_records(records)
+    rows = [row for _period, row in dated] if dated else list(records or [])
+    for row in rows:
+        value = safe_float(row.get(field))
+        if value is not None:
+            return value
+    return None
 
 
 def yoy_from_latest_and_annual(records: List[Dict[str, Any]], field: str) -> Optional[float]:
@@ -1490,6 +1584,7 @@ def apply_scores(
         factor_scores = {}
         weighted_sum = 0.0
         weight_sum = 0.0
+        available_weight_sum = 0.0
         positive_weight_count = 0
         for spec in specs:
             weight = safe_float(weights.get(spec.key))
@@ -1504,6 +1599,8 @@ def apply_scores(
             if weight > 0:
                 weighted_sum += score * weight
                 weight_sum += weight
+                if safe_float(raw) is not None:
+                    available_weight_sum += weight
                 positive_weight_count += 1
             factor_scores[spec.key] = {
                 "label": spec.label,
@@ -1518,6 +1615,10 @@ def apply_scores(
         result["factor_scores"] = factor_scores
         result["factor_count"] = positive_weight_count
         result["data_quality"] = round(data_quality, 3)
+        result["weighted_data_quality"] = round(
+            available_weight_sum / weight_sum if weight_sum > 0 else 0.0,
+            3,
+        )
         scored.append(result)
     scored.sort(key=lambda row: row["score"], reverse=True)
     for rank, item in enumerate(scored, 1):
@@ -1720,7 +1821,7 @@ def smallcap_reasons(item: Dict[str, Any]) -> List[str]:
     if safe_float(raw.get("roe_stability")) is not None:
         reasons.append(f"ROE稳定因子{raw['roe_stability']:.1f}")
     if safe_float(raw.get("dividend_yield_5y")) is not None:
-        reasons.append(f"五年股息率{raw['dividend_yield_5y']:.2f}%")
+        reasons.append(f"滚动五年年均股息率{raw['dividend_yield_5y']:.2f}%")
     if safe_float(raw.get("cashflow_quality")) is not None:
         reasons.append(f"现金流/利润{raw['cashflow_quality']:.2f}")
     holder_change = safe_float(raw.get("holder_count_change"))
@@ -1936,6 +2037,20 @@ def compute_long_raw_factors(
 
     piotroski = piotroski_f_score(income, indicators, net_profit_ttm, op_cash_ttm, total_assets)
 
+    reported_gross_margin = safe_float(latest_ind.get("gross_margin"))
+    if reported_gross_margin is None:
+        # 财务指标接口的最新季度经常不披露毛利率；优先用同一 PIT 切片的
+        # TTM 营收和营业成本重算，再回退最近一期非空的已披露值。
+        reported_gross_margin = first_not_none(
+            scale_ratio_to_pct(safe_ratio(gross_profit_ttm, revenue_ttm)),
+            latest_available_value(indicators, "gross_margin"),
+        )
+
+    dividends = stock.get("dividends")
+    dividend_data_available = (
+        isinstance(dividends, dict) and isinstance(dividends.get("records"), list)
+    )
+
     # 波动率/流动性/分红：实盘读文件快照；PIT 从切片日线 + 截止 as_of 的分红现算
     if as_of is None:
         daily_stats = derived_daily_stats(stock)
@@ -1948,7 +2063,9 @@ def compute_long_raw_factors(
             avg_turnover_rate_from_rows(hist_rows),
         )
         dividend_yield_5y = scale_ratio_to_pct(dividend_yield(stock, years=5))
-        dividend_consistency = 1.0 if stock.get("dividends", {}).get("consecutive_3y_dividend") else 0.0
+        dividend_consistency = (
+            1.0 if dividends.get("consecutive_3y_dividend") else 0.0
+        ) if dividend_data_available else None
     else:
         if price_arr is not None and asof_len is not None:
             low_volatility = _vol_np(price_arr["close"], asof_len)
@@ -1960,7 +2077,9 @@ def compute_long_raw_factors(
         dividend_yield_5y = scale_ratio_to_pct(
             dividend_yield(stock, years=5, as_of=as_of, price=price_asof)
         )
-        dividend_consistency = 1.0 if consecutive_dividend_asof(stock, as_of) else 0.0
+        dividend_consistency = (
+            1.0 if consecutive_dividend_asof(stock, as_of) else 0.0
+        ) if dividend_data_available else None
 
     capital_signal = capital_signal or {}
     capital_available = capital_available or {}
@@ -1987,7 +2106,7 @@ def compute_long_raw_factors(
         "roe_stability": roe_stability,
         "revenue_growth": scale_ratio_to_pct(compute_yoy_growth(income, "revenue")),
         "net_profit_growth": scale_ratio_to_pct(compute_yoy_growth(income, "net_profit")),
-        "gross_margin": safe_float(latest_ind.get("gross_margin")),
+        "gross_margin": reported_gross_margin,
         "net_margin": safe_float(latest_ind.get("net_margin")),
         "cashflow_quality": cash_quality,
         "dividend_yield_5y": dividend_yield_5y,
@@ -2060,7 +2179,7 @@ def long_reasons(item: Dict[str, Any]) -> List[str]:
     if safe_float(raw.get("roe_stability")) is not None:
         reasons.append(f"ROE稳定因子{raw['roe_stability']:.1f}")
     if safe_float(raw.get("dividend_yield_5y")) is not None:
-        reasons.append(f"五年股息率{raw['dividend_yield_5y']:.2f}%")
+        reasons.append(f"滚动五年年均股息率{raw['dividend_yield_5y']:.2f}%")
     if safe_float(raw.get("cashflow_quality")) is not None:
         reasons.append(f"现金流/利润{raw['cashflow_quality']:.2f}")
     holder_change = safe_float(raw.get("holder_count_change"))
@@ -2563,6 +2682,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
     meta = {
         "config_key": key,
         "long_liquidity_factor": LONG_LIQUIDITY_FACTOR_VERSION,
+        "long_dividend_factor": LONG_DIVIDEND_FACTOR_VERSION,
         "stock_data": stock_data_signature,
         "stock_universe": list(universe_signature),
         "market_snapshot": list(snapshot_signature),
@@ -2580,6 +2700,7 @@ def live_long_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str, Any
         _signature_key(leader_signature),
         _signature_key(capital_signature),
         LONG_LIQUIDITY_FACTOR_VERSION,
+        LONG_DIVIDEND_FACTOR_VERSION,
         key,
     )
     write_live_candidate_cache("long", meta, candidates, notes)
@@ -2594,6 +2715,7 @@ def _build_live_long_candidates_cached(
         leader_signature: Tuple[Tuple[str, Any], ...],
         capital_signature: Tuple[Tuple[str, Any], ...],
         liquidity_factor_version: str,
+        dividend_factor_version: str,
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     # 进程内缓存：stock_data 变更由 invalidate_dir_fingerprints() 显式清缓存覆盖，
@@ -2601,6 +2723,7 @@ def _build_live_long_candidates_cached(
     _ = (
         universe_signature, snapshot_signature, stock_data_signature,
         leader_signature, capital_signature, liquidity_factor_version,
+        dividend_factor_version,
     )
     return build_long_candidates(config_from_key(config_key))
 
@@ -2621,6 +2744,7 @@ def live_smallcap_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str,
         "stock_data": stock_data_signature,
         "capital_signals": capital_signature,
         "long_liquidity_factor": LONG_LIQUIDITY_FACTOR_VERSION,
+        "long_dividend_factor": LONG_DIVIDEND_FACTOR_VERSION,
     }
     cached = read_live_candidate_cache("smallcap", meta)
     if cached is not None:
@@ -2632,6 +2756,7 @@ def live_smallcap_candidate_pool(config: Dict[str, Any]) -> Tuple[List[Dict[str,
         _signature_key(capital_signature),
         SMALLCAP_UNIVERSE_VERSION,
         LONG_LIQUIDITY_FACTOR_VERSION,
+        LONG_DIVIDEND_FACTOR_VERSION,
         key,
     )
     write_live_candidate_cache("smallcap", meta, candidates, notes)
@@ -2645,11 +2770,12 @@ def _build_live_smallcap_candidates_cached(
         capital_signature: Tuple[Tuple[str, Any], ...],
         universe_version: str,
         liquidity_factor_version: str,
+        dividend_factor_version: str,
         config_key: str,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     _ = (
         hot_money_pool_signature, stock_data_signature, capital_signature,
-        universe_version, liquidity_factor_version,
+        universe_version, liquidity_factor_version, dividend_factor_version,
     )
     return build_smallcap_candidates(config_from_key(config_key))
 
@@ -2953,6 +3079,11 @@ def get_default_config() -> Dict[str, Any]:
             "caveat": smallcap_optimized.get("caveat"),
             "smallcap_universe_version": smallcap_optimized.get("smallcap_universe_version"),
         }
+    # 历史优化文件可能仍保存这些长线因子的非零权重。它们可以在页面上
+    # 手动调整，但不得继续作为自动加载的默认值。
+    long_weights = config["long"].setdefault("weights", {})
+    for key in LONG_FIXED_ZERO_WEIGHT_KEYS:
+        long_weights[key] = 0.0
     return config
 
 
@@ -2981,6 +3112,7 @@ def strip_internal(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             "sw3_segment_code": item.get("sw3_segment_code"),
             "score": item.get("score"),
             "data_quality": item.get("data_quality"),
+            "weighted_data_quality": item.get("weighted_data_quality"),
             "reasons": item.get("reasons", []),
             "warnings": item.get("warnings", []),
             "raw_factors": item.get("raw_factors", {}),
@@ -2996,7 +3128,12 @@ def strip_internal(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 def diagnostics(scored: List[Dict[str, Any]], specs: List[FactorSpec]) -> Dict[str, Any]:
     if not scored:
-        return {"score_range": None, "top_factor_coverage": [], "groups": {}}
+        return {
+            "score_range": None,
+            "top_factor_coverage": [],
+            "coverage_sections": [],
+            "groups": {},
+        }
     scores = [item["score"] for item in scored]
     groups: Dict[str, float] = defaultdict(float)
     for spec in specs:
@@ -3005,9 +3142,68 @@ def diagnostics(scored: List[Dict[str, Any]], specs: List[FactorSpec]) -> Dict[s
         "score_range": [round(min(scores), 2), round(max(scores), 2)],
         "avg_score": round(mean(scores), 2),
         "avg_data_quality": round(mean(item.get("data_quality", 0) for item in scored), 3),
+        "avg_weighted_data_quality": round(
+            mean(
+                first_not_none(
+                    item.get("weighted_data_quality"), item.get("data_quality"), 0.0
+                ) or 0.0
+                for item in scored
+            ),
+            3,
+        ),
+        "coverage_sections": factor_source_coverage(scored, specs),
         "top_factor_coverage": factor_coverage(scored[: min(20, len(scored))], specs),
         "groups": {k: round(v, 3) for k, v in sorted(groups.items())},
     }
+
+
+def factor_coverage_bucket(spec: FactorSpec) -> Tuple[str, str]:
+    if spec.strategy in {"long", "smallcap"}:
+        if spec.key in LONG_PRICE_COVERAGE_KEYS:
+            return "price", "价量"
+        if spec.key in LONG_CAPITAL_COVERAGE_KEYS:
+            return "capital", "资金面"
+        return "fundamental", "财务/估值"
+    if spec.group in {"技术", "价量Alpha"}:
+        return "technical", "价量技术"
+    if spec.group == "风控":
+        return "risk", "风控"
+    return "seats", "龙虎榜/席位"
+
+
+def factor_source_coverage(
+        items: List[Dict[str, Any]], specs: List[FactorSpec]
+) -> List[Dict[str, Any]]:
+    if not items:
+        return []
+    buckets: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
+    for spec in specs:
+        key, label = factor_coverage_bucket(spec)
+        bucket = buckets.setdefault(key, {
+            "key": key,
+            "label": label,
+            "factor_count": 0,
+            "present": 0,
+        })
+        bucket["factor_count"] += 1
+        bucket["present"] += sum(
+            1
+            for item in items
+            if safe_float((item.get("raw_factors") or {}).get(spec.key)) is not None
+        )
+    rows = []
+    for bucket in buckets.values():
+        total = len(items) * bucket["factor_count"]
+        rows.append({
+            "key": bucket["key"],
+            "label": bucket["label"],
+            "factor_count": bucket["factor_count"],
+            "coverage": round(bucket["present"] / total if total else 0.0, 3),
+        })
+    if specs and specs[0].strategy in {"long", "smallcap"}:
+        order = {"fundamental": 0, "price": 1, "capital": 2}
+        rows.sort(key=lambda row: order.get(row["key"], 99))
+    return rows
 
 
 def factor_coverage(items: List[Dict[str, Any]], specs: List[FactorSpec]) -> List[Dict[str, Any]]:

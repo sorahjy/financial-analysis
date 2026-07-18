@@ -11,3 +11,4 @@ optuna
 tqdm
 rich
 numpy
+requests

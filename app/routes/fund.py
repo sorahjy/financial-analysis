@@ -349,7 +349,7 @@ def refresh_fund_report():
 
         started = start_command_job(
             "fund-refresh",
-            ["bash", "fund_run.sh"],
+            [sys.executable, "-B", "fund_data_refresh.py"],
             cwd=ROOT_DIR,
             timeout=1800,
             resource_key=_FUND_RESOURCE_KEY,

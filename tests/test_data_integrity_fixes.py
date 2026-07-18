@@ -216,6 +216,443 @@ class Sw3MembershipIntegrityTest(unittest.TestCase):
 
 
 class RefreshFailurePropagationTest(unittest.TestCase):
+    def test_failed_stock_is_retried_once_after_all_first_pass_stocks(self):
+        calls = []
+        attempts = {}
+
+        def fake_process(code, name, *args, save_callback=None, stage_callback=None, **kwargs):
+            calls.append(code)
+            attempts[code] = attempts.get(code, 0) + 1
+            if code == "000001" and attempts[code] == 1:
+                stage_callback("daily_history")
+                raise RuntimeError("first-pass failure")
+            return {"status": "queued" if save_callback is not None else "saved"}
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=fake_process,
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "reset_daily_source_runtime",
+        ) as reset_mock, patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {
+                    "000001": "平安银行",
+                    "000002": "万科A",
+                    "000003": "国华网安",
+                },
+                workers=1,
+            )
+
+        self.assertEqual(calls, ["000001", "000002", "000003", "000001"])
+        reset_mock.assert_called_once_with()
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_recovered"], 1)
+        self.assertEqual(result["retry_failed"], 0)
+        self.assertEqual(result["failed"], [])
+        self.assertEqual(result["failure_details"], [])
+
+    def test_final_failure_uses_retry_stage_and_exception_only(self):
+        attempts = 0
+
+        def fail_twice(*args, stage_callback=None, **kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                stage_callback("daily_history")
+                raise RuntimeError("first error must be discarded")
+            stage_callback("valuation")
+            raise ValueError("second error is final")
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=fail_twice,
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "reset_daily_source_runtime",
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_recovered"], 0)
+        self.assertEqual(result["retry_failed"], 1)
+        self.assertEqual(result["failure_details"], [{
+            "code": "000001",
+            "name": "平安银行",
+            "stage": "valuation",
+            "error": "ValueError: second error is final",
+        }])
+        self.assertNotIn("first error", str(result))
+
+    def test_empty_source_response_is_retried_and_recovered(self):
+        outcomes = [
+            {"status": "source_empty"},
+            {"status": "saved"},
+        ]
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=outcomes,
+        ) as process_mock, patch.object(
+            stock_crawl_price_valuation,
+            "reset_daily_source_runtime",
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(process_mock.call_count, 2)
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_recovered"], 1)
+        self.assertEqual(result["retry_failed"], 0)
+        self.assertEqual(result["failure_details"], [])
+
+    def test_first_write_failure_retries_same_payload_without_recrawl(self):
+        payload = {"symbol": "000001", "records": [{"date": "2026-07-17"}]}
+        save_calls = []
+
+        def queue_payload(code, name, *args, save_callback=None, **kwargs):
+            save_callback(code, name, payload)
+            return {"status": "queued"}
+
+        def fail_first_save(code, name, data):
+            save_calls.append((code, name, data))
+            if len(save_calls) == 1:
+                raise RuntimeError("database is locked")
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=queue_payload,
+        ) as process_mock, patch.object(
+            stock_crawl_price_valuation,
+            "save_stock_file",
+            side_effect=fail_first_save,
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(process_mock.call_count, 1)
+        self.assertEqual(len(save_calls), 2)
+        self.assertIs(save_calls[0][2], payload)
+        self.assertIs(save_calls[1][2], payload)
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_recovered"], 1)
+        self.assertEqual(result["retry_failed"], 0)
+        self.assertEqual(result["failure_details"], [])
+
+    def test_second_write_failure_is_the_only_reported_exception(self):
+        save_attempts = 0
+
+        def queue_payload(code, name, *args, save_callback=None, **kwargs):
+            save_callback(code, name, {"symbol": code})
+            return {"status": "queued"}
+
+        def fail_both_saves(*args, **kwargs):
+            nonlocal save_attempts
+            save_attempts += 1
+            if save_attempts == 1:
+                raise RuntimeError("first write error")
+            raise OSError("second write error")
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=queue_payload,
+        ) as process_mock, patch.object(
+            stock_crawl_price_valuation,
+            "save_stock_file",
+            side_effect=fail_both_saves,
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(process_mock.call_count, 1)
+        self.assertEqual(save_attempts, 2)
+        self.assertEqual(result["failure_details"], [{
+            "code": "000001",
+            "name": "平安银行",
+            "stage": "stock_history_write",
+            "error": "OSError: second write error",
+        }])
+        self.assertNotIn("first write error", str(result))
+
+    def test_all_successful_stocks_are_not_retried(self):
+        calls = []
+
+        def queue_success(code, name, *args, save_callback=None, **kwargs):
+            calls.append(code)
+            save_callback(code, name, {"symbol": code})
+            return {"status": "queued"}
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=queue_success,
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "save_stock_file",
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "reset_daily_source_runtime",
+        ) as reset_mock, patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ) as sync_mock:
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行", "000002": "万科A"}, workers=1
+            )
+
+        self.assertEqual(calls, ["000001", "000002"])
+        reset_mock.assert_not_called()
+        sync_mock.assert_called_once()
+        self.assertEqual(result["retry_attempted"], 0)
+        self.assertEqual(result["retry_recovered"], 0)
+        self.assertEqual(result["retry_failed"], 0)
+        self.assertEqual(result["failure_details"], [])
+
+    def test_per_stock_failure_keeps_code_stage_and_exception(self):
+        def fail_during_history(*args, **kwargs):
+            kwargs["stage_callback"]("daily_history")
+            raise RuntimeError("upstream disconnected")
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            side_effect=fail_during_history,
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(result["failed"], ["000001"])
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_failed"], 1)
+        self.assertEqual(result["failure_details"], [{
+            "code": "000001",
+            "name": "平安银行",
+            "stage": "daily_history",
+            "error": "RuntimeError: upstream disconnected",
+        }])
+
+    def test_stock_writer_failure_keeps_structured_error(self):
+        with patch.object(
+            stock_crawl_price_valuation,
+            "save_stock_file",
+            side_effect=RuntimeError("database is locked"),
+        ):
+            writer = stock_crawl_price_valuation.StockDbWriter(maxsize=1)
+            writer.start()
+            writer.enqueue("000001", "平安银行", {"records": []})
+            writer.wait()
+
+        self.assertEqual(writer.failed, [("000001", "平安银行")])
+        self.assertEqual(writer.failure_details[0]["stage"], "stock_history_write")
+        self.assertEqual(writer.failure_details[0]["error"], "RuntimeError: database is locked")
+
+    def test_empty_refresh_is_reported_even_when_old_history_exists(self):
+        old_records = [
+            {
+                "date": "2026-07-16",
+                "daily_open": 10.0,
+                "daily_high": 10.5,
+                "daily_low": 9.8,
+                "daily_close": 10.2,
+                "daily_volume": 1000.0,
+                "daily_amount": 1020000.0,
+                "daily_change_pct": 1.0,
+                "daily_turnover_rate": 2.0,
+            }
+        ]
+        with patch.object(
+            stock_crawl_price_valuation,
+            "load_stock_file",
+            return_value={
+                "records": old_records,
+                "start_date": "2026-07-16",
+                "end_date": "2026-07-16",
+                "history_refetched_at": "2026-07-16T10:00:00",
+            },
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "latest_weekday_date",
+            return_value="2026-07-17",
+        ):
+            outcome = stock_crawl_price_valuation.process_stock(
+                "000001",
+                "平安银行",
+                1,
+                1,
+                refresh_valuation=False,
+                daily_fetcher=lambda *_args, **_kwargs: [],
+            )
+
+        self.assertEqual(outcome["status"], "source_empty")
+
+        with patch.object(
+            stock_crawl_price_valuation,
+            "process_stock",
+            return_value=outcome,
+        ), patch.object(
+            stock_crawl_price_valuation.ss,
+            "sync_sw3_member_market_caps",
+            return_value=0,
+        ):
+            result = stock_crawl_price_valuation.refresh_stock_histories(
+                {"000001": "平安银行"}, workers=1
+            )
+
+        self.assertEqual(result["failed"], ["000001"])
+        self.assertEqual(result["retry_attempted"], 1)
+        self.assertEqual(result["retry_failed"], 1)
+        self.assertEqual(result["failure_details"][0]["stage"], "daily_history")
+        self.assertIn("未返回日线", result["failure_details"][0]["error"])
+
+    def test_empty_segment_pool_is_a_reported_failure(self):
+        with patch.object(
+            stock_crawl_price_valuation,
+            "get_segment_leader_stocks",
+            return_value={},
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "_plan_fundamentals_refresh",
+        ) as planner:
+            result = stock_crawl_price_valuation.run_segment_leader_refresh()
+
+        planner.assert_not_called()
+        self.assertEqual(result["failure_details"][0]["stage"], "segment_leader_pool")
+        self.assertIn("龙头池为空", result["failure_details"][0]["error"])
+
+    def test_unexpected_cli_failure_still_writes_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "path with spaces" / "failures.json"
+            with patch.object(
+                stock_crawl_price_valuation,
+                "run_segment_leader_refresh",
+                side_effect=RuntimeError("worker coordinator crashed"),
+            ):
+                exit_code = stock_crawl_price_valuation.cli(
+                    ["--failure-report", str(report_path)]
+                )
+            payload = stock_crawl_common.load_json_file(report_path)
+
+        self.assertEqual(exit_code, 1)
+        self.assertEqual(
+            payload["failure_details"][0]["stage"], "segment_leader_refresh"
+        )
+        self.assertIn(
+            "worker coordinator crashed", payload["failure_details"][0]["error"]
+        )
+
+    def test_segment_failure_sidecar_is_merged_into_refresh_report(self):
+        detail = {
+            "code": "301332",
+            "name": "德尔玛",
+            "stage": "daily_history",
+            "error": "RuntimeError: all daily sources failed",
+        }
+
+        def fake_run_step(name, cmd, *, timeout=None, env=None, skip=False):
+            if skip:
+                return stock_data_refresh.StepResult(
+                    name, " ".join(cmd), True, 0, 0.0, skipped=True
+                )
+            if name == "segment_leader_history":
+                path = Path(cmd[cmd.index("--failure-report") + 1])
+                stock_crawl_common.write_json_file(path, {
+                    "requested": 976,
+                    "processed": 976,
+                    "retry_attempted": 3,
+                    "retry_recovered": 2,
+                    "retry_failed": 1,
+                    "failed": ["301332"],
+                    "failure_details": [detail],
+                })
+                return stock_data_refresh.StepResult(name, " ".join(cmd), False, 1, 0.0)
+            return stock_data_refresh.StepResult(name, " ".join(cmd), True, 0, 0.0)
+
+        def fake_local_step(name, command, func):
+            return stock_data_refresh.StepResult(name, command, True, 0, 0.0)
+
+        with patch.object(
+            stock_data_refresh, "run_step", side_effect=fake_run_step
+        ), patch.object(
+            stock_data_refresh, "local_step_result", side_effect=fake_local_step
+        ), patch.object(
+            stock_data_refresh, "collect_data_health", return_value={}
+        ), patch.object(stock_data_refresh, "write_json_file"):
+            report = stock_data_refresh.refresh_before_server(mode="full", timeout=1)
+
+        history = next(
+            step for step in report["steps"] if step["name"] == "segment_leader_history"
+        )
+        self.assertEqual(history["meta"]["failure_details"], [detail])
+        self.assertEqual(history["meta"]["retry_attempted"], 3)
+        self.assertEqual(history["meta"]["retry_recovered"], 2)
+        self.assertEqual(history["meta"]["retry_failed"], 1)
+        self.assertIn("301332 [daily_history]", history["error"])
+        self.assertEqual(report["failures"], [{"step": "segment_leader_history", **detail}])
+
+    def test_nonzero_child_with_empty_sidecar_still_has_an_error(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sidecar = Path(tmpdir) / "failure.json"
+            stock_crawl_common.write_json_file(sidecar, {"failure_details": []})
+            step = stock_data_refresh.StepResult(
+                "segment_leader_history", "python child.py", False, 1, 0.0
+            )
+            stock_data_refresh._attach_failure_sidecar(step, sidecar)
+
+        self.assertIn("没有异常明细", step.error)
+
+    def test_stale_health_rows_become_per_stock_report_failures(self):
+        failures = stock_data_refresh._collect_health_failures({
+            "hot_money_history_reference_date": "2026-07-17",
+            "hot_money_history_cutoff": "2026-07-10",
+            "hot_money_history_stale_details": [
+                {"code": "1", "latest_date": "2026-07-01"},
+                {"code": "830001", "latest_date": None},
+            ],
+        })
+
+        self.assertEqual([item["code"] for item in failures], ["000001", "830001"])
+        self.assertTrue(all(
+            item["stage"] == "hot_money_history_freshness" for item in failures
+        ))
+        self.assertIn("2026-07-01", failures[0]["error"])
+        self.assertIn("无日线", failures[1]["error"])
+
     def test_failed_dependency_skips_strategy_rebuild_and_marks_report_failed(self):
         calls = []
 
@@ -322,6 +759,42 @@ class DailySourceFallbackTest(unittest.TestCase):
                 stock_crawl_common.fetch_qfq_daily_records(
                     "000001", "20260710", "20260710"
                 )
+
+    def test_etf_empty_dedicated_source_falls_back_to_generic_public_sources(self):
+        expected = [{"date": "2026-07-10", "close": 4.2}]
+        warnings = []
+        with patch.object(
+            stock_crawl_common,
+            "_fetch_daily_eastmoney_etf_qfq",
+            return_value=[],
+        ) as etf_mock, patch.object(
+            stock_crawl_common,
+            "fetch_qfq_daily_records",
+            return_value=expected,
+        ) as fallback_mock:
+            records = stock_crawl_common.fetch_etf_qfq_daily_records(
+                "510300",
+                "20260701",
+                "20260710",
+                include_trading_value=True,
+                warn=warnings.append,
+            )
+
+        self.assertEqual(records, expected)
+        etf_mock.assert_called_once_with(
+            "510300",
+            "20260701",
+            "20260710",
+            include_trading_value=True,
+        )
+        fallback_mock.assert_called_once_with(
+            "510300",
+            "20260701",
+            "20260710",
+            include_trading_value=True,
+            warn=warnings.append,
+        )
+        self.assertTrue(any("ETF行情返回空数据" in message for message in warnings))
 
 
 class PlateCoverageIntegrityTest(unittest.TestCase):

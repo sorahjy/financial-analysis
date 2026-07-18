@@ -33,6 +33,10 @@ from bs4 import BeautifulSoup
 
 import stock_storage
 from stock_crawl_common import strip_proxy_env
+from sw3_industry_heat import (
+    SW3_INDUSTRY_HEAT_FILE,
+    build_sw3_industry_heat_report,
+)
 
 
 strip_proxy_env()
@@ -128,9 +132,10 @@ FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属
     "300274",  # 阳光电源 * 光伏逆变器、储能
     "603606",  # 东方电缆 海缆、海上风电
     "002202",  # 金风科技 风电整机
-    "600900",  # 长江电力 水电
+    "600900",  # 长江电力 * 水电
     "601985",  # 中国核电 核电运营
     "003816",  # 中国广核 核电运营
+    "600886",  # 国投电力
     # 工程
     "000338",  # 潍柴动力 *
     "600031",  # 三一重工 *
@@ -156,8 +161,11 @@ FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属
     "002979",  # 雷赛智能 运动控制
     "603662",  # 柯力传感 机器人力传感起步，工业物联网力传感器
     "688017",  # 绿的谐波 谐波减速器、计算机视觉
+    "603298",  # 杭叉集团
+    "002230",  # 科大讯飞
     # cpo
     "300308",  # 中际旭创 *
+    "300502",  # 新易盛
     "300394",  # 天孚通信
     # 晶圆厂
     "002371",  # 北方华创
@@ -188,9 +196,9 @@ FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属
     "000636",  # 风华高科
     "300408",  # 三环集团
     "300285",  # 国瓷材料
-    # 其他
-    "603298",  # 杭叉集团
-    "002230",  # 科大讯飞
+    # 社会主义护城河
+    "601766",  # 中国中车 *
+    "601816",  # 京沪高铁
 ]
 
 DEFAULT_POOL_MAX_AGE_DAYS = 14
@@ -1232,11 +1240,76 @@ def load_sw3_membership(max_age_days: Optional[int] = MEMBERSHIP_MAX_AGE_DAYS) -
     return _load_sw3_membership_from_db(max_age_days)
 
 
+def refresh_sw3_industry_heat_report(membership: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """刷新三级行业 20 日热度报告；失败时保留上一份完整文件。"""
+    segments = membership.get("segments") or []
+    if not segments:
+        print("  [heat] 跳过：归属缓存没有三级行业", flush=True)
+        return None
+    print(
+        f"  [heat] 开始刷新近20日三级行业热度（{len(segments)}个行业，"
+        "申万历史 + AkShare相邻交易日兜底）...",
+        flush=True,
+    )
+    try:
+        payload = build_sw3_industry_heat_report(
+            segments,
+            market_cap_fetcher=fetch_a_spot_member_metrics,
+            output_file=SW3_INDUSTRY_HEAT_FILE,
+        )
+    except Exception as exc:
+        print(
+            f"  [heat] 本轮刷新失败，已保留上一份完整报告：{exc}",
+            flush=True,
+        )
+        return None
+
+    industries = [
+        row for row in (payload.get("industries") or [])
+        if isinstance(row, dict)
+    ]
+    hottest = sorted(
+        (row for row in industries if row.get("hottest_rank") is not None),
+        key=lambda row: int(row.get("hottest_rank") or 0),
+    )
+    rising = sorted(
+        (row for row in industries if row.get("rising_rank") is not None),
+        key=lambda row: int(row.get("rising_rank") or 0),
+    )
+    latest_sources = payload.get("data_quality", {}).get("latest_amount_sources") or []
+    print(
+        f"  [heat] 报告已落盘 {SW3_INDUSTRY_HEAT_FILE} · 截至 {payload.get('as_of_date')} · "
+        f"有效行业 {payload.get('data_quality', {}).get('eligible_segment_count')}/{len(segments)} · "
+        f"最新日来源 {','.join(str(source) for source in latest_sources) or '未标注'}",
+        flush=True,
+    )
+    print(f"  [heat] 最热门全量榜（{len(hottest)}个，20日成交额 / 日均）：", flush=True)
+    for row in hottest:
+        print(
+            f"    {row.get('hottest_rank'):>3}. {row.get('segment_name')}({row.get('segment_code')}) "
+            f"{row.get('amount_20d_yi'):.2f}亿 / {row.get('avg_daily_amount_yi'):.2f}亿",
+            flush=True,
+        )
+    print(
+        f"  [heat] 热度上升全量榜（{len(rising)}个，末5日份额较首5日 / 趋势相关 / 上升分）：",
+        flush=True,
+    )
+    for row in rising:
+        print(
+            f"    {row.get('rising_rank'):>3}. {row.get('segment_name')}({row.get('segment_code')}) "
+            f"{row.get('last5_vs_first5_share_pct'):+.2f}% / "
+            f"{row.get('trend_correlation'):.3f} / {row.get('rising_score'):.2f}",
+            flush=True,
+        )
+    return payload
+
+
 def build_segment_leader_pool(
         top_per_segment: int = 2,
         min_market_cap_yi: float = 10.0,
         refresh_membership: bool = False,
         refresh_slice: int = 0,
+        refresh_industry_heat: bool = False,
         enrich_weights_online: bool = False,
         forced_leader_codes: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
@@ -1244,6 +1317,7 @@ def build_segment_leader_pool(
 
     refresh_membership=True 强制全量重抓归属(resume=False, 感知改名/成分调整/删除)；
     refresh_slice>0 则只切片补抓最旧的几个赛道(滚动保鲜)；两者都不给时直接用现有缓存。
+    refresh_industry_heat=True 会在龙头池完成后刷新独立行业热度报告；失败不影响龙头池。
     """
     if refresh_membership:
         print("  [membership] recrawl: 重拉总表 + 全量重抓(resume=False)，感知行业改名/成分/删除...", flush=True)
@@ -1433,11 +1507,15 @@ def build_segment_leader_pool(
         if previous and previous_leaders > 0:
             print(f"  [membership] 本次未生成龙头，保留已有 {previous_leaders} 只龙头池，避免空结果覆盖")
             _mark_leaders_in_db(previous.get("segments", []))
+            if refresh_industry_heat:
+                refresh_sw3_industry_heat_report(membership)
             return previous
     with open(SEGMENT_LEADER_POOL_FILE, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
     print(f"  -> 已生成 {len(segments)} 个细分行业 / {leader_count} 只龙头，落盘 {SEGMENT_LEADER_POOL_FILE}")
     _mark_leaders_in_db(segments)
+    if refresh_industry_heat:
+        refresh_sw3_industry_heat_report(membership)
     return payload
 
 
@@ -1540,11 +1618,13 @@ def main() -> None:
         build_segment_leader_pool(
             top_per_segment=DEFAULT_TOP_PER_SEGMENT,
             refresh_slice=DEFAULT_REFRESH_SLICE,
+            refresh_industry_heat=True,
         )
     elif action == "recrawl":
         build_segment_leader_pool(
             top_per_segment=DEFAULT_TOP_PER_SEGMENT,
             refresh_membership=True,
+            refresh_industry_heat=True,
         )
 
 

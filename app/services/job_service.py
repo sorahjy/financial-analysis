@@ -7,7 +7,7 @@ import subprocess
 import threading
 import time
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, TextIO
+from typing import Any, Callable, Dict, List, Mapping, Optional, TextIO
 
 from app.config import ROOT_DIR
 
@@ -102,8 +102,7 @@ def _run_command(
     error = ""
     return_code: Optional[int] = None
     try:
-        env = os.environ.copy()
-        env["PYTHONUNBUFFERED"] = "1"
+        env = _job_environment()
         process = subprocess.Popen(
             command,
             cwd=str(cwd),
@@ -114,7 +113,7 @@ def _run_command(
             errors="replace",
             bufsize=1,
             env=env,
-            start_new_session=os.name != "nt",
+            **_popen_group_kwargs(),
         )
         reader = threading.Thread(
             target=_stream_process_output,
@@ -165,11 +164,37 @@ def _run_command(
         }
 
 
-def _format_command(command: List[str]) -> str:
+def _job_environment(base_env: Mapping[str, str] | None = None) -> Dict[str, str]:
+    env = dict(os.environ if base_env is None else base_env)
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def _popen_group_kwargs(platform_name: str | None = None) -> Dict[str, Any]:
+    if (platform_name or os.name) == "nt":
+        create_new_process_group = getattr(
+            subprocess,
+            "CREATE_NEW_PROCESS_GROUP",
+            0x00000200,
+        )
+        return {"creationflags": create_new_process_group}
+    return {"start_new_session": True}
+
+
+def _format_command(command: List[str], *, platform_name: str | None = None) -> str:
+    if (platform_name or os.name) == "nt":
+        return subprocess.list2cmdline(command)
     return shlex.join(command)
 
 
-def terminate_process_tree(process: subprocess.Popen[Any], *, grace_seconds: float = 2.0) -> None:
+def terminate_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    grace_seconds: float = 2.0,
+    platform_name: str | None = None,
+) -> None:
     """Stop a subprocess and every descendant in its process group.
 
     Refresh commands often launch shell/Python grandchildren.  Killing only the
@@ -179,14 +204,13 @@ def terminate_process_tree(process: subprocess.Popen[Any], *, grace_seconds: flo
     if process.poll() is not None:
         return
 
+    if (platform_name or os.name) == "nt":
+        _terminate_windows_process_tree(process, grace_seconds=grace_seconds)
+        return
+
     def send(sig: int) -> None:
         try:
-            if os.name != "nt":
-                os.killpg(process.pid, sig)
-            elif sig == signal.SIGTERM:
-                process.terminate()
-            else:
-                process.kill()
+            os.killpg(process.pid, sig)
         except (ProcessLookupError, PermissionError):
             pass
 
@@ -196,12 +220,48 @@ def terminate_process_tree(process: subprocess.Popen[Any], *, grace_seconds: flo
         return
     except subprocess.TimeoutExpired:
         pass
-    send(signal.SIGKILL)
+    send(getattr(signal, "SIGKILL", signal.SIGTERM))
     try:
         process.wait(timeout=max(1.0, grace_seconds))
     except subprocess.TimeoutExpired:
         process.kill()
         process.wait()
+
+
+def _terminate_windows_process_tree(
+    process: subprocess.Popen[Any],
+    *,
+    grace_seconds: float,
+) -> None:
+    """Use Windows' built-in taskkill so grandchildren cannot outlive a timeout."""
+    try:
+        completed = subprocess.run(
+            ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            check=False,
+            timeout=max(1.0, grace_seconds),
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        completed = None
+
+    try:
+        process.wait(timeout=max(1.0, grace_seconds))
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    # taskkill can fail under a restricted account. At least stop the direct
+    # child rather than leaving the task running indefinitely.
+    try:
+        if completed is None or completed.returncode != 0:
+            process.terminate()
+            process.wait(timeout=max(1.0, grace_seconds))
+            return
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    process.kill()
+    process.wait()
 
 
 def _stream_process_output(job_id: str, stream: Optional[TextIO]) -> None:

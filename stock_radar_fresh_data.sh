@@ -1,12 +1,7 @@
-#!/usr/bin/env bash
-set -euo pipefail
+#!/bin/sh
+# Unix 兼容入口；Windows 和网页刷新直接运行 stock_radar_fresh_data.py。
+set -eu
+cd "$(dirname "$0")"
 
-export STOCK_CRAWL_NO_PROXY=1
-export NO_PROXY="*"
-export no_proxy="*"
-unset http_proxy https_proxy all_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY
-
-python stock_data_refresh.py --mode full --no-proxy
-python plate_crawl_history.py --no-proxy
-python stock_theme_candidates.py
-python stock_hot_money_radar.py ambush --no-exclude-large-cap --pool leader
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+exec "$PYTHON_BIN" -B stock_radar_fresh_data.py "$@"

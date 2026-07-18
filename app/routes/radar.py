@@ -4,7 +4,9 @@ from flask import Blueprint, jsonify, render_template, request
 
 from app.services.radar_service import (
     kline_bars,
+    pattern_backtest_events,
     radar_data_state,
+    radar_industry_heat_payload,
     radar_pattern_catalog,
     radar_payload,
     radar_realtime_payload,
@@ -55,12 +57,29 @@ def radar_model():
     return jsonify(radar_scoring_model())
 
 
+@bp.get("/api/radar/industry-heat")
+def radar_industry_heat():
+    return jsonify({"payload": radar_industry_heat_payload()})
+
+
 @bp.get("/api/radar/kline")
 def radar_kline():
     code = request.args.get("code", "")
-    limit = request.args.get("limit", 3600, type=int)
+    limit = request.args.get("limit", 0, type=int)
     period = request.args.get("period", "day")
-    return jsonify(kline_bars(code, limit, period))
+    requested_years = request.args.get("years", type=int)
+    years = max(1, min(requested_years, 6)) if requested_years is not None else None
+    return jsonify(kline_bars(code, limit, period, years))
+
+
+@bp.get("/api/radar/pattern-backtest")
+def radar_pattern_backtest():
+    code = request.args.get("code", "")
+    limit = request.args.get("limit", 0, type=int)
+    pool = request.args.get("pool", "leader")
+    requested_years = request.args.get("years", type=int)
+    years = max(1, min(requested_years, 6)) if requested_years is not None else None
+    return jsonify(pattern_backtest_events(code, limit, pool, years))
 
 
 @bp.post("/api/radar/run")

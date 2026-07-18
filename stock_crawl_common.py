@@ -154,12 +154,12 @@ def is_bse_stock(code):
 def exchange_prefix(code):
     """6 位 code → 交易所前缀 sh/sz/bj。"""
     code = str(code).zfill(6)
-    if code.startswith(("60", "68", "9")):
-        return "sh"
-    if code.startswith(("00", "30", "20")):
-        return "sz"
     if code.startswith(("8", "4", "92")):
         return "bj"
+    if code.startswith(("5", "60", "68", "9")):
+        return "sh"
+    if code.startswith(("1", "00", "30", "20")):
+        return "sz"
     return "sh"
 
 
@@ -514,6 +514,43 @@ def _fetch_daily_eastmoney_qfq(symbol, start_date, end_date, include_trading_val
     return records
 
 
+def _fetch_daily_eastmoney_etf_qfq(symbol, start_date, end_date,
+                                    include_trading_value=False):
+    """东方财富 ETF 专用前复权日线。
+
+    ``stock_zh_a_hist`` 只按 6 开头判断沪市，会把 5xxxxx ETF 发到错误市场；
+    ``fund_etf_hist_em`` 使用完整市场映射，因此 ETF 必须走这里。
+    """
+    df = ak.fund_etf_hist_em(
+        symbol=str(symbol).zfill(6),
+        period="daily",
+        start_date=_date_compact(start_date),
+        end_date=_date_compact(end_date),
+        adjust="qfq",
+    )
+    if df is None or df.empty:
+        return []
+
+    records = []
+    for _, row in df.iterrows():
+        record = {
+            "date": str(row["日期"])[:10],
+            "close": safe_float(row["收盘"]),
+            "change_pct": safe_float(row.get("涨跌幅")),
+            "turnover_rate": safe_float(row.get("换手率")),
+        }
+        if include_trading_value:
+            record.update({
+                "open": safe_float(row.get("开盘")),
+                "high": safe_float(row.get("最高")),
+                "low": safe_float(row.get("最低")),
+                "volume": safe_float(row.get("成交量")),
+                "amount": safe_float(row.get("成交额")),
+            })
+        records.append(record)
+    return records
+
+
 def _normalize_volume_to_hands(volume, amount=None, close=None):
     """成交量统一归一到「手」；当成交额能识别出「股」单位时自动除以 100。"""
     volume = safe_float(volume)
@@ -784,6 +821,16 @@ def _reset_daily_process_pool():
         pool.shutdown(wait=False, cancel_futures=True)
 
 
+def reset_daily_source_runtime():
+    """Reset source circuit breakers and workers before a final failed-stock retry."""
+    with _DAILY_SOURCE_LOCK:
+        _DAILY_SOURCE_DISABLED.clear()
+        _DAILY_PRIORITY_CURSORS.clear()
+        for source in _DAILY_SOURCE_FAILURES:
+            _DAILY_SOURCE_FAILURES[source] = 0
+    _reset_daily_process_pool()
+
+
 def _shutdown_daily_process_pool():
     _reset_daily_process_pool()
 
@@ -859,6 +906,33 @@ def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=
     if saw_empty_response:
         return []
     return []
+
+
+def fetch_etf_qfq_daily_records(symbol, start_date, end_date,
+                                include_trading_value=False, warn=None):
+    """ETF 前复权日线：基金专用东财接口优先，腾讯/新浪作容灾。"""
+    try:
+        records = retry_fetch(
+            _fetch_daily_eastmoney_etf_qfq,
+            symbol,
+            start_date,
+            end_date,
+            include_trading_value=include_trading_value,
+        )
+        if records:
+            return records
+        if warn:
+            warn(f"{symbol} 东财ETF行情返回空数据，切换通用备用源")
+    except Exception as exc:
+        if warn:
+            warn(f"{symbol} 东财ETF行情失败({exc})，切换通用备用源")
+    return fetch_qfq_daily_records(
+        symbol,
+        start_date,
+        end_date,
+        include_trading_value=include_trading_value,
+        warn=warn,
+    )
 
 
 # ─── 通用 JSON 文件工具 ───────────────────────────────────────

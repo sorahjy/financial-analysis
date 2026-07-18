@@ -11,7 +11,7 @@ from app import create_app
 from app.config import FUND_REPORT_DATA_FILE, ROOT_DIR
 from app.services.job_service import get_job_state, start_command_job
 from app.services.fund_report_service import load_fund_report_view
-from app.services import stock_strategy_service
+from app.services import radar_service, stock_strategy_service
 from funds import get_funds, get_funds_bond
 
 
@@ -250,7 +250,8 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("function sw2Cell(s)", script)
         self.assertIn("s.sw2_heat_pctile", script)
         self.assertIn("esc(industry) + heat", script)
-        self.assertNotIn("三级行业", script)
+        self.assertIn('fetch("/api/radar/industry-heat")', script)
+        self.assertIn("三级行业热度", script)
         self.assertNotIn("跟踪二级行业", script)
 
     def test_radar_pattern_colors_follow_backend_effectiveness_catalog(self):
@@ -265,19 +266,21 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(catalog["P6"]["effective_style"], "neutral")
         self.assertEqual(len(catalog), 26)
         self.assertTrue(all(item["production"] for item in catalog.values()))
-        self.assertEqual(catalog["P3"]["score_usage"], "吸筹分 20%")
-        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 5%")
+        self.assertEqual(catalog["P3"]["score_usage"], "吸筹分 10%")
+        self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 10%")
         self.assertEqual(catalog["P25"]["score_usage"], "吸筹分 5%")
-        self.assertEqual(catalog["P14"]["score_usage"], "出货分 10%")
-        self.assertEqual(catalog["P26"]["score_usage"], "出货预警")
+        self.assertEqual(catalog["P14"]["score_usage"], "出货分 5%")
+        self.assertEqual(catalog["P15"]["score_usage"], "出货分 5%")
+        self.assertEqual(catalog["P22"]["score_usage"], "出货分 5%")
+        self.assertEqual(catalog["P26"]["score_usage"], "出货分 10%")
         self.assertEqual(catalog["P25"]["validation_status"], "experimental")
-        self.assertEqual(catalog["P1"]["validation_label"], "仅小盘有效")
-        self.assertEqual(catalog["P25"]["validation_label"], "仅小盘有效")
+        self.assertEqual(catalog["P1"]["validation_label"], "核心有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "双池10/20日正向")
         self.assertEqual(catalog["P6"]["validation_status"], "observation")
 
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
         css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
-        self.assertIn("if (!meta || !meta.effective) return \"pd\"", script)
+        self.assertIn("if (!meta || !meta.effective || isEtfMode()) return \"pd\"", script)
         self.assertIn('meta.effective_style === "bullish"', script)
         self.assertIn('meta.effective_style === "momentum"', script)
         self.assertIn('meta.effective_style === "risk"', script)
@@ -360,11 +363,14 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("P3 缩量打压首次收复", body)
         self.assertIn("P24 OBV底背离", body)
         self.assertIn("股东户数变化", body)
-        self.assertIn("9项原始特征直接加权", body)
-        self.assertIn("P1 低位底盘确认（仅小盘有效）", body)
-        self.assertIn("P25 缩量平台启动（仅小盘有效）", body)
-        self.assertIn('id="radar-scoring-factor-count">23<', body)
-        self.assertIn("9项风险特征直接加权", body)
+        self.assertIn("13项原始特征直接加权", body)
+        self.assertIn("P1 超额优先复合确认", body)
+        self.assertIn("P25 缩量平台转强（双池实验）", body)
+        self.assertIn('id="radar-scoring-factor-count">29<', body)
+        self.assertIn("11项风险特征直接加权", body)
+        self.assertIn("P15 新高量背离放量回撤", body)
+        self.assertIn("<b>强风险因子</b><span>P16、P17、P19、P26</span>", body)
+        self.assertIn("<b>风险因子</b><span>P14、P15、P20、P22</span>", body)
         self.assertIn("近90日龙虎榜", body)
         self.assertIn("游资小盘池按三日平滑反转分排序", body)
         self.assertIn('id="radar-pattern-factor-groups"', body)
@@ -384,8 +390,12 @@ class FlaskAppTest(unittest.TestCase):
         distribution = {row["key"]: row["weight"] for row in payload["distribution"]["factors"]}
         reversal = {row["key"]: row["weight"] for row in payload["reversal"]["factors"]}
         self.assertEqual(accumulation, radar.ACCUM_MODEL_WEIGHTS)
-        self.assertEqual(len(accumulation), 9)
+        self.assertEqual(len(accumulation), 13)
         self.assertEqual(distribution, radar.DIST_MODEL_WEIGHTS)
+        self.assertEqual(len(distribution), 11)
+        self.assertEqual(distribution["p15"], 0.05)
+        self.assertEqual(distribution["p22"], 0.05)
+        self.assertIn("P15", payload["distribution"]["warning_rule"]["pattern_codes"])
         self.assertEqual(reversal, radar.REVERSAL_WEIGHTS)
         self.assertEqual(len(payload["auxiliary"]), 4)
         self.assertEqual(
@@ -398,6 +408,57 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("renderScoringModel", script)
         self.assertIn("renderProductionPatterns", script)
         self.assertIn("radar-pattern-factor-groups", script)
+
+    def test_pattern_backtest_marks_p15_as_sell_point(self):
+        import stock_hot_money_radar as radar
+
+        bars = [
+            {
+                "date": f"d{index:03d}",
+                "open": 10.0,
+                "high": 10.2,
+                "low": 9.8,
+                "close": 10.0,
+                "volume": 1000.0,
+            }
+            for index in range(radar.MIN_BARS)
+        ]
+        p15 = {
+            "code": "P15",
+            "name": "新高量背离放量回撤",
+            "phase": "出货",
+            "signal": "sell",
+        }
+        raw_features = {key: 0.0 for key in radar.ACCUM_MODEL_WEIGHTS}
+        with (
+            patch.object(radar, "_build_pattern_context", return_value={}),
+            patch.object(radar, "_p1_rule_state", return_value={"active": False}),
+            patch.object(radar, "match_patterns", return_value=[p15]),
+            patch.object(radar, "_ensure_pattern_chip_context"),
+            patch.object(radar, "_score_bars", return_value={"sub_scores": {}}),
+            patch.object(radar, "_accumulation_raw_features", return_value=raw_features),
+        ):
+            events = radar_service._scan_effective_pattern_events(
+                "600000",
+                bars,
+                radar.MIN_BARS - 1,
+                "leader",
+                {},
+                {},
+            )
+
+        self.assertEqual(len(events), 1)
+        self.assertTrue(events[0]["is_sell_point"])
+        self.assertEqual(events[0]["distribution_warning_points"], 1)
+        self.assertEqual(events[0]["effective_sell_pattern_count"], 1)
+        self.assertEqual(events[0]["patterns"][0]["code"], "P15")
+        self.assertEqual(events[0]["patterns"][0]["effective_style"], "risk")
+
+        radar_script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        stock_script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
+        expected_codes = '["P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26"]'
+        self.assertIn(expected_codes, radar_script)
+        self.assertIn(expected_codes, stock_script)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
@@ -469,14 +530,31 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(response.status_code, 202)
         self.assertEqual(response.get_json(), {"started": True})
 
-    def test_stock_refresh_uses_radar_refresh_script(self):
+    def test_stock_refresh_uses_cross_platform_python_entrypoint(self):
         with patch("app.services.stock_strategy_service.start_command_job", return_value=True) as start_job:
             self.assertTrue(stock_strategy_service.start_stock_data_refresh())
 
         command = start_job.call_args.args[1]
-        self.assertEqual(command, ["bash", "stock_radar_fresh_data.sh"])
+        self.assertEqual(command, [sys.executable, "-B", "stock_radar_fresh_data.py"])
+        self.assertFalse(any(part.endswith(".sh") for part in command))
         self.assertNotIn("--strict", command)
         self.assertNotIn("--timeout", command)
+
+    def test_radar_jobs_use_current_python_and_share_refresh_lock(self):
+        with patch("app.services.radar_service.start_command_job", return_value=True) as start_job:
+            self.assertTrue(radar_service.start_radar_data_refresh())
+
+        self.assertEqual(
+            start_job.call_args.args[1],
+            [sys.executable, "-B", "stock_radar_fresh_data.py"],
+        )
+        self.assertEqual(start_job.call_args.kwargs["resource_key"], "stock-data-refresh")
+
+        with patch("app.services.radar_service.start_command_job", return_value=True) as start_job:
+            self.assertTrue(radar_service.start_radar_run(pool="leader"))
+
+        self.assertEqual(start_job.call_args.args[1][:3], [sys.executable, "-B", "stock_hot_money_radar.py"])
+        self.assertEqual(start_job.call_args.kwargs["resource_key"], "stock-data-refresh")
 
     def test_stock_optimizer_shares_refresh_resource_lock(self):
         with patch(
@@ -632,6 +710,9 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('data-stock-view="settings"', body)
         self.assertIn("function setMobileView(view)", script)
         self.assertIn('event.key === "Escape"', script)
+        self.assertIn('"加权覆盖"', script)
+        self.assertIn('diag.coverage_sections', script)
+        self.assertIn('pick.weighted_data_quality ?? pick.data_quality', script)
 
     def test_stock_kline_endpoint_returns_weekly_bars(self):
         payload = {"code": "002511", "period": "week", "bars": [{"date": "2026-06-19", "close": 10.0}]}
@@ -974,7 +1055,7 @@ class FlaskAppTest(unittest.TestCase):
             self.assertEqual(response.status_code, 202)
             start_mock.assert_called_once_with(
                 "fund-refresh",
-                ["bash", "fund_run.sh"],
+                [sys.executable, "-B", "fund_data_refresh.py"],
                 cwd=ROOT_DIR,
                 timeout=1800,
                 resource_key="fund-data-refresh",
@@ -984,10 +1065,10 @@ class FlaskAppTest(unittest.TestCase):
                 ["510310", "510580", "161119", "008115", "040046", "011555"],
             )
 
-    def test_fund_run_script_does_not_execute_funds_module(self):
-        script = (ROOT_DIR / "fund_run.sh").read_text(encoding="utf-8")
+    def test_fund_refresh_entrypoint_does_not_execute_funds_module(self):
+        script = (ROOT_DIR / "fund_data_refresh.py").read_text(encoding="utf-8")
 
-        self.assertNotRegex(script, r"(?m)^\s*python\s+funds\.py\s*$")
+        self.assertNotIn("import funds", script)
         self.assertIn("_load_validated_fund_config", script)
         self.assertIn("_sync_fund_codes", script)
 

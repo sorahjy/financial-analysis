@@ -24,6 +24,10 @@
     let chartReturnFocus = null;
     let klineRenderSeq = 0;
     const klineCache = new Map();
+    let radarContextMeta = {};
+    let radarContextByCode = new Map();
+    const RADAR_BUY_PATTERNS = new Set(["P1", "P2", "P3", "P5", "P21", "P23", "P24", "P25"]);
+    const RADAR_RISK_PATTERNS = new Set(["P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26"]);
 
     const $ = (id) => document.getElementById(id);
     const status = (text) => {
@@ -64,10 +68,36 @@
       return payload;
     }
 
+    async function fetchRadarContext() {
+      const resp = await fetch("/api/stock/radar-context");
+      const payload = await resp.json();
+      if (!resp.ok) throw new Error(payload.error || "radar context failed");
+      return payload;
+    }
+
+    function acceptRadarContext(payload) {
+      const context = payload || {};
+      radarContextMeta = context;
+      radarContextByCode = new Map(
+        (Array.isArray(context.stocks) ? context.stocks : [])
+          .map((stock) => [String(stock.code || "").padStart(6, "0"), stock])
+          .filter(([code]) => code !== "000000")
+      );
+    }
+
+    async function loadRadarContext() {
+      try {
+        const payload = await fetchRadarContext();
+        if (!disposed) acceptRadarContext(payload);
+      } catch (err) {
+        /* 雷达缓存不可用时不阻塞策略计算。 */
+      }
+    }
+
     async function init() {
       try {
         const saved = localStorage.getItem("stockStrategyConfig");
-        const payload = await fetchConfig();
+        const [payload] = await Promise.all([fetchConfig(), loadRadarContext()]);
         if (disposed) return;
         config = saved ? mergeDeep(payload.config, JSON.parse(saved)) : payload.config;
         registry = payload.factors;
@@ -229,6 +259,7 @@
           config = mergeDeep(payload.config, JSON.parse(localStorage.getItem("stockStrategyConfig") || "{}"));
           registry = payload.factors;
           renderControls();
+          await loadRadarContext();
           await runNow();
         } catch (err) {
           status("刷新后运行失败");
@@ -674,13 +705,19 @@
     function renderMetrics(section) {
       const diag = section.diagnostics || {};
       const range = diag.score_range || ["--", "--"];
+      const weightedCoverage = diag.avg_weighted_data_quality ?? diag.avg_data_quality;
+      const coverageCards = (diag.coverage_sections || []).map((row) => [
+        `${row.label || row.key || "分项"}覆盖`,
+        row.coverage === undefined ? "--" : `${fmt(row.coverage * 100, 1)}%`
+      ]);
       const cards = [
         ["候选", section.candidate_count],
         ["入选", section.selected_count],
         [{long: "长线因子", smallcap: "小盘因子", short: "短线因子"}[active], section.factor_count],
         ["均分", diag.avg_score ?? "--"],
         ["分数区间", `${range[0]} / ${range[1]}`],
-        ["数据覆盖", diag.avg_data_quality === undefined ? "--" : `${fmt(diag.avg_data_quality * 100, 1)}%`]
+        ["加权覆盖", weightedCoverage === undefined ? "--" : `${fmt(weightedCoverage * 100, 1)}%`],
+        ...coverageCards
       ].map(([label, value]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div></div>`).join("");
       $("metrics").innerHTML = cards + `
         <div class="metric stock-search-card">
@@ -951,6 +988,42 @@
       requestAnimationFrame(() => loadWeeklyMiniKlines(picks));
     }
 
+    function radarPatternTone(code) {
+      if (RADAR_BUY_PATTERNS.has(code)) return "buy";
+      if (RADAR_RISK_PATTERNS.has(code)) return "risk";
+      return "neutral";
+    }
+
+    function cachedRadarContext(pick) {
+      const code = String(pick.code || "").padStart(6, "0");
+      const cached = radarContextByCode.get(code);
+      const poolLabel = {
+        leader: "细分龙头池",
+        hotmoney: "游资小盘池",
+        etf: "ETF池",
+      }[radarContextMeta.pool] || "游资雷达";
+      const generatedAt = radarContextMeta.generated_at || "时间未知";
+      if (!cached) {
+        return `<div class="stock-radar-context is-missing" title="${esc(poolLabel)} · ${esc(generatedAt)}"><span>雷达未入池</span></div>`;
+      }
+      const patterns = (Array.isArray(cached.patterns) ? cached.patterns : [])
+        .filter((pattern) => /^P\d+$/.test(String(pattern)))
+        .map((pattern) => {
+          const code = String(pattern);
+          return `<span class="stock-radar-factor ${radarPatternTone(code)}">${esc(code)}</span>`;
+        }).join("");
+      const metric = radarContextMeta.pool === "hotmoney"
+        ? `反转分 ${fmt(cached.reversal_score, 1)}`
+        : `机会分 ${fmt(cached.opportunity_score, 1)}`;
+      const title = `${poolLabel} · 本地排名 #${cached.rank} · ${metric} · ${generatedAt}`;
+      return `
+        <div class="stock-radar-context" title="${esc(title)}">
+          <div class="stock-radar-rank"><span>雷达</span><strong>#${esc(cached.rank)}</strong></div>
+          <div class="stock-radar-patterns">${patterns || `<span class="stock-radar-empty">未命中因子</span>`}</div>
+        </div>
+      `;
+    }
+
     function renderRow(pick) {
       const industry = industryLabel(pick);
       const topFactors = Object.entries(pick.factor_scores || {})
@@ -969,7 +1042,7 @@
               <span class="mini-kline-status">周K</span>
             </div>
           </td>
-          <td><span class="score">${fmt(pick.score)}</span><div class="name">覆盖 ${fmt((pick.data_quality || 0) * 100, 1)}%</div></td>
+          <td class="score-cell"><span class="score">${fmt(pick.score)}</span><div class="name">加权覆盖 ${fmt(((pick.weighted_data_quality ?? pick.data_quality) || 0) * 100, 1)}%</div>${cachedRadarContext(pick)}</td>
           <td><div class="chips">${(pick.reasons || []).map((r) => `<span class="chip good">${esc(r)}</span>`).join("")}</div></td>
           <td><div class="chips">${(pick.warnings || []).map((r) => `<span class="chip warn">${esc(r)}</span>`).join("") || `<span class="chip">无显著提示</span>`}</div></td>
           <td><div class="chips">${topFactors.map((f) => `<span class="chip">${esc(f.label)} ${fmt(f.score, 0)}×${fmt(f.weight, 1)}</span>`).join("")}</div></td>

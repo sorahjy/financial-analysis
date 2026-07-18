@@ -35,7 +35,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 6
 SQLITE_BUSY_TIMEOUT_MS = 120000
 # 批量刷新友好的连接级调优（均为连接局部或不写库文件，不扰动 user_version/mtime）：
 #   cache_size 负值=KB，每连接一块页缓存减少大表反复读盘（多线程下 N 连接各占一份，故默认偏保守 16MB）；
@@ -101,6 +101,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS stock_meta (
             code                    TEXT PRIMARY KEY,
             name                    TEXT NOT NULL,
+            instrument_type         TEXT NOT NULL DEFAULT 'stock',
             fetch_time              TEXT,
             financials_refetched_at TEXT,
             daily_refetched_at      TEXT,
@@ -216,6 +217,10 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         # 游资小盘池是游资雷达与 A 股短线策略共用的唯一成员口径。
         "is_hot_money": "INTEGER NOT NULL DEFAULT 0",
     })
+    _ensure_table_columns(conn, "stock_meta", {
+        # ETF 与股票共用 OHLCV 表，但必须让财报/策略全库扫描能排除 ETF。
+        "instrument_type": "TEXT NOT NULL DEFAULT 'stock'",
+    })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
 
@@ -234,7 +239,7 @@ def _ensure_table_columns(conn: sqlite3.Connection, table: str, columns: Mapping
 # ─── 动态 SQL（列集中定义，避免手抖漏列）────────────────────────
 
 _META_COLUMNS = (
-    "code", "name", "fetch_time",
+    "code", "name", "instrument_type", "fetch_time",
     "financials_refetched_at", "daily_refetched_at", "history_refetched_at",
     "daily_stats_json", "financials_json", "indicators_json", "dividends_json",
     "pledge_ratio", "pledge_count", "pledge_trade_date", "industry",
@@ -288,6 +293,7 @@ def save_stock(
     meta_row = (
         code,
         str(data.get("name") or code),
+        str(data.get("instrument_type") or "stock"),
         _optional_text(data.get("fetch_time")),
         _optional_text(data.get("financials_refetched_at")),
         _optional_text(data.get("daily_refetched_at")),
@@ -330,6 +336,7 @@ def upsert_history_records(
     source: str = "stock_history_upsert",
     price_adjust: str = "qfq",
     daily_stats: Optional[Mapping[str, Any]] = None,
+    instrument_type: str = "stock",
 ) -> int:
     """只增量写入 stock_history，并保留 stock_meta 里的财报/指标等 JSON blob。
 
@@ -365,6 +372,7 @@ def upsert_history_records(
                     """
                     UPDATE stock_meta
                     SET name = ?,
+                        instrument_type = ?,
                         history_refetched_at = ?,
                         history_source = ?,
                         history_start_date = ?,
@@ -373,17 +381,17 @@ def upsert_history_records(
                         updated_at = CURRENT_TIMESTAMP
                     WHERE code = ?
                     """,
-                    (display_name, now, source, merged_start, merged_end, price_adjust, code),
+                    (display_name, instrument_type, now, source, merged_start, merged_end, price_adjust, code),
                 )
             else:
                 conn.execute(
                     """
                     INSERT INTO stock_meta
-                    (code, name, fetch_time, history_refetched_at, history_source,
+                    (code, name, instrument_type, fetch_time, history_refetched_at, history_source,
                      history_start_date, history_end_date, price_adjust, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
                     """,
-                    (code, display_name, now, now, source, start_date, end_date, price_adjust),
+                    (code, display_name, instrument_type, now, now, source, start_date, end_date, price_adjust),
                 )
             conn.executemany(
                 _HISTORY_INSERT_SQL,
@@ -395,6 +403,30 @@ def upsert_history_records(
                     (_json_or_none(daily_stats), code),
                 )
     return len(rows)
+
+
+def update_stock_identity(
+    conn: sqlite3.Connection,
+    code: str,
+    name: str,
+    *,
+    instrument_type: str,
+) -> bool:
+    """更新已入库证券的名称与品种，不重写历史行情或公司数据。"""
+    code = _normalize_code(code)
+    if not code:
+        return False
+    with _WRITE_LOCK:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE stock_meta
+                SET name = ?, instrument_type = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE code = ?
+                """,
+                (str(name or code), str(instrument_type or "stock"), code),
+            )
+    return bool(cursor.rowcount)
 
 
 def save_index_nav(conn: sqlite3.Connection, payload: Mapping[str, Any], *, name: Optional[str] = None) -> int:
@@ -1047,8 +1079,16 @@ def load_index_nav(conn: sqlite3.Connection, code: str) -> Dict[str, Any]:
     return payload
 
 
-def list_codes(conn: sqlite3.Connection) -> List[str]:
-    return [row["code"] for row in conn.execute("SELECT code FROM stock_meta ORDER BY code")]
+def list_codes(conn: sqlite3.Connection, instrument_type: Optional[str] = "stock") -> List[str]:
+    """列出代码；默认只返回股票，传 ``None`` 才返回全部证券。"""
+    if instrument_type is None:
+        rows = conn.execute("SELECT code FROM stock_meta ORDER BY code")
+    else:
+        rows = conn.execute(
+            "SELECT code FROM stock_meta WHERE instrument_type = ? ORDER BY code",
+            (instrument_type,),
+        )
+    return [row["code"] for row in rows]
 
 
 def stock_history_end_date(conn: sqlite3.Connection, code: str) -> Optional[str]:
@@ -1116,9 +1156,19 @@ def existing_codes(conn: sqlite3.Connection) -> set:
     return {row["code"] for row in rows}
 
 
-def codes_with_history(conn: sqlite3.Connection) -> List[str]:
-    """有日线记录的 code（PIT 回测股票池，对应旧"带 history.records 的文件"）。"""
-    return [row["code"] for row in conn.execute("SELECT DISTINCT code FROM stock_history ORDER BY code")]
+def codes_with_history(conn: sqlite3.Connection,
+                       instrument_type: Optional[str] = "stock") -> List[str]:
+    """有日线记录的 code；默认排除 ETF，避免股票财报任务误抓。"""
+    if instrument_type is None:
+        rows = conn.execute("SELECT DISTINCT code FROM stock_history ORDER BY code")
+    else:
+        rows = conn.execute(
+            "SELECT DISTINCT h.code FROM stock_history h "
+            "JOIN stock_meta m ON m.code = h.code "
+            "WHERE m.instrument_type = ? ORDER BY h.code",
+            (instrument_type,),
+        )
+    return [row["code"] for row in rows]
 
 
 def codes_needing_history_cleanup(conn: sqlite3.Connection) -> List[str]:
@@ -1246,20 +1296,21 @@ def financials_refetched_map(
     return out
 
 
-def iter_history(conn: sqlite3.Connection):
+def iter_history(conn: sqlite3.Connection, instrument_type: Optional[str] = "stock"):
     """轻量产出 (meta_row, records[])：只读 stock_history + 必要 meta 列，跳过财报 blob 解析。
 
     meta_row 含 code/name/history_source/history_start_date/history_end_date/price_adjust。
     用单条按 (code,date) 排序的 bulk 查询流式分组（PK WITHOUT ROWID 已物理有序），
     避免对每个 code 单独发查询（4900+ 次往返）。
     """
+    where = "" if instrument_type is None else "WHERE instrument_type = ?"
+    params = () if instrument_type is None else (instrument_type,)
     meta_by_code = {
         row["code"]: row
         for row in conn.execute(
-            """
-            SELECT code, name, history_source, history_start_date, history_end_date, price_adjust
-            FROM stock_meta
-            """
+            f"SELECT code, name, instrument_type, history_source, history_start_date, "
+            f"history_end_date, price_adjust FROM stock_meta {where}",
+            params,
         )
     }
     columns = ", ".join(HISTORY_COLUMNS)
@@ -1321,7 +1372,11 @@ def _load_history_records(conn: sqlite3.Connection, code: str) -> List[Dict[str,
 def _rebuild_stock(meta: sqlite3.Row, records: List[Dict[str, Any]]) -> Dict[str, Any]:
     code = meta["code"]
     name = meta["name"]
-    data: Dict[str, Any] = {"symbol": code, "name": name}
+    data: Dict[str, Any] = {
+        "symbol": code,
+        "name": name,
+        "instrument_type": meta["instrument_type"] or "stock",
+    }
     if meta["fetch_time"]:
         data["fetch_time"] = meta["fetch_time"]
 

@@ -25,7 +25,10 @@ os.environ.setdefault("STOCK_CRAWL_NO_PROXY", "1")
 
 import stock_storage
 from stock_crawl_common import strip_proxy_env
-from stock_crawl_price_valuation import refresh_stock_histories
+from stock_crawl_price_valuation import (
+    plan_fundamentals_refresh,
+    refresh_stock_histories,
+)
 
 strip_proxy_env()
 
@@ -107,6 +110,22 @@ def refresh_seed_histories(codes: List[str], names: Dict[str, str], *, years: fl
     )
 
 
+def refresh_selected_factor_data(
+        codes: List[str], names: Dict[str, str], *, years: float, workers: int):
+    """补齐最终游资小盘池的估值、财报、指标、分红和质押数据。"""
+    stocks = {code: names.get(code, "") for code in codes}
+    fundamentals_plan, pledge_map = plan_fundamentals_refresh(set(stocks))
+    return refresh_stock_histories(
+        stocks,
+        max_years=years,
+        workers=workers,
+        refresh_valuation=True,
+        fundamentals_plan=fundamentals_plan,
+        pledge_map=pledge_map,
+        label="游资小盘长线因子",
+    )
+
+
 def float_cap_yi(conn, code: str) -> Optional[float]:
     """流通市值(亿) = 成交额 / (换手率/100)，取近 20 个有效日中位数(抗一字板/停牌噪声)。"""
     rows = conn.execute(
@@ -126,6 +145,11 @@ def main() -> None:
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="爬取线程数(别>6)")
     ap.add_argument("--years", type=float, default=DEFAULT_YEARS, help="爬取历史年数")
     ap.add_argument("--since", default=None, help="龙虎榜起始日(默认今天往前365天)")
+    ap.add_argument(
+        "--enrich-long-factors",
+        action="store_true",
+        help="建池后补齐最终成员的估值与基本面；生产 full 刷新启用",
+    )
     ap.add_argument("--dry-run", action="store_true", help="只选股不爬K线不标记")
     args = ap.parse_args()
 
@@ -163,8 +187,7 @@ def main() -> None:
     latest_map = latest_history_dates(conn, in_member)
     reference_date = conn.execute("SELECT MAX(date) FROM stock_history").fetchone()[0]
 
-    # 3) 流通市值过滤 + 次新过滤 → 标记 is_hot_money
-    conn.execute("UPDATE sw3_member SET is_hot_money = 0 WHERE is_hot_money = 1")
+    # 3) 流通市值过滤 + 次新过滤。先只计算新池，因子数据补齐成功后再原子换池。
     selected, skip_cap, skip_new, skip_nocap, skip_stale = [], 0, 0, 0, 0
     for c in in_member:
         bars = _bars_count(conn, c)
@@ -182,9 +205,34 @@ def main() -> None:
             skip_cap += 1
             continue
         selected.append(c)
-    if selected:
-        conn.executemany("UPDATE sw3_member SET is_hot_money = 1 WHERE code = ?", [(c,) for c in selected])
-    conn.commit()
+    conn.close()
+
+    if not selected:
+        raise RuntimeError("游资小盘筛选结果为空，保留上一份有效股票池")
+
+    # 4) 生产 full 刷新会启用因子补齐。任一股票失败时不切换池标记，让上层
+    # 保留旧策略结果，避免新池配旧数据；独立建池/quick 模式维持轻量行为。
+    if args.enrich_long_factors:
+        factor_result = refresh_selected_factor_data(
+            selected, names, years=args.years, workers=args.workers
+        )
+        if factor_result.get("failed"):
+            samples = ", ".join(str(code) for code in factor_result["failed"][:8])
+            raise RuntimeError(
+                f"游资小盘长线因子数据刷新失败 {len(factor_result['failed'])} 只"
+                f"（{samples}），保留上一份有效股票池"
+            )
+
+    conn = stock_storage.connect()
+    try:
+        conn.execute("UPDATE sw3_member SET is_hot_money = 0 WHERE is_hot_money = 1")
+        conn.executemany(
+            "UPDATE sw3_member SET is_hot_money = 1 WHERE code = ?",
+            [(c,) for c in selected],
+        )
+        conn.commit()
+    finally:
+        conn.close()
     print(f"\n=== 建池完成 ===")
     print(f"  入池(is_hot_money=1): {len(selected)}")
     print(
@@ -192,7 +240,6 @@ def main() -> None:
         f"· K线落后>{MAX_HISTORY_LAG_DAYS}天 {skip_stale} · 无市值数据 {skip_nocap}"
     )
     print(f"  不在 sw3_member 未处理(TODO): {len(not_member)}")
-    conn.close()
 
 
 if __name__ == "__main__":

@@ -21,7 +21,7 @@ from app.services.stock_strategy_service import (
     start_optimizer_job,
     stock_data_refresh_state,
 )
-from app.services.radar_service import kline_bars
+from app.services.radar_service import kline_bars, radar_stock_context
 
 
 bp = Blueprint("stock", __name__)
@@ -97,6 +97,11 @@ def stock_kline():
     limit = request.args.get("limit", 640, type=int)
     period = request.args.get("period", "week")
     return jsonify(kline_bars(code, limit, period))
+
+
+@bp.get("/api/stock/radar-context")
+def stock_radar_context():
+    return jsonify(radar_stock_context())
 
 
 @bp.post("/api/stock/long-backtest-chart")

@@ -20,6 +20,7 @@
   - fetch_benchmark_etfs(): 爬取 510310 沪深300 ETF、510580 中证500 ETF 累计净值作为基准
 """
 
+import argparse
 import json
 import os
 import queue
@@ -46,6 +47,8 @@ from stock_crawl_common import (
     merge_records_by_date,
     normalize_history_records,
     prune_snapshot_only_history_records,
+    reset_daily_source_runtime,
+    write_json_file,
 )
 
 MAX_YEARS = 10
@@ -92,6 +95,20 @@ SEGMENT_REFRESH_SLICE = _env_int("STOCK_SEGMENT_REFRESH_SLICE", 15, minimum=0, m
 strip_proxy_env()
 
 
+def _failure_error(exc):
+    """Format an exception for the structured refresh report."""
+    return f"{type(exc).__name__}: {exc}"[:4000]
+
+
+def _failure_detail(code, name, stage, error):
+    return {
+        "code": str(code).zfill(6) if code else None,
+        "name": str(name or ""),
+        "stage": str(stage or "stock_refresh"),
+        "error": str(error or "unknown error")[:4000],
+    }
+
+
 # ─── 细分行业龙头选股 ─────────────────────────────────────────
 
 def get_segment_leader_stocks():
@@ -109,6 +126,7 @@ def get_segment_leader_stocks():
     payload = build_segment_leader_pool(
         top_per_segment=DEFAULT_TOP_PER_SEGMENT,
         refresh_slice=SEGMENT_REFRESH_SLICE,
+        refresh_industry_heat=True,
     )
     stocks = {}
     for seg in payload.get("segments", []):
@@ -169,6 +187,7 @@ def save_stock_file(code, name, data):
             write_records,
             source="stock_crawl_price_valuation",
             daily_stats=daily_payload_from_history_records(full_records).get("stats"),
+            instrument_type=str(data.get("instrument_type") or "stock"),
         )
         return
 
@@ -177,6 +196,7 @@ def save_stock_file(code, name, data):
     payload = ss.load_stock(conn, str(code).zfill(6), include_history=False) or {}
     payload.setdefault("symbol", str(code).zfill(6))
     payload.setdefault("name", name)
+    payload["instrument_type"] = str(data.get("instrument_type") or payload.get("instrument_type") or "stock")
     replace_history = True
     if full_records:
         # history 元信息(start/end)与 daily.stats 取全量序列；实际写入的行可能只是增量(append)。
@@ -214,6 +234,8 @@ class StockDbWriter:
         self.enqueued = 0
         self.completed = 0
         self.failed = []
+        self.failure_details = []
+        self.failed_tasks = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="stock-db-writer", daemon=True)
 
@@ -247,6 +269,15 @@ class StockDbWriter:
                     safe_print(f"[WRITE-ERROR] {code} {name}: {exc}")
                     with self._lock:
                         self.failed.append((code, name))
+                        self.failed_tasks.append((code, name, data))
+                        self.failure_details.append(
+                            _failure_detail(
+                                code,
+                                name,
+                                "stock_history_write",
+                                _failure_error(exc),
+                            )
+                        )
                 else:
                     with self._lock:
                         self.completed += 1
@@ -480,13 +511,30 @@ def _decide_valuation_period(records, today):
 
 
 def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_info=None,
-                  save_callback=None, max_years=MAX_YEARS, refresh_valuation=True):
+                  save_callback=None, max_years=MAX_YEARS, refresh_valuation=True,
+                  daily_fetcher=None, instrument_type="stock", stage_callback=None):
     """复用型单股历史刷新器。
 
     龙头池使用默认的 10 年历史并刷新估值；其他股票池可传入较短 ``max_years`` 且关闭
     ``refresh_valuation``，但日线的缺口判断、增量抓取、字段合并和 SQLite 写入完全共用。
     """
+    def mark_stage(stage):
+        if stage_callback is not None:
+            stage_callback(stage)
+
+    mark_stage("load_local_history")
     existing = load_stock_file(code, name)
+    source_fetch_history = daily_fetcher or fetch_daily_range
+    daily_fetch_attempted = False
+    daily_rows_received = 0
+
+    def fetch_history(symbol, range_start, range_end):
+        nonlocal daily_fetch_attempted, daily_rows_received
+        daily_fetch_attempted = True
+        rows = source_fetch_history(symbol, range_start, range_end)
+        if rows:
+            daily_rows_received += len(rows)
+        return rows
     existing_records = existing.get("records", [])
     raw_count = len(existing_records)  # C: 增量快路用——现有行是否被 prune/未来日期过滤改动
     snapshot_removed = 0
@@ -515,6 +563,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * float(max_years))
     ).strftime("%Y-%m-%d")
 
+    mark_stage("daily_history")
     hist_new_records = []
     full_daily_backfill = bool(existing_records and records_need_ohlcv_backfill(existing_records))
     qfq_rebased = False
@@ -528,7 +577,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     )
     if full_daily_backfill:
         safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {max_start} ~ {today}")
-        hist_new_records.extend(fetch_daily_range(code, full_refetch_start, today))
+        hist_new_records.extend(fetch_history(code, full_refetch_start, today))
     elif existing_qfq_seam:
         qfq_rebased = True
         safe_print(
@@ -538,13 +587,13 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             f"源涨跌={existing_qfq_seam['source_change_pct']:.2f}%)，"
             f"全量重刷 {full_refetch_start} ~ {today}"
         )
-        hist_new_records.extend(fetch_daily_range(code, full_refetch_start, today))
+        hist_new_records.extend(fetch_history(code, full_refetch_start, today))
 
     if not full_daily_backfill and not qfq_rebased and existing_records and start_date and start_date > max_start:
         prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
         if max_start <= prev_day:
             safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {max_start} ~ {prev_day}")
-            hist_new_records.extend(fetch_daily_range(code, max_start, prev_day))
+            hist_new_records.extend(fetch_history(code, max_start, prev_day))
 
     if full_daily_backfill or qfq_rebased:
         pass
@@ -558,7 +607,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             ).strftime("%Y-%m-%d")
             overlap_start = max(date for date in (overlap_start, start_date, max_start) if date)
             safe_print(f"[{idx}/{total}] {code} {name}: 重叠校验并补行情 {overlap_start} ~ {today}")
-            overlap_records = fetch_daily_range(code, overlap_start, today)
+            overlap_records = fetch_history(code, overlap_start, today)
             scale_change = qfq_overlap_scale_change(existing_records, overlap_records)
             if scale_change:
                 qfq_rebased = True
@@ -568,14 +617,21 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
                     f"{scale_change['new_close']:.2f}，全量重刷 "
                     f"{full_refetch_start} ~ {today}"
                 )
-                hist_new_records = fetch_daily_range(code, full_refetch_start, today)
+                hist_new_records = fetch_history(code, full_refetch_start, today)
             else:
                 # 重叠窗口不仅用于检测前复权尺度，也要用收盘后的完整 OHLCV 覆盖同日
                 # 旧值；否则曾在盘中写入的成交量/最高最低价会因日期相同被永久跳过。
                 hist_new_records.extend(overlap_records)
     else:
         safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {max_start} ~ {today}")
-        hist_new_records.extend(fetch_daily_range(code, max_start, today))
+        hist_new_records.extend(fetch_history(code, max_start, today))
+
+    if daily_fetch_attempted and daily_rows_received == 0:
+        # Keep the last complete local history, but do not turn a fully empty
+        # upstream response into a successful refresh merely because old rows
+        # happen to exist.
+        safe_print(f"[{idx}/{total}] {code} {name}: 本轮行情请求全部为空，保留旧历史")
+        return {"status": "source_empty"}
 
     # SQLite rows use daily_* names while crawler rows use compact aliases.
     # Normalize fetched daily fields first so same-date full refetches actually
@@ -601,12 +657,13 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             changed_daily_dates.add(date_text)
     merged = merge_records(existing_records, normalized_new_records)
 
-    result = {"symbol": code, "name": name}
+    result = {"symbol": code, "name": name, "instrument_type": instrument_type}
     val_period = None
     if merged:
         # 估值：按 merged（合并后最新状态）判断是否需要拉取及拉取哪个period
         val_period = _decide_valuation_period(merged, today) if refresh_valuation else None
         if val_period is not None:
+            mark_stage("valuation")
             val_by_date = fetch_valuation_data(code, period=val_period)
             if val_by_date:
                 merged = attach_valuation(merged, val_by_date)
@@ -622,8 +679,14 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         force_history_replace = full_daily_backfill or qfq_rebased
         if (val_period is None and existing_unchanged and not changed_rows
                 and not force_history_replace and not need_fundamentals):
+            # 行情无需改写时仍要校正证券品种；ETF 可能在引入 instrument_type
+            # 之前已经以默认 stock 身份入库。
+            mark_stage("stock_history_write")
+            ss.update_stock_identity(
+                ss.thread_conn(), code, name, instrument_type=instrument_type
+            )
             safe_print(f"[{idx}/{total}] {code} {name}: 已最新({end_date})，跳过写库")
-            return
+            return {"status": "up_to_date"}
         if val_period is None and existing_unchanged and not force_history_replace:
             result["history_write_records"] = changed_rows
             result["history_replace"] = False
@@ -633,14 +696,16 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
 
     # 嵌入式财报刷新：仅当本只被判定需要刷(新报告/超期/从未爬)时才逐只爬
     if need_fundamentals:
+        mark_stage("fundamentals")
         from stock_crawl_fundamentals import fetch_fundamentals
         result.update(fetch_fundamentals(code, pledge_info))
 
     if not merged and not need_fundamentals:
         safe_print(f"[{idx}/{total}] {code} {name}: 无数据")
-        return
+        return {"status": "no_data"}
 
     queued_write = save_callback is not None
+    mark_stage("stock_history_write")
     if save_callback is None:
         save_stock_file(code, name, result)
     else:
@@ -659,11 +724,13 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         parts.append("财报已刷新")
     write_state = "已入写库队列" if queued_write else "已写库"
     safe_print(f"[{idx}/{total}] {code} {name}: {write_state} | " + " | ".join(parts))
+    return {"status": "queued" if queued_write else "saved"}
 
 
 def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT,
                             refresh_valuation=True, fundamentals_plan=None,
-                            pledge_map=None, label="股票池"):
+                            pledge_map=None, label="股票池", daily_fetcher=None,
+                            instrument_type="stock"):
     """批量刷新任意股票池，统一复用龙头池的单股增量更新与单写线程。
 
     ``stocks`` 为 ``{code: name}``。返回本轮抓取/写库统计和失败代码；调用方据此做池级
@@ -686,8 +753,14 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
     def worker(args):
         nonlocal completed
         idx_local, (code, name) = args
+        current_stage = "stock_refresh"
+
+        def set_stage(stage):
+            nonlocal current_stage
+            current_stage = stage
+
         try:
-            process_stock(
+            outcome = process_stock(
                 code,
                 name,
                 idx_local,
@@ -697,9 +770,18 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
                 save_callback=db_writer.enqueue,
                 max_years=max_years,
                 refresh_valuation=refresh_valuation,
+                daily_fetcher=daily_fetcher,
+                instrument_type=instrument_type,
+                stage_callback=set_stage,
             )
+            if (
+                isinstance(outcome, dict)
+                and outcome.get("status") in {"no_data", "source_empty"}
+            ):
+                with counter_lock:
+                    failed.append((code, name))
         except Exception as exc:
-            safe_print(f"[ERROR] {code} {name}: {exc}")
+            safe_print(f"[ERROR] {code} {name} [{current_stage}]: {exc}")
             with counter_lock:
                 failed.append((code, name))
         finally:
@@ -724,23 +806,125 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
         )
         db_writer.wait()
 
-    try:
-        synced = ss.sync_sw3_member_market_caps(ss.thread_conn())
-        safe_print(f"[{label}] sw3 市值批量同步: {synced} 行")
-    except Exception as exc:
-        safe_print(f"[WARN] [{label}] sw3 市值批量同步失败: {exc}")
+    first_failure_by_code = {}
+    for code, name in failed:
+        normalized = str(code).zfill(6)
+        first_failure_by_code.setdefault(normalized, {
+            "code": normalized,
+            "name": name,
+            "kind": "process",
+            "data": None,
+        })
+    for code, name, data in db_writer.failed_tasks:
+        normalized = str(code).zfill(6)
+        first_failure_by_code[normalized] = {
+            "code": normalized,
+            "name": name,
+            "kind": "write",
+            "data": data,
+        }
 
-    failed.extend(db_writer.failed)
+    retry_items = []
+    seen_retry_codes = set()
+    for code, name in items:
+        normalized = str(code).zfill(6)
+        candidate = first_failure_by_code.get(normalized)
+        if candidate is not None and normalized not in seen_retry_codes:
+            retry_items.append(candidate)
+            seen_retry_codes.add(normalized)
+    for normalized, candidate in first_failure_by_code.items():
+        if normalized not in seen_retry_codes:
+            retry_items.append(candidate)
+            seen_retry_codes.add(normalized)
+
+    final_failure_by_code = {}
+    retry_recovered = 0
+    if retry_items:
+        safe_print(
+            f"[{label}] 首轮失败 {len(retry_items)} 只；全部首轮写库结束后逐只复试 1 次"
+        )
+        if any(item["kind"] == "process" for item in retry_items):
+            reset_daily_source_runtime()
+        for retry_index, candidate in enumerate(retry_items, start=1):
+            code = candidate["code"]
+            name = candidate["name"]
+            stage = {"value": "stock_refresh"}
+
+            def set_retry_stage(value, holder=stage):
+                holder["value"] = value
+
+            try:
+                if candidate["kind"] == "write":
+                    stage["value"] = "stock_history_write"
+                    save_stock_file(code, name, candidate["data"])
+                    outcome = {"status": "saved"}
+                else:
+                    outcome = process_stock(
+                        code,
+                        name,
+                        retry_index,
+                        len(retry_items),
+                        need_fundamentals=fundamentals_plan.get(code, False),
+                        pledge_info=pledge_map.get(code),
+                        save_callback=None,
+                        max_years=max_years,
+                        refresh_valuation=refresh_valuation,
+                        daily_fetcher=daily_fetcher,
+                        instrument_type=instrument_type,
+                        stage_callback=set_retry_stage,
+                    )
+                if (
+                    isinstance(outcome, dict)
+                    and outcome.get("status") in {"no_data", "source_empty"}
+                ):
+                    final_failure_by_code[code] = _failure_detail(
+                        code,
+                        name,
+                        "daily_history",
+                        "所有已配置行情源均未返回日线数据",
+                    )
+                else:
+                    retry_recovered += 1
+                    safe_print(f"[{label}] 复试成功 {retry_index}/{len(retry_items)}: {code} {name}")
+            except Exception as exc:
+                final_failure_by_code[code] = _failure_detail(
+                    code,
+                    name,
+                    stage["value"],
+                    _failure_error(exc),
+                )
+                safe_print(
+                    f"[{label}] 复试仍失败 {retry_index}/{len(retry_items)}: "
+                    f"{code} {name} [{stage['value']}] {exc}"
+                )
+
+    if instrument_type == "stock":
+        try:
+            synced = ss.sync_sw3_member_market_caps(ss.thread_conn())
+            safe_print(f"[{label}] sw3 市值批量同步: {synced} 行")
+        except Exception as exc:
+            safe_print(f"[WARN] [{label}] sw3 市值批量同步失败: {exc}")
+
+    final_failed_codes = [
+        candidate["code"]
+        for candidate in retry_items
+        if candidate["code"] in final_failure_by_code
+    ]
+    failure_details = [final_failure_by_code[code] for code in final_failed_codes]
     result = {
         "requested": total,
         "processed": completed,
         "write_enqueued": db_writer.enqueued,
         "write_completed": db_writer.completed,
-        "failed": [code for code, _name in failed],
+        "retry_attempted": len(retry_items),
+        "retry_recovered": retry_recovered,
+        "retry_failed": len(final_failed_codes),
+        "failed": final_failed_codes,
+        "failure_details": failure_details,
     }
     safe_print(
         f"[{label}] 完成：处理 {completed}/{total}，写库 {db_writer.completed}/{db_writer.enqueued}，"
-        f"失败 {len(failed)}"
+        f"首轮失败 {len(retry_items)}，复试恢复 {retry_recovered}，最终失败 {len(final_failed_codes)}"
     )
     return result
 
@@ -903,22 +1087,145 @@ def _plan_fundamentals_refresh(codes):
     return needs, pledge_map
 
 
+def plan_fundamentals_refresh(codes):
+    """Public pool-level wrapper shared by leader and hot-money refreshes."""
+    return _plan_fundamentals_refresh(codes)
+
+
+def run_segment_leader_refresh():
+    """Run the production leader refresh and retain structured failure details."""
+    stocks = {}
+    try:
+        stocks = get_segment_leader_stocks()
+    except Exception as exc:
+        detail = _failure_detail(None, "", "segment_leader_pool", _failure_error(exc))
+        safe_print(f"[ERROR] segment_leader_pool: {detail['error']}")
+        return {
+            "requested": 0,
+            "processed": 0,
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "retry_attempted": 0,
+            "retry_recovered": 0,
+            "retry_failed": 0,
+            "failed": [],
+            "failure_details": [detail],
+        }
+    if not stocks:
+        detail = _failure_detail(
+            None,
+            "",
+            "segment_leader_pool",
+            _failure_error(RuntimeError("细分行业龙头池为空")),
+        )
+        safe_print(f"[ERROR] segment_leader_pool: {detail['error']}")
+        return {
+            "requested": 0,
+            "processed": 0,
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "retry_attempted": 0,
+            "retry_recovered": 0,
+            "retry_failed": 0,
+            "failed": [],
+            "failure_details": [detail],
+        }
+
+    try:
+        needs_fund, pledge_map = _plan_fundamentals_refresh(set(stocks))
+    except Exception as exc:
+        detail = _failure_detail(None, "", "fundamentals_plan", _failure_error(exc))
+        safe_print(f"[ERROR] fundamentals_plan: {detail['error']}")
+        return {
+            "requested": len(stocks),
+            "processed": 0,
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "retry_attempted": 0,
+            "retry_recovered": 0,
+            "retry_failed": 0,
+            "failed": [],
+            "failure_details": [detail],
+        }
+
+    try:
+        return refresh_stock_histories(
+            stocks,
+            max_years=MAX_YEARS,
+            workers=THREAD_COUNT,
+            refresh_valuation=True,
+            fundamentals_plan=needs_fund,
+            pledge_map=pledge_map,
+            label="细分龙头",
+        )
+    except Exception as exc:
+        detail = _failure_detail(None, "", "segment_leader_refresh", _failure_error(exc))
+        safe_print(f"[ERROR] segment_leader_refresh: {detail['error']}")
+        return {
+            "requested": len(stocks),
+            "processed": 0,
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "retry_attempted": 0,
+            "retry_recovered": 0,
+            "retry_failed": 0,
+            "failed": [],
+            "failure_details": [detail],
+        }
+
+
 def main():
-    stocks = get_segment_leader_stocks()
-    needs_fund, pledge_map = _plan_fundamentals_refresh(set(stocks))
-    result = refresh_stock_histories(
-        stocks,
-        max_years=MAX_YEARS,
-        workers=THREAD_COUNT,
-        refresh_valuation=True,
-        fundamentals_plan=needs_fund,
-        pledge_map=pledge_map,
-        label="细分龙头",
+    """Compatibility entry point returning the historical ``[(code, name)]`` shape."""
+    result = run_segment_leader_refresh()
+    global_failure = next(
+        (
+            detail
+            for detail in result.get("failure_details", [])
+            if not detail.get("code")
+        ),
+        None,
     )
-    return [(code, stocks.get(code, "")) for code in result["failed"]]
+    if global_failure:
+        raise RuntimeError(global_failure.get("error") or "细分龙头刷新失败")
+    return [
+        (detail.get("code"), detail.get("name", ""))
+        for detail in result.get("failure_details", [])
+    ]
+
+
+def cli(argv=None):
+    parser = argparse.ArgumentParser(description="刷新细分龙头前复权行情与估值")
+    parser.add_argument(
+        "--failure-report",
+        type=Path,
+        help="把逐股失败代码、阶段和异常写入该 JSON sidecar",
+    )
+    args = parser.parse_args(argv)
+    try:
+        result = run_segment_leader_refresh()
+    except Exception as exc:
+        detail = _failure_detail(
+            None,
+            "",
+            "segment_leader_refresh",
+            _failure_error(exc),
+        )
+        safe_print(f"[ERROR] segment_leader_refresh: {detail['error']}")
+        result = {
+            "requested": 0,
+            "processed": 0,
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "retry_attempted": 0,
+            "retry_recovered": 0,
+            "retry_failed": 0,
+            "failed": [],
+            "failure_details": [detail],
+        }
+    if args.failure_report:
+        write_json_file(args.failure_report, result)
+    return 1 if result.get("failure_details") else 0
 
 
 if __name__ == "__main__":
-    failed_stocks = main()
-    if failed_stocks:
-        raise SystemExit(1)
+    raise SystemExit(cli())

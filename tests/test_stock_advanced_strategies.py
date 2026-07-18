@@ -366,6 +366,45 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(scored[0]["code"], "A")
         self.assertGreater(scored[0]["score"], scored[1]["score"])
 
+    def test_apply_scores_reports_active_weight_coverage(self):
+        specs = [
+            FactorSpec("present", "Present", "long", "质量", "", 3.0),
+            FactorSpec("missing", "Missing", "long", "质量", "", 1.0),
+        ]
+        items = [{
+            "code": "A",
+            "raw_factors": {"present": 10.0, "missing": None},
+            "data_quality": 0.5,
+        }]
+
+        scored = apply_scores(items, specs, {"present": 3.0, "missing": 1.0})
+
+        self.assertEqual(scored[0]["weighted_data_quality"], 0.75)
+
+    def test_diagnostics_splits_long_factor_coverage_by_source(self):
+        specs = [
+            FactorSpec("roe_mean", "ROE", "long", "质量", "", 1.0),
+            FactorSpec("liquidity", "换手", "long", "价格", "", 1.0),
+            FactorSpec("repurchase_recent", "回购", "long", "资金面", "", 1.0),
+        ]
+        scored = apply_scores([{
+            "code": "A",
+            "raw_factors": {
+                "roe_mean": None,
+                "liquidity": 2.0,
+                "repurchase_recent": 0.0,
+            },
+            "data_quality": 2 / 3,
+        }], specs, {spec.key: 1.0 for spec in specs})
+
+        diag = strategies.diagnostics(scored, specs)
+        sections = {row["key"]: row for row in diag["coverage_sections"]}
+
+        self.assertEqual(diag["avg_weighted_data_quality"], 0.667)
+        self.assertEqual(sections["fundamental"]["coverage"], 0.0)
+        self.assertEqual(sections["price"]["coverage"], 1.0)
+        self.assertEqual(sections["capital"]["coverage"], 1.0)
+
     def test_first_not_none_keeps_legitimate_zero(self):
         self.assertEqual(first_not_none(0, 5), 0.0)
         self.assertEqual(first_not_none(None, "abc", 3), 3.0)
@@ -620,6 +659,26 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertIsNone(missing["holder_count_change"])
         self.assertIsNone(missing["repurchase_recent"])
         self.assertIsNone(missing["lhb_recent_avoid"])
+
+    def test_compute_long_factors_rebuilds_missing_latest_gross_margin(self):
+        stock = json.loads(json.dumps(PIT_SYNTH_STOCK))
+        stock["indicators"]["records"][0]["gross_margin"] = None
+
+        raw = compute_long_raw_factors(
+            "X", stock, {}, False, False, 1e10, None,
+        )
+
+        self.assertAlmostEqual(raw["gross_margin"], 50.0)
+
+    def test_missing_dividend_payload_is_not_counted_as_no_dividend(self):
+        stock = json.loads(json.dumps(PIT_SYNTH_STOCK))
+        stock.pop("dividends")
+
+        raw = compute_long_raw_factors(
+            "X", stock, {}, False, False, 1e10, None,
+        )
+
+        self.assertIsNone(raw["dividend_consistency"])
 
     def test_run_strategies_returns_usable_sections(self):
         result = run_strategies(persist=False)
