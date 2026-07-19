@@ -19,13 +19,14 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import requests
 
-from fund_storage import (
+from .fund_storage import (
     connect as connect_fund_db,
     import_nav_store_payload,
     load_nav_store as db_load_nav_store,
     save_nav_entry,
     save_realtime_estimates,
 )
+from refresh_workflow import is_no_proxy_enabled
 
 
 FUND_CODES_FILE = os.path.join("data", "fund_codes.json")
@@ -52,6 +53,43 @@ MAX_RETRIES = 3
 META_RE = re.compile(r"records:(\d+),pages:(\d+),curpage:(\d+)")
 ROW_RE = re.compile(r"<td[^>]*>(.*?)</td>")
 JSONP_RE = re.compile(r"jsonpgz\((.*)\)")
+
+_HTTP_SESSION: Optional[requests.Session] = None
+_HTTP_SESSION_NO_PROXY: Optional[bool] = None
+
+
+def _no_proxy_enabled() -> bool:
+    # stock_data_refresh reuses this module for benchmark ETF NAV.  Honor both
+    # refresh markers so that path gets the same library-level guarantee as a
+    # standalone fund refresh.
+    return (
+        is_no_proxy_enabled("FUND_CRAWL_NO_PROXY")
+        or is_no_proxy_enabled("STOCK_CRAWL_NO_PROXY")
+    )
+
+
+def _build_http_session() -> requests.Session:
+    """Build the shared Requests session for the current proxy mode."""
+    session = requests.Session()
+    if _no_proxy_enabled():
+        # NO_PROXY alone is not sufficient when proxy variables use unusual
+        # casing or are injected after process startup.  Requests documents
+        # trust_env as the switch controlling all environment proxy lookup.
+        session.trust_env = False
+    return session
+
+
+def _get_http_session() -> requests.Session:
+    """Reuse connections while rebuilding if the legacy marker changes."""
+    global _HTTP_SESSION, _HTTP_SESSION_NO_PROXY
+
+    no_proxy = _no_proxy_enabled()
+    if _HTTP_SESSION is None or _HTTP_SESSION_NO_PROXY != no_proxy:
+        if _HTTP_SESSION is not None:
+            _HTTP_SESSION.close()
+        _HTTP_SESSION = _build_http_session()
+        _HTTP_SESSION_NO_PROXY = no_proxy
+    return _HTTP_SESSION
 
 
 def load_fund_codes() -> List[str]:
@@ -89,7 +127,12 @@ def _get_nav_with_retry(params: Dict[str, Any]) -> str:
     last_err = None
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(NAV_API_URL, params=params, headers=NAV_HEADERS, timeout=15)
+            response = _get_http_session().get(
+                NAV_API_URL,
+                params=params,
+                headers=NAV_HEADERS,
+                timeout=15,
+            )
             response.raise_for_status()
             return response.text
         except Exception as exc:
@@ -289,7 +332,11 @@ def fetch_estimate(code: str) -> Optional[Dict[str, str]]:
     url = ESTIMATE_API_URL.format(code=code)
     for attempt in range(MAX_RETRIES):
         try:
-            response = requests.get(url, headers=ESTIMATE_HEADERS, timeout=10)
+            response = _get_http_session().get(
+                url,
+                headers=ESTIMATE_HEADERS,
+                timeout=10,
+            )
             response.encoding = "utf-8"
             match = JSONP_RE.search(response.text)
             if not match:

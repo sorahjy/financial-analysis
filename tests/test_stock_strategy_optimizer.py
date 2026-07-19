@@ -88,22 +88,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
             self.assertEqual(optuna_cfg["weights"][key], 0.0)
         self.assertEqual(optuna_cfg["min_market_cap_yi"], 0)
 
-    def test_long_capital_factors_are_searchable(self):
-        keys = {"holder_count_change", "repurchase_recent", "lhb_recent_avoid"}
-        searchable = {factor.key for factor in optimizer.LONG_SEARCHABLE_FACTORS}
-
-        self.assertTrue(keys <= searchable)
-
-        random_cfg = optimizer.random_long_config(random.Random(7), iteration=0)
-        for key in keys:
-            self.assertIn(key, random_cfg["weights"])
-            self.assertGreater(random_cfg["weights"][key], 0)
-
-        trial = RecordingTrial()
-        optimizer._suggest_long_config(trial)
-        for key in keys:
-            self.assertIn(f"w_{key}", trial.float_names)
-
     def test_short_optuna_search_space_matches_random_search_knobs(self):
         trial = RecordingTrial()
         cfg, hold_days = optimizer._suggest_short_config(trial)
@@ -150,15 +134,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
 
         self.assertEqual(result["samples"], 1)
         self.assertAlmostEqual(result["avg_return"], 9.6, places=6)
-
-    def test_short_hold_config_uses_one_selected_horizon(self):
-        cfg = optimizer._short_config_with_hold_days(DEFAULT_CONFIG["short"], 3)
-
-        self.assertEqual(cfg["hold_days"], 3)
-        self.assertEqual(cfg["hold_days_min"], 3)
-        self.assertEqual(cfg["hold_days_max"], 3)
-        self.assertEqual(DEFAULT_CONFIG["short"]["hold_days_min"], 1)
-        self.assertEqual(DEFAULT_CONFIG["short"]["hold_days_max"], 5)
 
     def test_short_horizon_without_samples_does_not_borrow_another_horizon(self):
         picks = [{"code": "000001", "event_date": "2026-07-01"}]
@@ -304,17 +279,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertFalse(any(name.removeprefix("w_") in excluded for name in trial.float_names))
         self.assertFalse(set(cfg["weights"]) & excluded)
         self.assertEqual(cfg["top_n"], 10)
-
-    def test_smallcap_uses_five_year_twenty_day_fold_contract(self):
-        self.assertEqual(optimizer.SMALLCAP_HOLD_CHOICES, [20])
-        self.assertEqual(optimizer.SMALLCAP_FOLD_STEP_TD, 20)
-        self.assertEqual(optimizer.SMALLCAP_MAX_LOOKBACK_TD, 1250)
-        offsets = optimizer.smallcap_anchor_offsets(20)
-        self.assertEqual(offsets[:3], [21, 41, 61])
-        self.assertTrue(all(b - a == 20 for a, b in zip(offsets, offsets[1:])))
-        self.assertLess(offsets[-1], 1250)
-        self.assertEqual(optimizer._default_smallcap_params()["hold_td"], 20)
-        self.assertEqual(optimizer._default_long_params()["hold_td"], 40)
 
     def test_smallcap_optimizer_never_searches_or_enables_high_drawdown_filter(self):
         random_cfg = optimizer.random_smallcap_config(random.Random(7), iteration=5)

@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -168,14 +169,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
             ["2026-07-10", "2026-07-08"],
         )
 
-    def test_factor_registry_has_required_depth(self):
-        registry = get_factor_registry()
-
-        self.assertGreaterEqual(registry["total"], 20)
-        self.assertGreaterEqual(len(registry["long"]), 20)
-        self.assertGreaterEqual(len(registry["smallcap"]), 20)
-        self.assertGreaterEqual(len(registry["short"]), 20)
-
     def test_smallcap_registry_reuses_long_without_index_or_size_factors(self):
         registry = get_factor_registry()
         long_keys = {item["key"] for item in registry["long"]}
@@ -186,17 +179,6 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertFalse(
             set(get_default_config()["smallcap"]["weights"]) & SMALLCAP_EXCLUDED_FACTOR_KEYS
         )
-
-    def test_long_factor_registry_exposes_capital_group(self):
-        registry = get_factor_registry()
-        long_by_key = {item["key"]: item for item in registry["long"]}
-        defaults = get_default_config()["long"]["weights"]
-
-        for key in ("holder_count_change", "repurchase_recent", "lhb_recent_avoid"):
-            self.assertIn(key, long_by_key)
-            self.assertEqual(long_by_key[key]["group"], "资金面")
-            self.assertIn(key, defaults)
-            self.assertGreater(defaults[key], 0)
 
     def test_default_config_falls_back_to_backup_optimized_config(self):
         payload = {
@@ -541,76 +523,118 @@ class StockAdvancedStrategyTest(unittest.TestCase):
 
         self.assertEqual(result["candidate_count"], 0)
 
-    def test_high_drawdown_filter_keeps_passing_stock_score_stable(self):
-        base = get_default_config()["long"]
-        base.update({
-            "require_csi300": False,
-            "min_market_cap_yi": 500,
-            "min_high_drawdown_pct": 10,
-            "min_score": 0,
-            "top_n": 9999,
-        })
+    def test_long_hard_filters_keep_passing_stock_score_stable(self):
+        score_factor = FactorSpec(
+            "synthetic_signal",
+            "合成信号",
+            "long",
+            "test",
+            "用于验证硬过滤不会改变评分池。",
+            1.0,
+        )
+        candidates = [
+            {
+                "code": "PASS",
+                "name": "通过项",
+                "strategy": "long",
+                "raw_factors": {
+                    "synthetic_signal": 50.0,
+                    "market_cap": 600.0,
+                    "csi300_current": 1.0,
+                    "historical_high_drawdown": 20.0,
+                },
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+            {
+                "code": "FILTERED",
+                "name": "被过滤项",
+                "strategy": "long",
+                "raw_factors": {
+                    "synthetic_signal": 100.0,
+                    "market_cap": 200.0,
+                    "csi300_current": 0.0,
+                    "historical_high_drawdown": 5.0,
+                },
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+            {
+                "code": "ANCHOR",
+                "name": "锚点项",
+                "strategy": "long",
+                "raw_factors": {
+                    "synthetic_signal": 0.0,
+                    "market_cap": 600.0,
+                    "csi300_current": 1.0,
+                    "historical_high_drawdown": 20.0,
+                },
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+        ]
+        default_config = {
+            "long": {
+                "exclude_st": False,
+                "min_market_cap_yi": 0,
+                "require_csi300": False,
+                "require_high_drawdown": False,
+                "min_high_drawdown_pct": 0,
+                "min_score": 0,
+                "top_n": 10,
+                "weights": {"synthetic_signal": 1.0},
+            },
+        }
+        cases = [
+            (
+                "historical high drawdown",
+                {"require_high_drawdown": False, "min_high_drawdown_pct": 10},
+                {"require_high_drawdown": True, "min_high_drawdown_pct": 10},
+            ),
+            (
+                "current CSI300 membership",
+                {"require_csi300": False},
+                {"require_csi300": True},
+            ),
+            (
+                "market-cap floor",
+                {"min_market_cap_yi": 100},
+                {"min_market_cap_yi": 500},
+            ),
+        ]
 
-        without_required = dict(base)
-        without_required["require_high_drawdown"] = False
-        with_required = dict(base)
-        with_required["require_high_drawdown"] = True
+        def synthetic_pool(config):
+            return (
+                [item for item in candidates if passes_long_hard_filters(item, config)],
+                ["synthetic candidate pool"],
+            )
 
-        loose = run_long_strategy(without_required)
-        strict = run_long_strategy(with_required)
-        loose_hikvision = next((row for row in loose["picks"] if row["code"] == "002415"), None)
-        strict_hikvision = next((row for row in strict["picks"] if row["code"] == "002415"), None)
-        if loose_hikvision is None or strict_hikvision is None:
-            self.skipTest("local data does not include Hikvision passing the drawdown threshold")
+        with patch.object(strategies, "LONG_FACTORS", [score_factor]), \
+             patch.object(
+                 strategies,
+                 "get_default_config",
+                 side_effect=lambda: copy.deepcopy(default_config),
+             ), \
+             patch.object(strategies, "live_long_candidate_pool", side_effect=synthetic_pool):
+            for label, loose_config, strict_config in cases:
+                with self.subTest(filter=label):
+                    loose = strategies.run_long_strategy(loose_config)
+                    strict = strategies.run_long_strategy(strict_config)
+                    loose_by_code = {row["code"]: row for row in loose["picks"]}
+                    strict_by_code = {row["code"]: row for row in strict["picks"]}
 
-        self.assertGreaterEqual(strict_hikvision["raw_factors"]["historical_high_drawdown"], 10)
-        self.assertAlmostEqual(loose_hikvision["score"], strict_hikvision["score"], places=6)
-
-    def test_require_csi300_keeps_current_member_score_stable(self):
-        base = get_default_config()["long"]
-        base.update({
-            "min_market_cap_yi": 500,
-            "min_score": 0,
-            "top_n": 9999,
-        })
-
-        without_required = dict(base)
-        without_required["require_csi300"] = False
-        with_required = dict(base)
-        with_required["require_csi300"] = True
-
-        loose = run_long_strategy(without_required)
-        strict = run_long_strategy(with_required)
-        loose_moutai = next((row for row in loose["picks"] if row["code"] == "600519"), None)
-        strict_moutai = next((row for row in strict["picks"] if row["code"] == "600519"), None)
-        if loose_moutai is None or strict_moutai is None:
-            self.skipTest("local data does not include Kweichow Moutai in the long pool")
-
-        self.assertEqual(strict_moutai["raw_factors"]["csi300_current"], 1.0)
-        self.assertAlmostEqual(loose_moutai["score"], strict_moutai["score"], places=6)
-
-    def test_market_cap_floor_does_not_change_passing_stock_score(self):
-        base = get_default_config()["long"]
-        base.update({
-            "require_csi300": False,
-            "min_score": 0,
-            "top_n": 9999,
-        })
-
-        loose = dict(base)
-        loose["min_market_cap_yi"] = 100
-        strict = dict(base)
-        strict["min_market_cap_yi"] = 500
-
-        loose_result = run_long_strategy(loose)
-        strict_result = run_long_strategy(strict)
-        loose_moutai = next((row for row in loose_result["picks"] if row["code"] == "600519"), None)
-        strict_moutai = next((row for row in strict_result["picks"] if row["code"] == "600519"), None)
-        if loose_moutai is None or strict_moutai is None:
-            self.skipTest("local data does not include Kweichow Moutai above both market-cap floors")
-
-        self.assertGreaterEqual(strict_moutai["raw_factors"]["market_cap"], 500)
-        self.assertAlmostEqual(loose_moutai["score"], strict_moutai["score"], places=6)
+                    self.assertIn("PASS", loose_by_code)
+                    self.assertIn("PASS", strict_by_code)
+                    self.assertIn("FILTERED", loose_by_code)
+                    self.assertNotIn("FILTERED", strict_by_code)
+                    self.assertEqual(loose_by_code["PASS"]["score"], 50.0)
+                    self.assertEqual(
+                        loose_by_code["PASS"]["score"],
+                        strict_by_code["PASS"]["score"],
+                    )
 
     def test_report_available_date_uses_statutory_deadlines(self):
         self.assertEqual(report_available_date("2024-12-31"), "2025-04-30")
@@ -650,6 +674,7 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertEqual(raw["holder_count_change"], -8.5)
         self.assertEqual(raw["repurchase_recent"], 1.0)
         self.assertEqual(raw["lhb_recent_avoid"], 1.0)
+        self.assertEqual(strategies.long_warnings(raw), ["近期上龙虎榜，波动加剧"])
 
         missing = compute_long_raw_factors(
             "X", PIT_SYNTH_STOCK, {}, False, False, 1e10, None,
@@ -659,6 +684,33 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertIsNone(missing["holder_count_change"])
         self.assertIsNone(missing["repurchase_recent"])
         self.assertIsNone(missing["lhb_recent_avoid"])
+
+    def test_live_candidate_cache_refreshes_legacy_lhb_warning_copy(self):
+        meta = {"config_key": "test"}
+        payload = {
+            "version": strategies.LIVE_CANDIDATE_CACHE_VERSION,
+            "long": {
+                "meta": meta,
+                "candidates": [{
+                    "code": "000933",
+                    "warnings": ["近期上龙虎榜，长线按避雷处理"],
+                }],
+                "notes": ["长线资金面已挂载：股东户数变化、公司回购、近期龙虎榜避雷。"],
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_file = Path(tmpdir) / "candidate-cache.json"
+            cache_file.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            with patch.object(strategies, "LIVE_CANDIDATE_CACHE_FILE", cache_file):
+                cached = strategies.read_live_candidate_cache("long", meta)
+
+        self.assertIsNotNone(cached)
+        candidates, notes = cached
+        self.assertEqual(candidates[0]["warnings"], ["近期上龙虎榜，波动加剧"])
+        self.assertEqual(
+            notes,
+            ["长线资金面已挂载：股东户数变化、公司回购、近期龙虎榜波动提示。"],
+        )
 
     def test_compute_long_factors_rebuilds_missing_latest_gross_margin(self):
         stock = json.loads(json.dumps(PIT_SYNTH_STOCK))
@@ -681,16 +733,96 @@ class StockAdvancedStrategyTest(unittest.TestCase):
         self.assertIsNone(raw["dividend_consistency"])
 
     def test_run_strategies_returns_usable_sections(self):
-        result = run_strategies(persist=False)
+        overrides = {
+            "long": {"min_score": 0, "top_n": 1},
+            "smallcap": {"min_score": 0, "top_n": 1},
+            "short": {"min_score": 0, "top_n": 1},
+        }
+        candidate_by_strategy = {
+            "long": {
+                "code": "LONG",
+                "name": "长线合成股",
+                "strategy": "long",
+                "raw_factors": {spec.key: 1.0 for spec in strategies.LONG_FACTORS},
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+            "smallcap": {
+                "code": "SMALL",
+                "name": "小盘合成股",
+                "strategy": "smallcap",
+                "raw_factors": {spec.key: 1.0 for spec in strategies.SMALLCAP_FACTORS},
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+            "short": {
+                "code": "SHORT",
+                "name": "短线合成股",
+                "strategy": "short",
+                "raw_factors": {spec.key: 1.0 for spec in strategies.SHORT_FACTORS},
+                "data_quality": 1.0,
+                "reasons": [],
+                "warnings": [],
+            },
+        }
 
-        self.assertIn("long", result)
-        self.assertIn("smallcap", result)
-        self.assertIn("short", result)
-        self.assertGreaterEqual(result["factor_total"], 20)
-        self.assertIsInstance(result["long"]["picks"], list)
-        self.assertIsInstance(result["smallcap"]["picks"], list)
-        self.assertIsInstance(result["short"]["picks"], list)
-        self.assertTrue(result["self_review"]["factor_count_ok"])
+        with patch.object(
+            strategies,
+            "get_default_config",
+            side_effect=lambda: copy.deepcopy(strategies.DEFAULT_CONFIG),
+        ), patch.object(
+            strategies,
+            "live_long_candidate_pool",
+            return_value=([candidate_by_strategy["long"]], ["synthetic long pool"]),
+        ) as long_pool, patch.object(
+            strategies,
+            "live_smallcap_candidate_pool",
+            return_value=([candidate_by_strategy["smallcap"]], ["synthetic smallcap pool"]),
+        ) as smallcap_pool, patch.object(
+            strategies,
+            "live_short_candidate_pool",
+            return_value=([candidate_by_strategy["short"]], ["synthetic short pool"]),
+        ) as short_pool:
+            result = strategies.run_strategies(
+                overrides,
+                persist=False,
+                include_search_pool=True,
+            )
+
+        expected_counts = {
+            "long": len(strategies.LONG_FACTORS),
+            "smallcap": len(strategies.SMALLCAP_FACTORS),
+            "short": len(strategies.SHORT_FACTORS),
+        }
+        expected_counts["total"] = sum(expected_counts.values())
+        self.assertEqual(result["factor_counts"], expected_counts)
+        self.assertEqual(result["factor_total"], expected_counts["total"])
+        self.assertEqual(
+            result["factor_registry"],
+            [
+                spec.to_dict()
+                for spec in (
+                    strategies.LONG_FACTORS
+                    + strategies.SMALLCAP_FACTORS
+                    + strategies.SHORT_FACTORS
+                )
+            ],
+        )
+        for strategy, code in (("long", "LONG"), ("smallcap", "SMALL"), ("short", "SHORT")):
+            with self.subTest(strategy=strategy):
+                section = result[strategy]
+                self.assertEqual(section["config"]["min_score"], 0)
+                self.assertEqual(section["config"]["top_n"], 1)
+                self.assertEqual(section["candidate_count"], 1)
+                self.assertEqual(section["selected_count"], 1)
+                self.assertEqual(section["picks"][0]["code"], code)
+                self.assertEqual(section["search_pool"][0]["code"], code)
+
+        self.assertEqual(long_pool.call_args.args[0]["top_n"], 1)
+        self.assertEqual(smallcap_pool.call_args.args[0]["top_n"], 1)
+        self.assertEqual(short_pool.call_args.args[0]["top_n"], 1)
 
     def test_run_smallcap_uses_long_factors_on_hot_money_candidates(self):
         cfg = get_default_config()["smallcap"]

@@ -55,7 +55,7 @@
 import json
 import math
 
-from fund_storage import (
+from .fund_storage import (
     connect as connect_fund_db,
     load_nav_history,
     load_realtime_estimates,
@@ -63,7 +63,7 @@ from fund_storage import (
 
 
 # ============================================================
-# 可调参数（修改后 fund_generate_output.py 会自动引用）
+# 可调参数（修改后 fund/fund_generate_output.py 会自动引用）
 # ============================================================
 ADX_WEIGHT = 1.5              # ADX 动态权重倍数
 BUY_SIGNAL = 4              # 综合评分 >= 此值 → 买入信号
@@ -770,7 +770,7 @@ def load_analysis_inputs():
         conn.close()
 
     if not history:
-        raise RuntimeError('SQLite 中没有基金历史净值数据，请先运行 fund_fetch_data.py')
+        raise RuntimeError('SQLite 中没有基金历史净值数据，请先运行 python -m fund.fund_fetch_data')
 
     return history, estimate_data
 

@@ -34,11 +34,23 @@ RADAR_PATTERN_BACKTEST_YEARS = 6
 RADAR_INDUSTRY_HEAT_FILE = ROOT_DIR / "data/capital/sw3_industry_heat.json"
 _REALTIME_LOCK = threading.Lock()
 _REALTIME_CACHE: Dict[str, Any] = {"fetched_at_ts": 0.0, "fetched_at": "", "codes_key": (), "quotes": None}
+LHB_VOLATILITY_WARNING = "近期上龙虎榜，波动加剧"
+LEGACY_LHB_WARNING_COPY = {"近期上龙虎榜(避雷)", "近期上龙虎榜，长线按避雷处理"}
 
 
 def radar_payload() -> Dict[str, Any]:
     """游资雷达 ambush 结果（stock_hot_money_radar.py 落盘的 hot_money_ambush.json）。"""
-    return load_json_file(AMBUSH_RESULT_FILE, {}) or {}
+    payload = load_json_file(AMBUSH_RESULT_FILE, {}) or {}
+    for row in payload.get("stocks") or []:
+        evidence = row.get("evidence") if isinstance(row, dict) else None
+        if not isinstance(evidence, list):
+            continue
+        for index, item in enumerate(evidence):
+            if isinstance(item, str) and item in LEGACY_LHB_WARNING_COPY:
+                evidence[index] = LHB_VOLATILITY_WARNING
+            elif isinstance(item, dict) and item.get("label") in LEGACY_LHB_WARNING_COPY:
+                item["label"] = LHB_VOLATILITY_WARNING
+    return payload
 
 
 def radar_industry_heat_payload() -> Dict[str, Any]:
@@ -437,7 +449,7 @@ def _scan_effective_pattern_events(
         for hit in fired:
             pattern_code = str(hit.get("code") or "")
             if pattern_code in buy_pattern_codes:
-                # 产品买点集合独立于 PATTERN_EFFECTIVE：P23/P25 也是绿色买点。
+                # 生产买点集合统一使用绿色；不从原始 signal 字段猜测展示语义。
                 effective_style = "bullish"
             elif pattern_code in sell_pattern_codes:
                 if not distribution_warning:

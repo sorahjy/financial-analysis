@@ -29,6 +29,8 @@ from pathlib import Path
 import akshare as ak
 import requests
 
+from refresh_workflow import is_no_proxy_enabled, strip_proxy_environment
+
 MAX_RETRIES = 3
 INDEX_CONS_PRIMARY_TIMEOUT_SEC = int(os.getenv("STOCK_INDEX_CONS_PRIMARY_TIMEOUT", "30"))
 _PRINT_LOCK = threading.Lock()
@@ -87,13 +89,12 @@ def strip_proxy_env():
     东财/腾讯/新浪/百度均为境内接口，经本地代理转发常出现
     ProxyError(RemoteDisconnected)；NO_PROXY=* 同时屏蔽 macOS 系统代理。
     """
-    if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() not in ("1", "true", "yes"):
+    if not is_no_proxy_enabled("STOCK_CRAWL_NO_PROXY"):
         return
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(var, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
+    strip_proxy_environment(
+        os.environ,
+        no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+    )
 
 
 def safe_print(*args, **kwargs):
@@ -181,12 +182,13 @@ import json
 import os
 import sys
 
-if os.getenv("STOCK_CRAWL_NO_PROXY", "").strip().lower() in ("1", "true", "yes"):
-    for var in ("http_proxy", "https_proxy", "all_proxy",
-                "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-        os.environ.pop(var, None)
-    os.environ["NO_PROXY"] = "*"
-    os.environ["no_proxy"] = "*"
+from refresh_workflow import is_no_proxy_enabled, strip_proxy_environment
+
+if is_no_proxy_enabled("STOCK_CRAWL_NO_PROXY"):
+    strip_proxy_environment(
+        os.environ,
+        no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+    )
 
 import akshare as ak
 
@@ -819,16 +821,6 @@ def _reset_daily_process_pool():
         _DAILY_PROCESS_POOL = None
     if pool is not None:
         pool.shutdown(wait=False, cancel_futures=True)
-
-
-def reset_daily_source_runtime():
-    """Reset source circuit breakers and workers before a final failed-stock retry."""
-    with _DAILY_SOURCE_LOCK:
-        _DAILY_SOURCE_DISABLED.clear()
-        _DAILY_PRIORITY_CURSORS.clear()
-        for source in _DAILY_SOURCE_FAILURES:
-            _DAILY_SOURCE_FAILURES[source] = 0
-    _reset_daily_process_pool()
 
 
 def _shutdown_daily_process_pool():

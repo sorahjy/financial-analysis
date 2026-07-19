@@ -6,10 +6,17 @@ from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 
+import requests
+
 import fund_data_refresh
+import stock_crawl_common
 import stock_data_refresh
 import stock_radar_fresh_data
-from refresh_workflow import build_child_environment, run_steps
+from refresh_workflow import (
+    build_child_environment,
+    run_steps,
+    strip_proxy_environment,
+)
 from stock_data_refresh import resolve_python
 
 
@@ -35,6 +42,64 @@ class RefreshWorkflowTest(unittest.TestCase):
         self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
         self.assertEqual(env["PYTHONUTF8"], "1")
         self.assertEqual(env["PYTHONUNBUFFERED"], "1")
+
+    def test_proxy_environment_cleanup_mutates_current_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "Https_Proxy": "http://mixed-http",
+                "All_Proxy": "socks5://mixed-all",
+                "No_Proxy": "localhost",
+            },
+            clear=True,
+        ):
+            result = strip_proxy_environment(
+                no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+            )
+
+            self.assertIs(result, os.environ)
+            self.assertFalse(
+                any(
+                    key.lower() in {"http_proxy", "https_proxy", "all_proxy"}
+                    for key in os.environ
+                )
+            )
+            self.assertEqual(os.environ["NO_PROXY"], "*")
+            self.assertEqual(os.environ["no_proxy"], "*")
+            self.assertEqual(os.environ["STOCK_CRAWL_NO_PROXY"], "1")
+
+    def test_clean_child_environment_resolves_no_requests_proxy(self):
+        env = build_child_environment(
+            {
+                "Https_Proxy": "http://proxy.invalid",
+                "All_Proxy": "socks5://proxy.invalid",
+            },
+            no_proxy=True,
+            no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+        )
+        with patch.dict(os.environ, env, clear=True):
+            proxies = requests.utils.get_environ_proxies(
+                "https://finance.sina.com.cn/"
+            )
+
+        self.assertEqual(proxies, {})
+
+    def test_stock_common_honors_case_insensitive_marker_and_proxy_keys(self):
+        with patch.dict(
+            os.environ,
+            {
+                "stock_crawl_no_proxy": "ON",
+                "Https_Proxy": "http://mixed-http",
+                "All_Proxy": "socks5://mixed-all",
+            },
+            clear=True,
+        ):
+            stock_crawl_common.strip_proxy_env()
+
+            self.assertNotIn("Https_Proxy", os.environ)
+            self.assertNotIn("All_Proxy", os.environ)
+            self.assertEqual(os.environ["NO_PROXY"], "*")
+            self.assertEqual(os.environ["STOCK_CRAWL_NO_PROXY"], "1")
 
     def test_runner_stops_at_first_failure_without_using_a_shell(self):
         calls = []
@@ -66,8 +131,12 @@ class RefreshWorkflowTest(unittest.TestCase):
         self.assertEqual([command[0] for command in commands], [python] * 4)
         self.assertEqual(commands[0], [python, "-B", "-m", "scrapy", "crawl", "jijin"])
         self.assertEqual(
-            [command[-1] for command in commands[1:]],
-            ["fund_fetch_data.py", "fund_technical_analysis.py", "fund_generate_output.py"],
+            commands[1:],
+            [
+                [python, "-B", "-m", "fund.fund_fetch_data"],
+                [python, "-B", "-m", "fund.fund_technical_analysis"],
+                [python, "-B", "-m", "fund.fund_generate_output"],
+            ],
         )
 
     def test_fund_refresh_syncs_config_and_passes_no_proxy_environment(self):
@@ -95,7 +164,7 @@ class RefreshWorkflowTest(unittest.TestCase):
         self.assertNotIn("HTTP_PROXY", calls[0][1]["env"])
 
     def test_fund_refresh_honors_legacy_no_proxy_environment_flag(self):
-        with patch.dict(os.environ, {"FUND_CRAWL_NO_PROXY": "1"}), patch.object(
+        with patch.dict(os.environ, {"fund_crawl_no_proxy": "ON"}), patch.object(
             fund_data_refresh,
             "refresh_fund_data",
             return_value=0,
@@ -180,6 +249,90 @@ class RefreshWorkflowTest(unittest.TestCase):
             self.assertFalse(any(key.lower() == "https_proxy" for key in env))
             self.assertEqual(env["STOCK_CRAWL_NO_PROXY"], "1")
             self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
+
+    def test_stock_data_refresh_applies_marker_to_local_and_child_steps(self):
+        child_environments = []
+        local_environments = []
+
+        def fake_run_step(name, command, *, timeout, env=None, skip=False):
+            child_environments.append(dict(env or {}))
+            return stock_data_refresh.StepResult(
+                name,
+                " ".join(command),
+                True,
+                0,
+                0.0,
+                skipped=skip,
+            )
+
+        def fake_local_step(name, command, func):
+            local_environments.append(dict(os.environ))
+            return stock_data_refresh.StepResult(name, command, True, 0, 0.0)
+
+        health = {
+            "hot_money_history_stale_count": 0,
+            "hot_money_history_stale_details": [],
+        }
+        with patch.dict(
+            os.environ,
+            {
+                "STOCK_CRAWL_NO_PROXY": "yes",
+                "Https_Proxy": "http://mixed-http",
+                "All_Proxy": "socks5://mixed-all",
+            },
+            clear=True,
+        ), patch.object(
+            stock_data_refresh,
+            "run_step",
+            side_effect=fake_run_step,
+        ), patch.object(
+            stock_data_refresh,
+            "local_step_result",
+            side_effect=fake_local_step,
+        ), patch.object(
+            stock_data_refresh,
+            "collect_data_health",
+            return_value=health,
+        ), patch.object(
+            stock_data_refresh,
+            "write_json_file",
+        ):
+            report = stock_data_refresh.refresh_before_server(mode="quick")
+
+        self.assertTrue(report["ok"])
+        self.assertTrue(child_environments)
+        self.assertTrue(local_environments)
+        for env in child_environments + local_environments:
+            self.assertFalse(
+                any(
+                    key.lower() in {"http_proxy", "https_proxy", "all_proxy"}
+                    for key in env
+                )
+            )
+            self.assertEqual(env["NO_PROXY"], "*")
+            self.assertEqual(env["STOCK_CRAWL_NO_PROXY"], "1")
+
+    def test_stock_data_refresh_main_honors_no_proxy_environment_marker(self):
+        with patch.dict(
+            os.environ,
+            {"stock_crawl_no_proxy": "true"},
+            clear=True,
+        ), patch.object(
+            stock_data_refresh,
+            "refresh_before_server",
+            return_value={"ok": True},
+        ) as refresh, patch.object(
+            stock_data_refresh.sys,
+            "argv",
+            ["stock_data_refresh.py", "--mode", "quick"],
+        ), patch("builtins.print"):
+            stock_data_refresh.main()
+
+        refresh.assert_called_once_with(
+            mode="quick",
+            timeout=None,
+            no_proxy=True,
+        )
 
     def test_resolve_python_keeps_the_active_interpreter_across_platforms(self):
         with tempfile.TemporaryDirectory() as tmpdir:

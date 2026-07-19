@@ -291,6 +291,7 @@ body.radar-modal-open { overflow: hidden; }
   display: inline-flex;
   z-index: 5;
 }
+.industry-filter.is-open { z-index: 10; }
 .industry-filter-trigger {
   max-width: 280px;
   min-height: 32px;
@@ -453,6 +454,60 @@ body.radar-modal-open { overflow: hidden; }
   font-size: 12px;
 }
 
+.pattern-filter-trigger { max-width: 240px; }
+.pattern-filter-panel {
+  width: 520px;
+  max-width: min(520px, calc(100vw - 48px));
+}
+.pattern-filter-tools {
+  justify-content: flex-start;
+  flex-wrap: wrap;
+}
+.pattern-preset.buy { color: #167847; background: #edf9f2; border-color: #bfe6cf; }
+.pattern-preset.sell { color: #b6372d; background: #fff1ef; border-color: #f1c3bd; }
+.pattern-preset.rally { color: #a45b00; background: #fff6e6; border-color: #f0d19d; }
+.pattern-preset.buy:hover { color: #0f653b; border-color: #60bd87; }
+.pattern-preset.sell:hover { color: #982b23; border-color: #e58f84; }
+.pattern-preset.rally:hover { color: #864a00; border-color: #dda94e; }
+.pattern-preset.is-active {
+  font-weight: 700;
+  box-shadow: inset 0 0 0 1px currentColor;
+}
+.pattern-option {
+  grid-template-columns: 18px 38px minmax(0, 1fr) auto auto;
+}
+.pattern-option-code {
+  font-weight: 750;
+  color: #5d49b8;
+}
+.pattern-option-category {
+  border-radius: 999px;
+  padding: 1px 7px;
+  background: #f0edff;
+  color: #6750c9;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.pattern-chip.buy { border-color: #bfe6cf; background: #edf9f2; color: #167847; }
+.pattern-chip.sell { border-color: #f1c3bd; background: #fff1ef; color: #b6372d; }
+.pattern-chip.rally { border-color: #f0d19d; background: #fff6e6; color: #a45b00; }
+
+@media (max-width: 960px) and (min-width: 721px) {
+  .pattern-filter-panel {
+    position: fixed;
+    left: 14px;
+    right: 14px;
+    top: 132px;
+    width: auto;
+    max-width: none;
+  }
+}
+
+@media (max-width: 720px) {
+  .pattern-option { grid-template-columns: 18px 38px minmax(0, 1fr) auto; }
+  .pattern-option-category { display: none; }
+}
+
 @media (max-width: 720px) {
   .radar-signal-guide { width: 100%; min-width: 0; max-width: none; }
   .radar-score-guide {
@@ -525,7 +580,7 @@ table.radar-grid td.pats { white-space: nowrap; }
   background: var(--panel-soft);
   color: var(--muted);
 }
-.pat.pg { background: #eaf7ef; color: #14804a; font-weight: 700; }   /* 有效吸筹买点 */
+.pat.pg { background: #eaf7ef; color: #14804a; font-weight: 700; }   /* 生产买点 */
 .pat.py { background: #fbf3df; color: #8a6d1f; font-weight: 700; }   /* 黄(备用) */
 .pat.po { background: #fdeede; color: #b4530e; font-weight: 700; }   /* 有效超短动量 */
 .pat.pr { background: #fdebe4; color: #b3340f; font-weight: 700; }   /* 有效负向风险/出货风控 */

@@ -15,14 +15,14 @@ ambush 吸筹分（十三项 0~100 原始分直接加权）：
   P3    缩量收盘大跌后首次完整收复                     权重 0.10
   P5    双底右腿确认                                  权重 0.05（临时核心有效，小盘更有效）
   P21   深破缩量收回                                  权重 0.10
-  P23   低位压缩温和量能转强                           权重 0.05（实验形态）
+  P23   低位压缩温和量能转强                           权重 0.05（核心有效）
   P24   OBV底背离连续确认后的首次成立                   权重 0.05
-  P25   中低位缩量平台价格转强                         权重 0.05（双池10/20日正向）
+  P25   中低位缩量平台价格转强                         权重 0.05（双池10/20日正向，核心有效）
   户数  股东户数下降                                  权重 0.10
   回购  近90日公司回购                                权重 0.05
 旧四技术因子加权分及其一字板/派发/P20折扣已删除；出货风险只在机会分中单独折扣。
 
-另叠加「游资形态匹配」(规格见 meta_data_backup/hot_money_patterns.md)：把游资坐庄的「吸筹→试盘→
+另叠加「游资形态匹配」：把游资坐庄的「吸筹→试盘→
 洗盘→突破→拉升→出货」六段套路编码成 match_patterns() 的布尔匹配器，给每只票打形态标签，再由
 _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstring）。
 
@@ -75,10 +75,10 @@ _pattern_phase() 汇总成一个主导阶段（详见下表 + 该函数 docstrin
   P26 获利盘冲高回撤风险 获利盘≥90%或5日前<40%且当前≥60% + 当日量≥前20日均量2倍
                        + 近5日涨≥5% + 收盘较近10日最高价回撤≥3%；双池覆盖与负向效果通过复测
 
-当前跨池核心有效集（P15/P21于2026-07-15按双池复测加入，P5为产品口径临时有效）：
-P1、P2、P3、P5、P11、P12、P13、P14、P15、P16、P17、P19、P20、P21、P22、P24、P26。
+当前跨池核心有效集（P15/P21于2026-07-15按双池复测加入，P5/P23/P25含产品口径决定）：
+P1、P2、P3、P5、P11、P12、P13、P14、P15、P16、P17、P19、P20、P21、P22、P23、P24、P25、P26。
 P6、P7 保留命中数据用于后续研究，但不作为有效因子或前端高亮。
-P1/P3/P21各占吸筹分10%；P2/P5/P23/P24/P25各占5%，其中P23/P25仍保留实验标签。
+P1/P3/P21各占吸筹分10%；P2/P5/P23/P24/P25各占5%。
 ─────────────────────────────────────────────────────────────────────────────
 
 Modes:
@@ -376,6 +376,8 @@ alpha。**根因疑为 universe 错配**：游资/主力打的是小盘低流通
        洗盘阶段标签/买点，不改变吸筹总分权重；固定窗口与既有量能上下文使复杂度仍为O(LOOKBACK)。
  36) 【2026-07-17生产展示与权重调整】按产品决定，因子描述与命中形态解释明确标注P1/P5小盘更有效、
      P2大盘更有效；吸筹分中P5由10%降至5%，P21由5%提高到10%，其余权重不变，总权重仍为100%。
+ 37) 【2026-07-19 P23/P25生产有效性口径】按产品决定，将P23/P25加入PATTERN_EFFECTIVE并使用bullish样式；
+     两者各占吸筹分5%、既有判据与历史回测数据不变，研究显著性限制继续保留在上述历史记录中。
 ═══════════════════════════════════════════════════════════════════════════════
 """
 
@@ -575,7 +577,7 @@ ACCUM_MODEL_WEIGHTS = {
     "p3": 0.1,                          # P3 缩量收盘大跌后首次收复
     "p5": 0.05,                         # P5 双底右腿确认；临时核心有效，小盘更有效
     "p21": 0.1,                         # P21 深破箱底后缩量收回
-    "p23": 0.05,                        # P23 低位压缩后温和量能转强；实验形态
+    "p23": 0.05,                        # P23 低位压缩后温和量能转强；核心有效
     "p24": 0.05,                        # P24 OBV 底背离：连续确认后的首次成立日
     "p25": 0.05,                        # P25 中低位缩量平台价格转强；双池10/20日正向
     "holder_change": 0.1,               # 股东户数变化：户数降=高分，缺失=中性50
@@ -643,8 +645,8 @@ PHASE_ORDER: Tuple[str, ...] = (
     "观望⚪",
 )
 
-# 形态回测的生产买点：命中任一代码即标记买入。该集合与形态是否属于
-# PATTERN_EFFECTIVE（统计验证标签）相互独立，P23/P25 可按产品口径参与买点。
+# 形态回测的生产买点：命中任一代码即标记买入。该集合与有效性元数据
+# 分开维护，避免回测标记规则被前端展示逻辑隐式改写。
 PATTERN_BACKTEST_BUY = frozenset({"P1", "P2", "P3", "P5", "P21", "P23", "P24", "P25"})
 
 # 出货预警：下列任一形态命中即触发。按代码去重后每项记1分；保留两个阈值
@@ -1665,7 +1667,7 @@ def _breakout_trigger(bars: List[Dict[str, Any]], vol: List[Optional[float]]) ->
     return triggered, {"breakout": bool(broke), "vol_confirm": vol_confirm, "base_pctile": round(base_pctile, 2)}
 
 
-# ── 游资形态匹配器（P1-P26，规格见 meta_data_backup/hot_money_patterns.md）──────────
+# ── 游资形态匹配器（P1-P26）──────────────────────────────────────
 # 每个匹配器输入 (bars, ctx) 返回 bool（命中），PIT 安全（只用窗口内 bar）。
 # 信号方向：buy=吸筹/洗盘(左侧) · hold=拉升(只标记不追) · sell=出货(风控/回避)
 #          · observe=中性结构观察（不驱动主导阶段）。
@@ -3126,7 +3128,7 @@ PATTERNS: List[Tuple[str, str, str, str, Any]] = [
     ("P20", "均线放量破位", "出货", "sell", _pat_ma_breakdown),
     ("P21", "深破缩量收回", "洗盘", "buy", _pat_spring_reclaim),     # 双池10~40日正向，核心洗盘买点
     ("P22", "放量假突破", "出货", "sell", _pat_failed_breakout),     # 全历史逐日复测：双池2~40日风控有效
-    ("P23", "低位压缩温和量能转强", "吸筹", "buy", _pat_compression),  # 10日实验信号，不进入核心有效集
+    ("P23", "低位压缩温和量能转强", "吸筹", "buy", _pat_compression),  # 10日正向，核心有效买点
     ("P24", "OBV底背离", "吸筹", "buy", _pat_obv_divergence),        # 强OBV背离，连续5日后一次性确认
     ("P25", "中低位缩量平台转强", "吸筹", "buy", _pat_bottom_base_ignition),
     ("P26", "获利盘风险", "出货", "sell", _pat_chip_winner_risk),
@@ -3156,17 +3158,17 @@ PATTERN_DESC: Dict[str, str] = {
     "P20": "收盘跌破MA20(第5根bar仍在当时MA20上方) + 近5/此前20日量能比>1.3 + 当日跌≥1%：确认放量破位；全历史复测双池命中率1.08%/1.41%，2~40日胜率<50%且负超额",
     "P21": "近5日最低价深破前40日箱底至少2.5%，当前收盘重新站回，且信号日量能不高于此前20日均值的0.75倍：供给枯竭后的Wyckoff spring；全历史复测双池10/20/40日胜率与同池超额均为正，进入吸筹分10%",
     "P22": "今日盘中破前40日高但收盘没站上 + 当日放量>1.8×：放量假突破(高位拒绝)；全历史逐日复测：双池2~40日风控有效",
-    "P23": "位置<0.36 + 近20/60日振幅比<0.96 + 收盘≥1.005×MA20，只在该结构状态首次成立且信号日量能/此前20日均量在0.4~1.2时触发；冻结快照复核覆盖率leader/hotmoney 0.678%/0.749%，10日胜率51.83%/52.19%、同池超额+0.331%/+0.529%，继续作10日实验信号并进入吸筹分5%",
+    "P23": "位置<0.36 + 近20/60日振幅比<0.96 + 收盘≥1.005×MA20，只在该结构状态首次成立且信号日量能/此前20日均量在0.4~1.2时触发；冻结快照生产等价复测覆盖率leader/hotmoney 0.678%/0.749%，10日胜率51.83%/52.19%、同池超额+0.331%/+0.529%；按产品口径纳入核心有效集并进入吸筹分5%",
     "P24": "位置<0.50 + 30日涨幅≤3% + 量纲化OBV>0.10 + OBV价差>0.25，连续5日后仅首次确认；最新复测双池10日有效",
-    "P25": "双池计算并进入吸筹分5%：120日价格分位≤65% + 60日振幅≤35%且涨跌≤16% + 近20日/前40日均量≤70% + 量能斜率≤-0.5% + 20日涨幅≥0.5% + 距20日平台≤4%；全历史命中率leader/hotmoney 1.326%/1.254%，10日胜率52.4%/53.7%、同池超额+0.24%/+0.55%，方向跨早晚段为正但leader HAC未显著",
+    "P25": "双池计算并进入吸筹分5%：120日价格分位≤65% + 60日振幅≤35%且涨跌≤16% + 近20日/前40日均量≤70% + 量能斜率≤-0.5% + 20日涨幅≥0.5% + 距20日平台≤4%；全历史复测命中率leader/hotmoney 1.326%/1.254%，10日胜率52.4%/53.7%、同池超额+0.24%/+0.55%，方向跨早晚段为正但leader HAC未显著；按产品口径纳入核心有效集",
     "P26": "获利盘比例≥90%，或5个交易日前<40%且当前≥60%；同时要求当日量能≥此前20日均量2倍、近5日涨幅≥5%、当前收盘较近10日盘中高点回撤≥3%：只把急涨后的极端放量回撤升级为兑现风险。全历史复测命中率leader/hotmoney 0.631%/0.995%，双池2~40日胜率均<50%且同池超额均为负；leader 40日HAC尚未显著",
 }
 
 # 当前生产核心有效形态（前端高亮）：P1/P2按2026-07-13双池复测与产品决定加入；
-#   P12/P13 为超短动量，P1/P2/P3/P5/P21/P24 为吸筹/洗盘买点，P26为获利盘兑现风险，
+#   P12/P13 为超短动量，P1/P2/P3/P5/P21/P23/P24/P25 为吸筹/洗盘买点，P26为获利盘兑现风险，
 #   其余为负向风险/出货风控；P1/P3/P21各占吸筹分10%，
-#   P2/P5/P23/P24/P25各占5%；P23/P25仍保留实验标签。
-PATTERN_EFFECTIVE = {"P1", "P2", "P3", "P5", "P11", "P12", "P13", "P14", "P15", "P16", "P17", "P19", "P20", "P21", "P22", "P24", "P26"}
+#   P2/P5/P23/P24/P25各占5%。
+PATTERN_EFFECTIVE = {"P1", "P2", "P3", "P5", "P11", "P12", "P13", "P14", "P15", "P16", "P17", "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26"}
 # “有效卖出形态”取核心有效集与结构 sell 信号的交集。P11 虽为统计负向
 # risk 样式，但原始结构是 hold；P18 仍只作形态观察。
 PATTERN_EFFECTIVE_SELL = frozenset(
@@ -3190,7 +3192,9 @@ PATTERN_EFFECTIVE_STYLE = {
     "P20": "risk",
     "P21": "bullish",
     "P22": "risk",
+    "P23": "bullish",
     "P24": "bullish",
+    "P25": "bullish",
     "P26": "risk",
 }
 
@@ -3238,17 +3242,20 @@ def pattern_catalog() -> List[Dict[str, Any]]:
 
         if code in PATTERN_EFFECTIVE:
             validation_status, validation_label = "core", "核心有效"
-        elif code == "P23":
-            validation_status, validation_label = "experimental", "双池10日实验"
-        elif code == "P25":
-            validation_status, validation_label = "experimental", "双池10/20日正向"
         else:
             validation_status, validation_label = "observation", "形态观察"
 
+        # 展示颜色表达生产信号方向；有效性与验证标签仍由独立字段明确输出。
+        display_style = (
+            "bullish"
+            if code in PATTERN_BACKTEST_BUY
+            else PATTERN_EFFECTIVE_STYLE.get(code, "neutral")
+        )
         out.append({
             "code": code, "name": name, "category": category, "signal": signal,
             "desc": PATTERN_DESC.get(code, ""), "effective": code in PATTERN_EFFECTIVE,
             "effective_style": PATTERN_EFFECTIVE_STYLE.get(code, "neutral"),
+            "display_style": display_style,
             "production": True, "score_usage": score_usage,
             "validation_status": validation_status, "validation_label": validation_label,
         })
@@ -3265,10 +3272,10 @@ def scoring_model_catalog() -> Dict[str, Any]:
         "p3": ("P3 缩量打压首次收复", "低位缩量收盘大跌后，事件后从未站回且收盘最多再破底6%，当日首次完整收回下跌前收盘。"),
         "p5": ("P5 双底右腿确认", "二底形成后回到颈线，并首次突破近3日收盘高点；小盘更有效，按产品决定暂时纳入核心有效集，命中计5分。"),
         "p21": ("P21 深破缩量收回", "价格深破前40日箱底后重新站回，且信号日缩量；命中按10分计入。"),
-        "p23": ("P23 低位压缩温和量能转强（实验）", "低位波动压缩后站上MA20，并由温和量能确认；命中按5分计入。"),
+        "p23": ("P23 低位压缩温和量能转强", "低位波动压缩后站上MA20，并由温和量能确认；核心有效，命中按5分计入。"),
         "p24": ("P24 OBV底背离", "价格仍在低位，量纲化OBV持续走强并连续确认后首次触发。"),
         "p1": ("P1 超额优先复合确认", "原低位缩量企稳两日首次确认，或低位首次突破前10日最高收盘并通过510310日终风险门；小盘更有效，双池命中计10分。"),
-        "p25": ("P25 缩量平台转强（双池实验）", "双池命中均计5分；中低位缩量平台的20日价格开始转正并接近平台。双池10/20日胜率和同池超额方向为正，但leader尚未达到HAC显著。"),
+        "p25": ("P25 缩量平台转强", "双池命中均计5分；中低位缩量平台的20日价格开始转正并接近平台。核心有效；双池10/20日胜率和同池超额方向为正，但leader尚未达到HAC显著。"),
         "holder_change": ("股东户数变化", "户数下降得分更高；-15%映射100分、+15%映射0分，缺失按50分。"),
         "repurchase": ("近90日回购", "近90个自然日有回购公告得100分，否则0分。"),
     }
@@ -3281,7 +3288,7 @@ def scoring_model_catalog() -> Dict[str, Any]:
         "p20": ("P20 均线放量破位", "此前位于MA20上方，随后放量跌破均线。"),
         "p22": ("P22 放量假突破", "盘中突破前高但收盘未站稳，同时明显放量。"),
         "p26": ("P26 获利盘冲高回撤风险", "获利盘拥挤或快速转盈后出现极端放量；近5日已有快速拉升、当前又从近10日盘中高点回撤至少3%，确认强势延续已转为兑现风险。"),
-        "lhb_recent": ("近90日龙虎榜", "近期上榜常伴随异动和交易拥挤，作为反转避雷信号。"),
+        "lhb_recent": ("近90日龙虎榜", "近期上榜常伴随异动和交易拥挤，提示波动加剧。"),
         "technical": ("连续技术派发", "高位门控后，综合20日涨幅和高位放量计算连续风险分。"),
         "divergence": ("原始量价背离", "成交投入大而价格反馈弱，说明资金推动效率下降。"),
     }
@@ -4215,7 +4222,7 @@ def _attach_capital_evidence(row: Dict[str, Any]) -> None:
     if row.get("repurchase_recent"):
         ev.append({"label": "公司回购中", "kind": "bullish"})
     if row.get("lhb_recent"):
-        ev.append({"label": "近期上龙虎榜(避雷)", "kind": "bearish"})
+        ev.append({"label": "近期上龙虎榜，波动加剧", "kind": "bearish"})
 
 
 # ── 游资池超短反转分（hotmoney 专用，纪要14）──────────────────
@@ -4238,7 +4245,7 @@ REVERSAL_FEATURES = tuple(REVERSAL_WEIGHTS)
 #   · 前半强 regime 单日略优(平滑稀释最新极值)。ema3 = 稳健补丁(二阶,前半几乎不掉、近段/favorable 吃增益)。
 REVERSAL_SMOOTH_DAYS = 3
 
-# 潜伏妖股筛选(latent 模式，研究见 meta_data_backup/hot_money_latent_hunting_research.md)：
+# 潜伏妖股筛选（latent 模式）：
 #   从"太极 2022 式"左侧指纹反推——低位 + 安静(没被发现) + 吸筹指纹 + 妖股基因 + 真吸筹证据。
 #   ⚠️ 左侧买入侧本就弱/慢(IC~0.04, regime 依赖, 纪要12)→ 这是观察名单，不是买点触发器。
 LATENT_MAX_POS = 0.35           # 收盘价近60日分位上限(左侧低位)
@@ -5060,7 +5067,7 @@ def _print_ambush_summary(payload: Dict[str, Any]) -> None:
     cc = payload.get("capital_counts") or {}
     if payload.get("capital_available"):
         print(f"  资金面(纪要13): 户数下降{cc.get('holder_down',0)} · 回购中{cc.get('repurchase',0)}"
-              f" · 上龙虎榜避雷{cc.get('lhb_avoid',0)} · 户数/回购已并入吸筹总分 · 排序=机会分")
+              f" · 近期龙虎榜波动提示{cc.get('lhb_avoid',0)} · 户数/回购已并入吸筹总分 · 排序=机会分")
     print(f"  落盘: {display_path(AMBUSH_RESULT_FILE)}")
     print(f"  {_theme_freshness_note(payload.get('theme_source') or {})}")
     print("-" * 112)
@@ -6674,7 +6681,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
     payload = base_payload("accumulation", len(candidates), pool=pool)
     payload.update({
         "status": "ok" if samples else "empty",
-        "description": "吸筹总分权重实验：用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分直接加权，不用截面 rank 合成线上分数。P23/P25保留实验标签，但按生产口径参与计分。",
+        "description": "吸筹总分权重实验：用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分直接加权，不用截面 rank 合成线上分数。P23/P25按核心有效口径参与计分。",
         "params": {
             "horizons": list(ACCUM_EXPERIMENT_HORIZONS),
             "step": VERIFY_STEP,
@@ -6788,7 +6795,7 @@ def run_accumulation_experiment(max_cap: Optional[float] = None, pool: str = DEF
             "recommended_model": recommended,
         },
         "notes": [
-            "线上吸筹总分使用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分按权重相加；P23/P25保留实验标签，但按生产口径参与计分。",
+            "线上吸筹总分使用 chip、position、cmf_eff、P1、P2、P3、P5、P21、P23、P24、P25、股东户数变化、公司回购十三个原始分按权重相加；P23/P25按核心有效口径参与计分。",
             "实验里的 RankIC 仅用于评价分数排序能力；高低差是高分五分位相对低分五分位的未来超额收益差。",
         ],
     })
@@ -6971,7 +6978,6 @@ def run_latent(as_of: Optional[str] = None, max_cap: Optional[float] = None,
             "max_distribution": LATENT_MAX_DIST, "weights": LATENT_WEIGHTS,
             "holder_bonus": LATENT_HOLDER_BONUS, "repurchase_bonus": LATENT_REPO_BONUS,
             "gene_lookback_years": LATENT_GENE_LOOKBACK_YEARS,
-            "research": "meta_data_backup/hot_money_latent_hunting_research.md",
         },
         "screened_count": len(survivors),
         "pool_size": len(rows),

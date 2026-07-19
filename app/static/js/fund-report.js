@@ -190,7 +190,7 @@
           if (!resp.ok) throw new Error(payload.error || "读取失败");
           originalContent = payload.content || "";
           codeInput.value = originalContent;
-          if (pathLabel) pathLabel.textContent = payload.path || "funds.py";
+          if (pathLabel) pathLabel.textContent = payload.path || "fund/funds.py";
           setEditorStatus("已加载");
           renderHighlight();
         } catch (error) {

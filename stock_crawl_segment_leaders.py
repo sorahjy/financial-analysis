@@ -199,6 +199,8 @@ FORCED_SEGMENT_LEADER_CODES = [ # 筛完各 SW3 topN 后仍强制纳入其所属
     # 社会主义护城河
     "601766",  # 中国中车 *
     "601816",  # 京沪高铁
+    #
+    "002579",  # 中京电子
 ]
 
 DEFAULT_POOL_MAX_AGE_DAYS = 14

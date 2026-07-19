@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import argparse
-import os
 import shutil
 import sys
 from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Mapping
 
-from refresh_workflow import Runner, Step, build_child_environment, run_steps
+from refresh_workflow import (
+    Runner,
+    Step,
+    build_child_environment,
+    is_no_proxy_enabled,
+    run_steps,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -16,16 +21,16 @@ SCRAPY_CACHE_DIR = ROOT / ".scrapy" / "httpcache" / "jijin"
 
 
 def _env_flag(name: str) -> bool:
-    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+    return is_no_proxy_enabled(name)
 
 
 def build_refresh_steps(python_executable: str | None = None) -> list[Step]:
     python = python_executable or sys.executable
     return [
         ("抓取基金概况", [python, "-B", "-m", "scrapy", "crawl", "jijin"]),
-        ("抓取基金净值与实时估算", [python, "-B", "fund_fetch_data.py"]),
-        ("计算基金技术指标", [python, "-B", "fund_technical_analysis.py"]),
-        ("生成基金报告数据", [python, "-B", "fund_generate_output.py"]),
+        ("抓取基金净值与实时估算", [python, "-B", "-m", "fund.fund_fetch_data"]),
+        ("计算基金技术指标", [python, "-B", "-m", "fund.fund_technical_analysis"]),
+        ("生成基金报告数据", [python, "-B", "-m", "fund.fund_generate_output"]),
     ]
 
 

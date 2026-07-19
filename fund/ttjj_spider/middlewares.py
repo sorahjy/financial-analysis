@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Define here the models for your spider middleware
+# Define here the middleware for the fund spider
 #
 # See documentation in:
 # https://doc.scrapy.org/en/latest/topics/spider-middleware.html

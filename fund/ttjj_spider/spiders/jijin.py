@@ -4,7 +4,7 @@ import os
 import json
 
 from lxml import etree
-from ttjj_spider.items import MyItem
+from fund.ttjj_spider.items import MyItem
 
 
 def _first(values, default=''):
@@ -36,7 +36,7 @@ class JijinSpider(scrapy.Spider):
             with open(self.fund_codes_file, 'r', encoding='utf-8') as fin:
                 fund_codes = json.load(fin)
         except FileNotFoundError:
-            self.logger.error('%s 不存在，请先通过基金编辑器保存配置或运行 fund_data_refresh.py', self.fund_codes_file)
+            self.logger.error('%s 不存在，请先通过基金编辑器保存配置或运行 python fund_data_refresh.py', self.fund_codes_file)
             return
         except json.JSONDecodeError as exc:
             self.logger.error('%s 不是合法 JSON: %s', self.fund_codes_file, exc)

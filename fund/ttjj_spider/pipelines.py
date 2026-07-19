@@ -8,7 +8,7 @@
 import json
 import os
 
-from fund_storage import connect as connect_fund_db, save_profile_snapshots
+from fund.fund_storage import connect as connect_fund_db, save_profile_snapshots
 # from pymongo import MongoClient
 
 

@@ -57,7 +57,7 @@
         <div class="radar-formula-hero"><span>范围 0–100</span><strong id="radar-opportunity-formula">机会分 = 吸筹百分位 ×（1 − 0.5 × 出货百分位 ÷ 100）</strong><p id="radar-opportunity-description">吸筹与出货原始分分别在当前候选池内换算成横截面百分位；同分共享平均名次，出货最多折掉一半吸筹强度。</p></div>
         <div id="radar-score-example" class="radar-score-example" aria-label="机会分计算示例"><div><small>吸筹百分位</small><strong>90</strong></div><span>×</span><div><small>风险保留系数</small><strong>0.80</strong></div><span>=</span><div class="result"><small>机会分</small><strong>72</strong></div></div>
         <div class="radar-insight-grid">
-          <article class="radar-insight-card accent-green"><div class="radar-card-title"><span>01</span><div><h3>先算吸筹原始分</h3><p>13项原始特征直接加权</p></div></div><div id="radar-accumulation-weights" class="radar-weight-list"><p><b>5%</b><span>近90日回购</span></p><p><b>10%</b><span>筹码集中</span></p><p><b>10%</b><span>价格位置</span></p><p><b>10%</b><span>CMF反向分</span></p><p><b>10%</b><span>股东户数变化</span></p><p><b>10%</b><span>P1 超额优先复合确认</span></p><p><b>10%</b><span>P3 缩量打压首次收复</span></p><p><b>10%</b><span>P21 深破缩量收回</span></p><p><b>5%</b><span>P2 低位长下影承接</span></p><p><b>5%</b><span>P5 双底右腿确认（临时有效）</span></p><p><b>5%</b><span>P23 低位压缩温和量能转强</span></p><p><b>5%</b><span>P24 OBV底背离</span></p><p><b>5%</b><span>P25 缩量平台转强（双池实验）</span></p></div></article>
+          <article class="radar-insight-card accent-green"><div class="radar-card-title"><span>01</span><div><h3>先算吸筹原始分</h3><p>13项原始特征直接加权</p></div></div><div id="radar-accumulation-weights" class="radar-weight-list"><p><b>5%</b><span>近90日回购</span></p><p><b>10%</b><span>筹码集中</span></p><p><b>10%</b><span>价格位置</span></p><p><b>10%</b><span>CMF反向分</span></p><p><b>10%</b><span>股东户数变化</span></p><p><b>10%</b><span>P1 超额优先复合确认</span></p><p><b>10%</b><span>P3 缩量打压首次收复</span></p><p><b>10%</b><span>P21 深破缩量收回</span></p><p><b>5%</b><span>P2 低位长下影承接</span></p><p><b>5%</b><span>P5 双底右腿确认（临时有效）</span></p><p><b>5%</b><span>P23 低位压缩温和量能转强</span></p><p><b>5%</b><span>P24 OBV底背离</span></p><p><b>5%</b><span>P25 缩量平台转强</span></p></div></article>
           <article class="radar-insight-card accent-red"><div class="radar-card-title"><span>02</span><div><h3>再算出货原始分</h3><p>11项风险特征直接加权</p></div></div><div id="radar-distribution-weights" class="radar-weight-list"><p><b>5%</b><span>P14 高位放量滞涨</span></p><p><b>5%</b><span>P15 新高量背离放量回撤</span></p><p><b>5%</b><span>P20 均线放量破位</span></p><p><b>5%</b><span>P22 放量假突破</span></p><p><b>10%</b><span>P16 阴天量</span></p><p><b>10%</b><span>P17 倒V反转</span></p><p><b>10%</b><span>P19 灌压巨量大阴</span></p><p><b>10%</b><span>P26 获利盘风险</span></p><p><b>10%</b><span>近90日龙虎榜</span></p><p><b>15%</b><span>连续技术派发</span></p><p><b>15%</b><span>原始量价背离</span></p></div></article>
         </div>
         <aside class="radar-insight-note"><strong>读分数时注意</strong><p id="radar-opportunity-sorting">机会分表达的是候选池内的相对位置，不是上涨概率。细分龙头池按机会分排序；游资小盘池按三日平滑反转分排序，机会分仅作辅助观察。</p></aside>
@@ -69,7 +69,7 @@
     <section class="radar-insight-dialog radar-factor-dialog" role="dialog" aria-modal="true" aria-labelledby="radar-factor-modal-title" tabindex="-1">
       <header class="radar-insight-head"><div><span class="radar-insight-kicker">Factor guide</span><h2 id="radar-factor-modal-title">因子解读</h2><p>覆盖当前雷达页面实际运行的评分因子、生产形态与辅助判断。</p></div><button class="radar-insight-close" type="button" data-radar-modal-close aria-label="关闭">×</button></header>
       <div class="radar-insight-body">
-        <div class="radar-factor-summary" aria-label="生产因子范围"><div><strong id="radar-scoring-factor-count">29</strong><span>评分因子</span></div><div><strong id="radar-pattern-factor-count">26</strong><span>生产形态</span></div><div><strong id="radar-effective-pattern-count">17</strong><span>核心有效形态</span></div><p><b>计分</b>会改变排序；<b>阶段标签</b>只描述当前结构；<b>核心有效</b>表示当前生产有效性口径。</p></div>
+        <div class="radar-factor-summary" aria-label="生产因子范围"><div><strong id="radar-scoring-factor-count">29</strong><span>评分因子</span></div><div><strong id="radar-pattern-factor-count">26</strong><span>生产形态</span></div><div><strong id="radar-effective-pattern-count">19</strong><span>核心有效形态</span></div><p><b>计分</b>会改变排序；<b>阶段标签</b>只描述当前结构；<b>核心有效</b>表示当前生产有效性口径。</p></div>
         <section class="radar-factor-section"><div class="radar-section-heading"><span class="green">吸筹</span><div><h3>机会的来源</h3><p>13项原始特征直接加权合成吸筹分；P1/P3/P21各占10%，P2/P5/P23/P24/P25各占5%。</p></div></div><div id="radar-accumulation-factors" class="radar-factor-grid">
         </div></section>
         <section class="radar-factor-section"><div class="radar-section-heading"><span class="red">出货</span><div><h3>需要折价的风险</h3><p>11项风险特征直接加权，分数越高，机会分折扣越大。</p></div></div><div id="radar-distribution-factors" class="radar-factor-grid">
@@ -109,6 +109,26 @@
     <select id="radar-phase-filter" aria-label="按阶段筛选">
       <option value="">全部阶段</option>
     </select>
+    <div id="radar-pattern-filter" class="industry-filter pattern-filter">
+      <button id="radar-pattern-trigger" class="industry-filter-trigger pattern-filter-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
+        <span class="industry-filter-label">命中形态</span>
+        <span id="radar-pattern-summary" class="industry-filter-summary">全部</span>
+      </button>
+      <div id="radar-pattern-panel" class="industry-filter-panel pattern-filter-panel" hidden>
+        <div class="industry-filter-search">
+          <input id="radar-pattern-search" type="search" placeholder="搜索 P编号 / 形态名称">
+        </div>
+        <div id="radar-pattern-selected" class="industry-selected pattern-selected"></div>
+        <div class="industry-filter-tools pattern-filter-tools">
+          <button id="radar-pattern-buy" class="mini-link pattern-preset buy" type="button" aria-pressed="false">全选买入</button>
+          <button id="radar-pattern-sell" class="mini-link pattern-preset sell" type="button" aria-pressed="false">全选卖出</button>
+          <button id="radar-pattern-rally" class="mini-link pattern-preset rally" type="button" aria-pressed="false">全选拉升</button>
+          <button id="radar-pattern-select-all" class="mini-link" type="button">全选</button>
+          <button id="radar-pattern-clear" class="mini-link" type="button">清空</button>
+        </div>
+        <div id="radar-pattern-options" class="industry-options pattern-options" role="listbox" aria-label="命中形态多选" aria-multiselectable="true"></div>
+      </div>
+    </div>
     <div id="radar-sw2-filter" class="industry-filter">
       <button id="radar-sw2-trigger" class="industry-filter-trigger" type="button" aria-haspopup="listbox" aria-expanded="false">
         <span id="radar-industry-filter-label" class="industry-filter-label">二级行业</span>

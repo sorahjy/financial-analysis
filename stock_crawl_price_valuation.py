@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import queue
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta
@@ -47,7 +48,6 @@ from stock_crawl_common import (
     merge_records_by_date,
     normalize_history_records,
     prune_snapshot_only_history_records,
-    reset_daily_source_runtime,
     write_json_file,
 )
 
@@ -107,6 +107,201 @@ def _failure_detail(code, name, stage, error):
         "stage": str(stage or "stock_refresh"),
         "error": str(error or "unknown error")[:4000],
     }
+
+
+_LISTING_MARKET_SPECS = {
+    "sh_main": {
+        "label": "上交所主板A股",
+        "code_columns": ("证券代码", "股票代码", "代码"),
+        "name_columns": ("证券简称", "股票简称", "名称"),
+        "date_columns": ("上市日期", "上市时间"),
+    },
+    "sh_star": {
+        "label": "上交所科创板",
+        "code_columns": ("证券代码", "股票代码", "代码"),
+        "name_columns": ("证券简称", "股票简称", "名称"),
+        "date_columns": ("上市日期", "上市时间"),
+    },
+    "sz": {
+        "label": "深交所A股",
+        "code_columns": ("A股代码", "证券代码", "股票代码", "代码"),
+        "name_columns": ("A股简称", "证券简称", "股票简称", "名称"),
+        "date_columns": ("A股上市日期", "上市日期", "上市时间"),
+    },
+    "bj": {
+        "label": "北交所股票",
+        "code_columns": ("证券代码", "股票代码", "代码"),
+        "name_columns": ("证券简称", "股票简称", "名称"),
+        "date_columns": ("上市日期", "上市时间"),
+    },
+}
+
+
+def _listing_market(code):
+    code = str(code).zfill(6)
+    if code.startswith(("4", "8", "9")):
+        return "bj"
+    if code.startswith("68"):
+        return "sh_star"
+    if code.startswith("6"):
+        return "sh_main"
+    return "sz"
+
+
+def _listing_code(value):
+    text = "" if value is None else str(value).strip()
+    if text.endswith(".0") and text[:-2].isdigit():
+        text = text[:-2]
+    matched = re.search(r"(\d{1,6})$", text)
+    return matched.group(1).zfill(6) if matched else ""
+
+
+def _first_existing_column(columns, candidates):
+    return next((column for column in candidates if column in columns), None)
+
+
+def _default_listing_date_fetchers():
+    return {
+        "sh_main": lambda: _retry_fetch(ak.stock_info_sh_name_code, symbol="主板A股"),
+        "sh_star": lambda: _retry_fetch(ak.stock_info_sh_name_code, symbol="科创板"),
+        "sz": lambda: _retry_fetch(ak.stock_info_sz_name_code, symbol="A股列表"),
+        "bj": lambda: _retry_fetch(ak.stock_info_bj_name_code),
+    }
+
+
+def fetch_stock_listing_dates(codes, *, fetchers=None):
+    """批量读取缺失股票的上市日期，返回 ``(resolved, errors)``。
+
+    ``resolved`` 是 ``{code: {name, listing_date}}``；``errors`` 是逐代码错误文本。
+    每个有缺失代码的市场只请求一次，调用方负责只把 DB 中尚无日期的代码传进来。
+    """
+    requested = []
+    seen = set()
+    for value in codes or []:
+        code = _listing_code(value)
+        if code and code not in seen:
+            requested.append(code)
+            seen.add(code)
+    if not requested:
+        return {}, {}
+
+    source_fetchers = fetchers if fetchers is not None else _default_listing_date_fetchers()
+    by_market = {}
+    for code in requested:
+        by_market.setdefault(_listing_market(code), []).append(code)
+
+    resolved = {}
+    errors = {}
+    for market, market_codes in by_market.items():
+        spec = _LISTING_MARKET_SPECS[market]
+        fetcher = source_fetchers.get(market)
+        if fetcher is None:
+            for code in market_codes:
+                errors[code] = f"{spec['label']}上市清单源未配置"
+            continue
+        try:
+            frame = fetcher()
+            if frame is None or getattr(frame, "empty", True):
+                raise RuntimeError("返回空清单")
+            columns = list(getattr(frame, "columns", []))
+            code_column = _first_existing_column(columns, spec["code_columns"])
+            name_column = _first_existing_column(columns, spec["name_columns"])
+            date_column = _first_existing_column(columns, spec["date_columns"])
+            if not code_column or not date_column:
+                raise RuntimeError(
+                    f"字段缺失(code={code_column or '-'}, listing_date={date_column or '-'})"
+                )
+            wanted = set(market_codes)
+            invalid_dates = set()
+            for _, row in frame.iterrows():
+                code = _listing_code(row.get(code_column))
+                if code not in wanted:
+                    continue
+                listing_date = ss.normalize_listing_date(row.get(date_column))
+                if not listing_date:
+                    invalid_dates.add(code)
+                    continue
+                raw_name = row.get(name_column) if name_column else None
+                name = str(raw_name).strip()
+                if name.lower() in {"nan", "nat", "none", "<na>"}:
+                    name = ""
+                resolved[code] = {
+                    "name": name,
+                    "listing_date": listing_date,
+                }
+            for code in market_codes:
+                if code not in resolved:
+                    suffix = "返回的上市日期无效" if code in invalid_dates else "清单未返回该股票"
+                    errors[code] = f"{spec['label']}{suffix}"
+        except Exception as exc:
+            error = _failure_error(exc)
+            for code in market_codes:
+                errors[code] = f"{spec['label']}上市清单抓取失败: {error}"
+    return resolved, errors
+
+
+def resolve_stock_listing_dates(stocks, *, fetcher=None, conn=None, label="股票池"):
+    """读取已缓存上市日期，并且只为缺失代码调用一次批量补齐器。"""
+    normalized_stocks = {
+        str(code).zfill(6): str(name or "")
+        for code, name in (stocks or {}).items()
+    }
+    if not normalized_stocks:
+        return {}, {}
+
+    db = conn or ss.thread_conn()
+    codes = list(normalized_stocks)
+    listing_dates = ss.listing_date_map(db, codes)
+    missing_codes = [code for code in codes if not listing_dates.get(code)]
+    if not missing_codes:
+        return listing_dates, {}
+
+    safe_print(
+        f"[{label}] 上市日期：已缓存 {len(codes) - len(missing_codes)}/{len(codes)}，"
+        f"批量补齐 {len(missing_codes)} 只"
+    )
+    fetch_listing_dates = fetcher or fetch_stock_listing_dates
+    try:
+        resolved, fetch_errors = fetch_listing_dates(missing_codes)
+        resolved = resolved if isinstance(resolved, dict) else {}
+        fetch_errors = fetch_errors if isinstance(fetch_errors, dict) else {}
+    except Exception as exc:
+        resolved = {}
+        error = f"上市日期批量抓取失败: {_failure_error(exc)}"
+        fetch_errors = {code: error for code in missing_codes}
+
+    if resolved:
+        prepared = {}
+        for code, entry in resolved.items():
+            normalized = _listing_code(code)
+            if normalized not in normalized_stocks:
+                continue
+            value = dict(entry) if isinstance(entry, dict) else {"listing_date": entry}
+            value["name"] = str(value.get("name") or normalized_stocks[normalized] or normalized)
+            value["instrument_type"] = "stock"
+            prepared[normalized] = value
+        try:
+            # Only missing/invalid DB values reach this branch. Explicit overwrite repairs an
+            # invalid non-empty legacy value; valid cached dates never enter the fetch set.
+            ss.upsert_listing_dates(db, prepared, overwrite=True)
+            listing_dates.update(ss.listing_date_map(db, missing_codes))
+        except Exception as exc:
+            error = f"上市日期写库失败: {_failure_error(exc)}"
+            for code in prepared:
+                fetch_errors[code] = error
+
+    listing_date_errors = {}
+    for code in missing_codes:
+        if listing_dates.get(code):
+            continue
+        listing_date_errors[code] = str(
+            fetch_errors.get(code) or "交易所股票清单未返回有效上市日期"
+        )
+    safe_print(
+        f"[{label}] 上市日期补齐：成功 {len(missing_codes) - len(listing_date_errors)}，"
+        f"失败 {len(listing_date_errors)}"
+    )
+    return listing_dates, listing_date_errors
 
 
 # ─── 细分行业龙头选股 ─────────────────────────────────────────
@@ -197,6 +392,8 @@ def save_stock_file(code, name, data):
     payload.setdefault("symbol", str(code).zfill(6))
     payload.setdefault("name", name)
     payload["instrument_type"] = str(data.get("instrument_type") or payload.get("instrument_type") or "stock")
+    if data.get("listing_date"):
+        payload["listing_date"] = data["listing_date"]
     replace_history = True
     if full_records:
         # history 元信息(start/end)与 daily.stats 取全量序列；实际写入的行可能只是增量(append)。
@@ -235,7 +432,6 @@ class StockDbWriter:
         self.completed = 0
         self.failed = []
         self.failure_details = []
-        self.failed_tasks = []
         self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, name="stock-db-writer", daemon=True)
 
@@ -269,7 +465,6 @@ class StockDbWriter:
                     safe_print(f"[WRITE-ERROR] {code} {name}: {exc}")
                     with self._lock:
                         self.failed.append((code, name))
-                        self.failed_tasks.append((code, name, data))
                         self.failure_details.append(
                             _failure_detail(
                                 code,
@@ -512,16 +707,22 @@ def _decide_valuation_period(records, today):
 
 def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_info=None,
                   save_callback=None, max_years=MAX_YEARS, refresh_valuation=True,
-                  daily_fetcher=None, instrument_type="stock", stage_callback=None):
+                  daily_fetcher=None, instrument_type="stock", listing_date=None,
+                  stage_callback=None):
     """复用型单股历史刷新器。
 
     龙头池使用默认的 10 年历史并刷新估值；其他股票池可传入较短 ``max_years`` 且关闭
     ``refresh_valuation``，但日线的缺口判断、增量抓取、字段合并和 SQLite 写入完全共用。
+    股票必须由批量层传入已缓存的 ``listing_date``；ETF 不复用股票上市清单。
     """
     def mark_stage(stage):
         if stage_callback is not None:
             stage_callback(stage)
 
+    mark_stage("listing_date")
+    listing_date = ss.normalize_listing_date(listing_date)
+    if instrument_type == "stock" and not listing_date:
+        raise RuntimeError("缺少有效上市日期，已停止行情刷新")
     mark_stage("load_local_history")
     existing = load_stock_file(code, name)
     source_fetch_history = daily_fetcher or fetch_daily_range
@@ -536,7 +737,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             daily_rows_received += len(rows)
         return rows
     existing_records = existing.get("records", [])
-    raw_count = len(existing_records)  # C: 增量快路用——现有行是否被 prune/未来日期过滤改动
+    raw_count = len(existing_records)  # C: 增量快路用——现有行是否被 prune/日期边界过滤改动
     snapshot_removed = 0
     if existing_records:
         existing_records, snapshot_removed = prune_snapshot_only_history_records(existing_records)
@@ -548,6 +749,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             [
                 row for row in existing_records
                 if str(row.get("date", ""))[:10] <= today
+                and (not listing_date or str(row.get("date", ""))[:10] >= listing_date)
             ],
             key=lambda row: str(row.get("date", "")),
         )
@@ -562,6 +764,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     max_start = (
         datetime.strptime(today, "%Y-%m-%d") - timedelta(days=365 * float(max_years))
     ).strftime("%Y-%m-%d")
+    history_floor = max(date for date in (max_start, listing_date) if date)
 
     mark_stage("daily_history")
     hist_new_records = []
@@ -575,8 +778,10 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     full_refetch_start = min(
         date for date in (start_date, max_start) if date
     )
+    if listing_date:
+        full_refetch_start = max(full_refetch_start, listing_date)
     if full_daily_backfill:
-        safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {max_start} ~ {today}")
+        safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {full_refetch_start} ~ {today}")
         hist_new_records.extend(fetch_history(code, full_refetch_start, today))
     elif existing_qfq_seam:
         qfq_rebased = True
@@ -589,11 +794,12 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         )
         hist_new_records.extend(fetch_history(code, full_refetch_start, today))
 
-    if not full_daily_backfill and not qfq_rebased and existing_records and start_date and start_date > max_start:
+    if (not full_daily_backfill and not qfq_rebased and existing_records
+            and start_date and start_date > history_floor):
         prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-        if max_start <= prev_day:
-            safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {max_start} ~ {prev_day}")
-            hist_new_records.extend(fetch_history(code, max_start, prev_day))
+        if history_floor <= prev_day:
+            safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {history_floor} ~ {prev_day}")
+            hist_new_records.extend(fetch_history(code, history_floor, prev_day))
 
     if full_daily_backfill or qfq_rebased:
         pass
@@ -605,7 +811,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             overlap_start = (
                 datetime.strptime(end_date, "%Y-%m-%d") - timedelta(days=QFQ_OVERLAP_DAYS)
             ).strftime("%Y-%m-%d")
-            overlap_start = max(date for date in (overlap_start, start_date, max_start) if date)
+            overlap_start = max(date for date in (overlap_start, start_date, history_floor) if date)
             safe_print(f"[{idx}/{total}] {code} {name}: 重叠校验并补行情 {overlap_start} ~ {today}")
             overlap_records = fetch_history(code, overlap_start, today)
             scale_change = qfq_overlap_scale_change(existing_records, overlap_records)
@@ -623,8 +829,8 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
                 # 旧值；否则曾在盘中写入的成交量/最高最低价会因日期相同被永久跳过。
                 hist_new_records.extend(overlap_records)
     else:
-        safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {max_start} ~ {today}")
-        hist_new_records.extend(fetch_history(code, max_start, today))
+        safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {history_floor} ~ {today}")
+        hist_new_records.extend(fetch_history(code, history_floor, today))
 
     if daily_fetch_attempted and daily_rows_received == 0:
         # Keep the last complete local history, but do not turn a fully empty
@@ -658,6 +864,8 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     merged = merge_records(existing_records, normalized_new_records)
 
     result = {"symbol": code, "name": name, "instrument_type": instrument_type}
+    if listing_date:
+        result["listing_date"] = listing_date
     val_period = None
     if merged:
         # 估值：按 merged（合并后最新状态）判断是否需要拉取及拉取哪个period
@@ -730,19 +938,30 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
 def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT,
                             refresh_valuation=True, fundamentals_plan=None,
                             pledge_map=None, label="股票池", daily_fetcher=None,
-                            instrument_type="stock"):
+                            instrument_type="stock", listing_date_fetcher=None):
     """批量刷新任意股票池，统一复用龙头池的单股增量更新与单写线程。
 
-    ``stocks`` 为 ``{code: name}``。返回本轮抓取/写库统计和失败代码；调用方据此做池级
-    新鲜度检查，不能再仅凭历史条数判断数据已经更新。
+    ``stocks`` 为 ``{code: name}``。股票先批量读取/补齐上市日期，再进入并发日线抓取；
+    返回本轮抓取/写库统计和失败代码，调用方据此做池级新鲜度检查，不能再仅凭历史条数
+    判断数据已经更新。
     """
     items = list((stocks or {}).items())
     total = len(items)
     fundamentals_plan = fundamentals_plan or {}
     pledge_map = pledge_map or {}
-    failed = []
+    worker_failure_details = []
     completed = 0
     counter_lock = threading.Lock()
+    listing_dates = {}
+    listing_date_errors = {}
+
+    if instrument_type == "stock" and items:
+        listing_dates, listing_date_errors = resolve_stock_listing_dates(
+            dict(items),
+            fetcher=listing_date_fetcher,
+            label=label,
+        )
+
     db_writer = StockDbWriter()
     db_writer.start()
     safe_print(
@@ -760,6 +979,20 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
             current_stage = stage
 
         try:
+            normalized_code = str(code).zfill(6)
+            if instrument_type == "stock" and normalized_code in listing_date_errors:
+                detail = _failure_detail(
+                    code,
+                    name,
+                    "listing_date",
+                    listing_date_errors[normalized_code],
+                )
+                safe_print(
+                    f"[ERROR] {code} {name} [{detail['stage']}]: {detail['error']}"
+                )
+                with counter_lock:
+                    worker_failure_details.append(detail)
+                return
             outcome = process_stock(
                 code,
                 name,
@@ -772,18 +1005,37 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
                 refresh_valuation=refresh_valuation,
                 daily_fetcher=daily_fetcher,
                 instrument_type=instrument_type,
+                listing_date=listing_dates.get(normalized_code),
                 stage_callback=set_stage,
             )
             if (
                 isinstance(outcome, dict)
                 and outcome.get("status") in {"no_data", "source_empty"}
             ):
+                status = outcome.get("status")
+                error = (
+                    "所有已配置行情源均未返回日线数据"
+                    if status == "source_empty"
+                    else "本轮未生成可写入的行情或基本面数据"
+                )
+                detail = _failure_detail(code, name, "daily_history", error)
+                safe_print(
+                    f"[ERROR] {code} {name} [{detail['stage']}]: {detail['error']}"
+                )
                 with counter_lock:
-                    failed.append((code, name))
+                    worker_failure_details.append(detail)
         except Exception as exc:
-            safe_print(f"[ERROR] {code} {name} [{current_stage}]: {exc}")
+            detail = _failure_detail(
+                code,
+                name,
+                current_stage,
+                _failure_error(exc),
+            )
+            safe_print(
+                f"[ERROR] {code} {name} [{detail['stage']}]: {detail['error']}"
+            )
             with counter_lock:
-                failed.append((code, name))
+                worker_failure_details.append(detail)
         finally:
             with counter_lock:
                 completed += 1
@@ -806,97 +1058,15 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
         )
         db_writer.wait()
 
-    first_failure_by_code = {}
-    for code, name in failed:
-        normalized = str(code).zfill(6)
-        first_failure_by_code.setdefault(normalized, {
-            "code": normalized,
-            "name": name,
-            "kind": "process",
-            "data": None,
-        })
-    for code, name, data in db_writer.failed_tasks:
-        normalized = str(code).zfill(6)
-        first_failure_by_code[normalized] = {
-            "code": normalized,
-            "name": name,
-            "kind": "write",
-            "data": data,
-        }
-
-    retry_items = []
-    seen_retry_codes = set()
-    for code, name in items:
-        normalized = str(code).zfill(6)
-        candidate = first_failure_by_code.get(normalized)
-        if candidate is not None and normalized not in seen_retry_codes:
-            retry_items.append(candidate)
-            seen_retry_codes.add(normalized)
-    for normalized, candidate in first_failure_by_code.items():
-        if normalized not in seen_retry_codes:
-            retry_items.append(candidate)
-            seen_retry_codes.add(normalized)
-
-    final_failure_by_code = {}
-    retry_recovered = 0
-    if retry_items:
-        safe_print(
-            f"[{label}] 首轮失败 {len(retry_items)} 只；全部首轮写库结束后逐只复试 1 次"
-        )
-        if any(item["kind"] == "process" for item in retry_items):
-            reset_daily_source_runtime()
-        for retry_index, candidate in enumerate(retry_items, start=1):
-            code = candidate["code"]
-            name = candidate["name"]
-            stage = {"value": "stock_refresh"}
-
-            def set_retry_stage(value, holder=stage):
-                holder["value"] = value
-
-            try:
-                if candidate["kind"] == "write":
-                    stage["value"] = "stock_history_write"
-                    save_stock_file(code, name, candidate["data"])
-                    outcome = {"status": "saved"}
-                else:
-                    outcome = process_stock(
-                        code,
-                        name,
-                        retry_index,
-                        len(retry_items),
-                        need_fundamentals=fundamentals_plan.get(code, False),
-                        pledge_info=pledge_map.get(code),
-                        save_callback=None,
-                        max_years=max_years,
-                        refresh_valuation=refresh_valuation,
-                        daily_fetcher=daily_fetcher,
-                        instrument_type=instrument_type,
-                        stage_callback=set_retry_stage,
-                    )
-                if (
-                    isinstance(outcome, dict)
-                    and outcome.get("status") in {"no_data", "source_empty"}
-                ):
-                    final_failure_by_code[code] = _failure_detail(
-                        code,
-                        name,
-                        "daily_history",
-                        "所有已配置行情源均未返回日线数据",
-                    )
-                else:
-                    retry_recovered += 1
-                    safe_print(f"[{label}] 复试成功 {retry_index}/{len(retry_items)}: {code} {name}")
-            except Exception as exc:
-                final_failure_by_code[code] = _failure_detail(
-                    code,
-                    name,
-                    stage["value"],
-                    _failure_error(exc),
-                )
-                safe_print(
-                    f"[{label}] 复试仍失败 {retry_index}/{len(retry_items)}: "
-                    f"{code} {name} [{stage['value']}] {exc}"
-                )
+    failure_by_code = {}
+    for detail in worker_failure_details:
+        code = detail.get("code")
+        if code:
+            failure_by_code.setdefault(code, detail)
+    for detail in db_writer.failure_details:
+        code = detail.get("code")
+        if code:
+            failure_by_code[code] = detail
 
     if instrument_type == "stock":
         try:
@@ -905,26 +1075,29 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
         except Exception as exc:
             safe_print(f"[WARN] [{label}] sw3 市值批量同步失败: {exc}")
 
-    final_failed_codes = [
-        candidate["code"]
-        for candidate in retry_items
-        if candidate["code"] in final_failure_by_code
-    ]
-    failure_details = [final_failure_by_code[code] for code in final_failed_codes]
+    failed_codes = []
+    seen_failed_codes = set()
+    for code, _name in items:
+        normalized = str(code).zfill(6)
+        if normalized in failure_by_code and normalized not in seen_failed_codes:
+            failed_codes.append(normalized)
+            seen_failed_codes.add(normalized)
+    for code in failure_by_code:
+        if code not in seen_failed_codes:
+            failed_codes.append(code)
+            seen_failed_codes.add(code)
+    failure_details = [failure_by_code[code] for code in failed_codes]
     result = {
         "requested": total,
         "processed": completed,
         "write_enqueued": db_writer.enqueued,
         "write_completed": db_writer.completed,
-        "retry_attempted": len(retry_items),
-        "retry_recovered": retry_recovered,
-        "retry_failed": len(final_failed_codes),
-        "failed": final_failed_codes,
+        "failed": failed_codes,
         "failure_details": failure_details,
     }
     safe_print(
         f"[{label}] 完成：处理 {completed}/{total}，写库 {db_writer.completed}/{db_writer.enqueued}，"
-        f"首轮失败 {len(retry_items)}，复试恢复 {retry_recovered}，最终失败 {len(final_failed_codes)}"
+        f"失败 {len(failed_codes)}"
     )
     return result
 
@@ -958,7 +1131,7 @@ BENCHMARK_ETFS = (
 def fetch_index_etf_nav(code, output_file, *, label, start_date=BENCHMARK_ETF_START_DATE, years=None):
     """爬取单只指数 ETF 累计净值并持久化，返回 records 列表。"""
     # 基金净值爬取/合并工具在 fund 侧，延迟导入避免常规爬取路径背上依赖
-    from fund_fetch_data import fetch_range, merge_records as merge_nav_records
+    from fund.fund_fetch_data import fetch_range, merge_records as merge_nav_records
 
     output_file = Path(output_file)
     output_file.parent.mkdir(parents=True, exist_ok=True)
@@ -1105,9 +1278,6 @@ def run_segment_leader_refresh():
             "processed": 0,
             "write_enqueued": 0,
             "write_completed": 0,
-            "retry_attempted": 0,
-            "retry_recovered": 0,
-            "retry_failed": 0,
             "failed": [],
             "failure_details": [detail],
         }
@@ -1124,9 +1294,6 @@ def run_segment_leader_refresh():
             "processed": 0,
             "write_enqueued": 0,
             "write_completed": 0,
-            "retry_attempted": 0,
-            "retry_recovered": 0,
-            "retry_failed": 0,
             "failed": [],
             "failure_details": [detail],
         }
@@ -1141,9 +1308,6 @@ def run_segment_leader_refresh():
             "processed": 0,
             "write_enqueued": 0,
             "write_completed": 0,
-            "retry_attempted": 0,
-            "retry_recovered": 0,
-            "retry_failed": 0,
             "failed": [],
             "failure_details": [detail],
         }
@@ -1166,9 +1330,6 @@ def run_segment_leader_refresh():
             "processed": 0,
             "write_enqueued": 0,
             "write_completed": 0,
-            "retry_attempted": 0,
-            "retry_recovered": 0,
-            "retry_failed": 0,
             "failed": [],
             "failure_details": [detail],
         }
@@ -1216,9 +1377,6 @@ def cli(argv=None):
             "processed": 0,
             "write_enqueued": 0,
             "write_completed": 0,
-            "retry_attempted": 0,
-            "retry_recovered": 0,
-            "retry_failed": 0,
             "failed": [],
             "failure_details": [detail],
         }

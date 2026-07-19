@@ -45,6 +45,11 @@ SMALLCAP_OPTIMIZED_CONFIG_FILE = DATA_DIR / "stock_strategy_smallcap_optimized_c
 SMALLCAP_OPTIMIZED_CONFIG_BACKUP_FILE = META_DATA_BACKUP_DIR / "stock_strategy_smallcap_optimized_config.json"
 LIVE_CANDIDATE_CACHE_FILE = DATA_DIR / "stock_strategy_candidate_cache.json"
 LIVE_CANDIDATE_CACHE_VERSION = 5
+LHB_VOLATILITY_WARNING = "近期上龙虎榜，波动加剧"
+LEGACY_LHB_WARNING_COPY = frozenset({
+    "近期上龙虎榜，长线按避雷处理",
+    "近期上龙虎榜(避雷)",
+})
 SHORT_UNIVERSE_VERSION = "hotmoney_small_cap_v1"
 SMALLCAP_UNIVERSE_VERSION = SHORT_UNIVERSE_VERSION
 LONG_LIQUIDITY_FACTOR_VERSION = "avg_turnover_rate_v1"
@@ -117,7 +122,7 @@ LONG_FACTORS: List[FactorSpec] = [
     FactorSpec("dividend_consistency", "连续分红", "long", "股东回报", "近三年连续现金分红。", 0.5, "boolean"),
     FactorSpec("holder_count_change", "股东户数变化", "long", "资金面", "最近已公告股东户数增减比例，户数下降代表筹码集中。", 0.7, "percentile", "low", missing_score=50),
     FactorSpec("repurchase_recent", "公司回购", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日有回购公告。", 0.4, "bounded", "high", 0.0, 1.0, 50),
-    FactorSpec("lhb_recent_avoid", "近期龙虎榜", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日上过龙虎榜按避雷处理；长线默认权重为0且不参与参数搜索。", 0.0, "bounded", "low", 0.0, 1.0, 50),
+    FactorSpec("lhb_recent_avoid", "近期龙虎榜", "long", "资金面", f"近{LONG_CAPITAL_EVENT_DAYS}日上过龙虎榜，提示波动加剧；长线默认权重为0且不参与参数搜索。", 0.0, "bounded", "low", 0.0, 1.0, 50),
     FactorSpec("debt_safety", "低负债率", "long", "风险", "资产负债率越低越好，银行等行业会由其他质量因子平衡。", 0.5, "percentile", "low", missing_score=45),
     FactorSpec("pledge_safety", "低质押", "long", "风险", "股权质押比例越低越好。", 0.4, "percentile", "low", missing_score=60),
     FactorSpec("industry_leadership", "行业规模地位", "long", "规模流动性", "行业内市值百分位。", 0.0, "direct", missing_score=40),
@@ -570,6 +575,29 @@ def config_from_key(key: str) -> Dict[str, Any]:
     return json.loads(key) if key else {}
 
 
+def _refresh_cached_candidate_copy(
+        section: str,
+        candidates: List[Dict[str, Any]],
+        notes: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Refresh presentation copy that may outlive code changes in disk caches."""
+    if section not in {"long", "smallcap"}:
+        return candidates, notes
+    for candidate in candidates:
+        warnings = candidate.get("warnings")
+        if isinstance(warnings, list):
+            candidate["warnings"] = [
+                LHB_VOLATILITY_WARNING if warning in LEGACY_LHB_WARNING_COPY else warning
+                for warning in warnings
+            ]
+    refreshed_notes = [
+        note.replace("近期龙虎榜避雷", "近期龙虎榜波动提示")
+        if isinstance(note, str) else note
+        for note in notes
+    ]
+    return candidates, refreshed_notes
+
+
 def read_live_candidate_cache(section: str, meta: Dict[str, Any]) -> Optional[Tuple[List[Dict[str, Any]], List[str]]]:
     with _candidate_cache_lock:
         payload = load_json_optional(LIVE_CANDIDATE_CACHE_FILE, {})
@@ -582,7 +610,11 @@ def read_live_candidate_cache(section: str, meta: Dict[str, Any]) -> Optional[Tu
         if not isinstance(candidates, list):
             return None
         notes = entry.get("notes")
-        return copy.deepcopy(candidates), list(notes if isinstance(notes, list) else [])
+        return _refresh_cached_candidate_copy(
+            section,
+            copy.deepcopy(candidates),
+            list(notes if isinstance(notes, list) else []),
+        )
 
 
 def write_live_candidate_cache(
@@ -1719,7 +1751,7 @@ def build_long_candidates(
         )
     if any(capital_availability.values()):
         notes.append(
-            "长线资金面已挂载：股东户数变化、公司回购、近期龙虎榜避雷。"
+            "长线资金面已挂载：股东户数变化、公司回购、近期龙虎榜波动提示。"
         )
     else:
         notes.append(
@@ -2193,7 +2225,7 @@ def long_reasons(item: Dict[str, Any]) -> List[str]:
 def long_warnings(raw: Dict[str, Any]) -> List[str]:
     warnings = []
     if safe_float(raw.get("lhb_recent_avoid")):
-        warnings.append("近期上龙虎榜，长线按避雷处理")
+        warnings.append(LHB_VOLATILITY_WARNING)
     holder_change = safe_float(raw.get("holder_count_change"))
     if holder_change is not None and holder_change > 15:
         warnings.append("股东户数明显增加，筹码集中度走弱")

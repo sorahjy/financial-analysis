@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 
-# Define here the models for your scraped items
+# Define here the models for fund profile items
 #
 # See documentation in:
 # https://doc.scrapy.org/en/latest/topics/items.html
@@ -70,5 +70,4 @@ class MyItem(scrapy.Item):
     # hs300GrowthRateRecentFiveYear = scrapy.Field()  # 近五年沪深300涨幅
     hs300GrowthRateSinceFirstDayOfYear = scrapy.Field()  # 今年来沪深300涨幅
     # hs300GrowthRateSinceInception = scrapy.Field()  # 成立来沪深300涨幅
-
 

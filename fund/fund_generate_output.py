@@ -3,8 +3,8 @@ import os
 import html
 import warnings
 from datetime import datetime
-from funds import get_funds, get_funds_bond
-from fund_storage import (
+from .funds import get_funds, get_funds_bond
+from .fund_storage import (
     connect as connect_fund_db,
     load_profile_snapshots,
 )

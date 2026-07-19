@@ -667,17 +667,20 @@
       min-height: 18px;
       padding: 1px 4px;
       border-radius: 5px;
-      background: #eef2f7;
-      color: #64748b;
+      background: var(--panel-soft);
+      color: var(--muted);
       font-size: 10px;
       font-weight: 700;
       line-height: 1;
     }.stock-native .stock-radar-factor.buy {
-      background: #e7f7ee;
-      color: #16804a;
+      background: #eaf7ef;
+      color: #14804a;
+    }.stock-native .stock-radar-factor.momentum {
+      background: #fdeede;
+      color: #b4530e;
     }.stock-native .stock-radar-factor.risk {
-      background: #ffedeb;
-      color: #c23c2e;
+      background: #fdebe4;
+      color: #b3340f;
     }.stock-native .stock-radar-empty {
       color: #9ca3af;
       font-size: 10px;

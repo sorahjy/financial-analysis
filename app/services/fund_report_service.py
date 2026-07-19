@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List
 
-from fund_technical_analysis import (
+from fund.fund_technical_analysis import (
     ADX_WEIGHT,
     BUY_PERCENTILE_CAP,
     BUY_SIGNAL,

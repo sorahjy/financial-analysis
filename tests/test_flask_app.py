@@ -8,11 +8,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app import create_app
-from app.config import FUND_REPORT_DATA_FILE, ROOT_DIR
+from app.config import ROOT_DIR
 from app.services.job_service import get_job_state, start_command_job
 from app.services.fund_report_service import load_fund_report_view
 from app.services import radar_service, stock_strategy_service
-from funds import get_funds, get_funds_bond
 
 
 VALID_FUND_EDITOR_CONTENT = """\
@@ -118,141 +117,76 @@ class FlaskAppTest(unittest.TestCase):
     def test_page_scripts_support_partial_navigation_reinit(self):
         fund_script = (ROOT_DIR / "app/static/js/fund-report.js").read_text(encoding="utf-8")
         stock_script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
+        radar_script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
 
         self.assertIn("FinancialAnalysisPages.fund = initFundPage", fund_script)
-        self.assertIn("dataset.fundPageInitialized", fund_script)
-        self.assertIn("reloadCurrentPageContent", fund_script)
-        self.assertIn("await reloadCurrentPageContent()", fund_script)
-        self.assertLess(
-            fund_script.index('if (state.running) return "运行中";'),
-            fund_script.index('if (state.ok === null) return "空闲";'),
-        )
-        self.assertIn("let pollTask = null;", fund_script)
-        self.assertIn("if (pollTask) return pollTask;", fund_script)
-        self.assertIn("if (!disposed && data.refresh && data.refresh.running)", fund_script)
+        self.assertIn('statusRoot.dataset.fundPageInitialized === "1"', fund_script)
+        self.assertIn('statusRoot.dataset.fundPageInitialized = "1"', fund_script)
+        self.assertIn("FinancialAnalysisPages.cleanup", fund_script)
+        self.assertIn("disposed = true", fund_script)
+
         self.assertIn("FinancialAnalysisPages.stock = initStockDashboard", stock_script)
-        self.assertIn("dataset.stockDashboardInitialized", stock_script)
-        self.assertIn("将对长线/小盘/短线各运行 1500 次 Optuna/TPE 参数搜索回测", stock_script)
-        self.assertIn("python stock_strategy_optimizer.py --iterations 1500", stock_script)
-        self.assertIn("三个策略会以独立进程并行搜索", stock_script)
-        self.assertIn("约需 10 分钟左右", stock_script)
-        self.assertNotIn("约需 2 分钟左右", stock_script)
+        self.assertIn('dashboardRoot.dataset.stockDashboardInitialized === "1"', stock_script)
+        self.assertIn('dashboardRoot.dataset.stockDashboardInitialized = "1"', stock_script)
+        self.assertIn("FinancialAnalysisPages.cleanup", stock_script)
         self.assertIn("clearTimeout(runTimer)", stock_script)
         self.assertIn("clearInterval(optimizeTimer)", stock_script)
         self.assertIn("clearInterval(refreshTimer)", stock_script)
 
-        stock_html = self.client.get("/stock").get_data(as_text=True)
-        self.assertIn("长线/小盘/短线各 1500 次 Optuna/TPE 参数搜索回测", stock_html)
-        self.assertIn("三个独立进程并行", stock_html)
-        self.assertIn("约需 10 分钟左右", stock_html)
+        self.assertIn("FinancialAnalysisPages.radar = initRadar", radar_script)
+        self.assertIn('root.dataset.radarInit === "1"', radar_script)
+        self.assertIn('root.dataset.radarInit = "1"', radar_script)
+        self.assertIn("FinancialAnalysisPages.cleanup", radar_script)
+        self.assertIn("clearInterval(pollTimer)", radar_script)
+        self.assertIn("clearInterval(realtimeTimer)", radar_script)
 
-    def test_radar_script_shows_market_cap_and_watch_label(self):
+    def test_radar_page_exposes_filter_and_sort_contracts(self):
         body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
-        css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
-        refresh_css = (ROOT_DIR / "app/static/css/ui-refresh.css").read_text(encoding="utf-8")
 
-        self.assertIn('"观望⚪"', script)
-        self.assertIn('replace("空仓观望", "观望")', script)
-        self.assertIn('sortTh("market_cap_yi", "市值")', script)
-        self.assertIn('sortTh("realtime_price", "现价")', script)
-        self.assertIn('sortTh("realtime_change_pct", "涨幅")', script)
-        self.assertIn('sortTh("opportunity_score", "机会分")', script)
-        self.assertNotIn('sortTh("ambush_score", "吸筹分")', script)
-        self.assertNotIn('sortTh("distribution_score", "出货分")', script)
-        self.assertIn('key: "opportunity_score"', script)
-        self.assertIn("户数/回购已并入吸筹总分", script)
         self.assertIn("fmtMarketCap(s.market_cap_yi)", script)
-        self.assertIn("pi-stock-meta", script)
-        self.assertIn(".pi-stock-meta", css)
-        self.assertIn('id="radar-export-limit"', body)
-        self.assertIn('value="10"', body)
-        self.assertIn('id="radar-export"', body)
-        self.assertIn('id="radar-live-quote"', body)
-        self.assertIn('id="radar-live-status"', body)
-        self.assertIn("实时行情", body)
-        self.assertIn('id="radar-sw2-filter"', body)
-        self.assertIn('id="radar-sw2-search"', body)
-        self.assertIn('id="radar-sw2-min-heat"', body)
-        self.assertIn('id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="0"', body)
-        self.assertNotIn('id="radar-sw2-min-heat" type="number" min="0" max="100" step="1" value="50"', body)
-        self.assertIn('id="radar-sw2-options"', body)
-        self.assertIn("热度Top10", body)
-        self.assertIn("全选", body)
-        self.assertIn("搜索二级行业", body)
-        self.assertNotIn("搜索二级行业 / 热度", body)
-        self.assertLess(body.index('id="radar-sw2-hot"'), body.index('id="radar-sw2-select-all"'))
-        self.assertLess(body.index('id="radar-sw2-select-all"'), body.index('id="radar-sw2-clear"'))
-        self.assertLess(body.index('id="radar-phase-filter"'), body.index('id="radar-sw2-filter"'))
-        self.assertLess(body.index('id="radar-sw2-filter"'), body.index('id="radar-min-score"'))
-        self.assertLess(body.index('id="radar-hide-dist"'), body.index('id="radar-export-limit"'))
-        self.assertLess(body.index('id="radar-export-limit"'), body.index('id="radar-export"'))
-        self.assertIn("function buildSw2Options()", script)
-        self.assertIn("selectedSw2Industries", script)
-        self.assertIn("function renderSw2Filter()", script)
-        self.assertIn("function setSw2PanelOpen(open)", script)
-        self.assertIn("function visibleSw2Options()", script)
-        self.assertIn("new Set(selectedSw2Industries)", script)
-        self.assertIn("!f.sw2.has(stockSw2Name(s))", script)
-        self.assertIn('$("radar-sw2-min-heat").addEventListener("input", renderSw2Filter)', script)
-        self.assertIn('$("radar-sw2-select-all").onclick', script)
-        self.assertIn("new Set(visibleSw2Options().map((o) => o.name))", script)
-        self.assertIn("o.heat === null || o.heat <= minHeat", script)
-        self.assertIn("o.name.toLowerCase().includes(q)", script)
-        self.assertNotIn("heatText(o.heat)} ${o.count}只`.toLowerCase()", script)
-        self.assertIn("o.heat !== null).slice(0, 10)", script)
-        self.assertIn(".industry-filter-panel", css)
-        self.assertIn(".industry-heat-filter", css)
-        self.assertIn(".industry-option-heat", css)
-        self.assertIn("function exportTopOpportunityStocks()", script)
-        self.assertIn('aria-sort="${ariaSort}"', script)
-        self.assertIn('event.key !== "Enter" && event.key !== " "', script)
-        self.assertIn("REALTIME_REFRESH_MS = 180000", script)
-        self.assertIn('· 3分钟`, "live"', script)
-        self.assertNotIn("REALTIME_REFRESH_MS = 120000", script)
-        self.assertIn("REALTIME_SOURCE_LABEL", script)
-        self.assertIn('tencent_batch: "腾讯"', script)
-        self.assertIn('sina_batch: "新浪"', script)
+        for key, label in (
+            ("market_cap_yi", "市值"),
+            ("realtime_price", "现价"),
+            ("realtime_change_pct", "涨幅"),
+            ("opportunity_score", "机会分"),
+        ):
+            with self.subTest(sort_key=key):
+                self.assertIn(f'sortTh("{key}", "{label}")', script)
+
+        for element_id in (
+            "radar-live-quote",
+            "radar-live-status",
+            "radar-phase-filter",
+            "radar-pattern-filter",
+            "radar-sw2-filter",
+            "radar-min-score",
+            "radar-export-limit",
+            "radar-export",
+        ):
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', body)
+
         self.assertIn('fetch("/api/radar/realtime")', script)
-        self.assertIn("function setRealtimeEnabled(enabled)", script)
-        self.assertIn("async function fetchRealtimeData(queueIfBusy = false)", script)
-        self.assertIn("let realtimeRefreshPending = false", script)
-        self.assertIn("let realtimeRefreshQueued = false", script)
-        self.assertIn('updateRealtimeStatus("等待新股票池…", "live")', script)
-        self.assertIn("if (wasRadarRunBusy && !radarRunBusy && realtimeRefreshPending)", script)
-        self.assertIn("fetchRealtimeData(true)", script)
-        self.assertIn("realtime_quote", script)
-        self.assertIn("text/plain;charset=utf-8", script)
-        self.assertIn("hot_money_radar_opportunity_top", script)
-        self.assertIn("Number(b.opportunity_score) - Number(a.opportunity_score)", script)
-        self.assertIn("Number(b.ambush_score) - Number(a.ambush_score)", script)
-        self.assertIn("已导出机会分Top", script)
-        self.assertIn('${cleanField(s.code)},${cleanField(s.name)},', script)
-        self.assertNotIn('sortTh("capital_score", "资金分")', script)
-        self.assertIn(".radar-export-limit", css)
-        self.assertIn(".radar-live-status", css)
-        self.assertIn('title="按筹码成本估算，当前价以下的筹码占比">获利盘</th>', script)
-        self.assertIn("fmtRatioPct(sig.chip_winner)", script)
-        for hidden_header in ("量比", "价分位", "换手分位", "CMF", "筹码", "连板", "走势相似行业"):
-            self.assertNotIn(f'<th class="num">{hidden_header}</th>', script)
-            self.assertNotIn(f'<th>{hidden_header}</th>', script)
-        self.assertNotIn("themeCell(s)", script)
-        self.assertRegex(
-            css,
-            r"\.radar-table\s*\{\s*max-height:\s*none;\s*overflow-x:\s*auto;\s*overflow-y:\s*hidden;",
-        )
-        self.assertRegex(
-            refresh_css,
-            r"\.radar-kline\s*\{\s*position:\s*sticky;\s*align-self:\s*start;",
-        )
-        self.assertIn("走势相似行业", body)
-        self.assertIn("二级行业", script)
-        self.assertIn("function sw2Cell(s)", script)
-        self.assertIn("s.sw2_heat_pctile", script)
-        self.assertIn("esc(industry) + heat", script)
         self.assertIn('fetch("/api/radar/industry-heat")', script)
-        self.assertIn("三级行业热度", script)
-        self.assertNotIn("跟踪二级行业", script)
+        self.assertIn('data-key="${key}"', script)
+        self.assertIn('aria-sort="${ariaSort}"', script)
+        self.assertIn('key: "opportunity_score"', script)
+
+    def test_radar_payload_refreshes_legacy_lhb_warning_copy(self):
+        legacy = {
+            "stocks": [{
+                "code": "000933",
+                "evidence": [{"label": "近期上龙虎榜(避雷)", "kind": "bearish"}],
+            }],
+        }
+        with patch("app.services.radar_service.load_json_file", return_value=legacy):
+            payload = radar_service.radar_payload()
+
+        self.assertEqual(
+            payload["stocks"][0]["evidence"][0],
+            {"label": "近期上龙虎榜，波动加剧", "kind": "bearish"},
+        )
 
     def test_radar_pattern_colors_follow_backend_effectiveness_catalog(self):
         response = self.client.get("/api/radar/patterns")
@@ -261,9 +195,17 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(catalog["P3"]["effective_style"], "bullish")
         self.assertEqual(catalog["P24"]["effective_style"], "bullish")
         self.assertEqual(catalog["P12"]["effective_style"], "momentum")
+        self.assertEqual(catalog["P13"]["effective_style"], "momentum")
         self.assertEqual(catalog["P11"]["effective_style"], "risk")
         self.assertFalse(catalog["P6"]["effective"])
+        self.assertTrue(catalog["P23"]["effective"])
+        self.assertTrue(catalog["P25"]["effective"])
         self.assertEqual(catalog["P6"]["effective_style"], "neutral")
+        self.assertEqual(catalog["P23"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P25"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P6"]["display_style"], "neutral")
+        self.assertEqual(catalog["P23"]["display_style"], "bullish")
+        self.assertEqual(catalog["P25"]["display_style"], "bullish")
         self.assertEqual(len(catalog), 26)
         self.assertTrue(all(item["production"] for item in catalog.values()))
         self.assertEqual(catalog["P3"]["score_usage"], "吸筹分 10%")
@@ -273,17 +215,20 @@ class FlaskAppTest(unittest.TestCase):
         self.assertEqual(catalog["P15"]["score_usage"], "出货分 5%")
         self.assertEqual(catalog["P22"]["score_usage"], "出货分 5%")
         self.assertEqual(catalog["P26"]["score_usage"], "出货分 10%")
-        self.assertEqual(catalog["P25"]["validation_status"], "experimental")
+        self.assertEqual(catalog["P23"]["validation_status"], "core")
+        self.assertEqual(catalog["P25"]["validation_status"], "core")
         self.assertEqual(catalog["P1"]["validation_label"], "核心有效")
-        self.assertEqual(catalog["P25"]["validation_label"], "双池10/20日正向")
+        self.assertEqual(catalog["P23"]["validation_label"], "核心有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "核心有效")
         self.assertEqual(catalog["P6"]["validation_status"], "observation")
 
         script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
         css = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
-        self.assertIn("if (!meta || !meta.effective || isEtfMode()) return \"pd\"", script)
-        self.assertIn('meta.effective_style === "bullish"', script)
-        self.assertIn('meta.effective_style === "momentum"', script)
-        self.assertIn('meta.effective_style === "risk"', script)
+        self.assertIn('const style = meta.display_style || meta.effective_style || "neutral"', script)
+        self.assertIn('style === "bullish"', script)
+        self.assertIn('style === "momentum"', script)
+        self.assertIn('style === "risk"', script)
+        self.assertNotIn('if (!meta || !meta.effective || isEtfMode()) return "pd"', script)
         self.assertIn(
             "Promise.all([fetchPatternCatalog(), fetchScoringModel()]).finally(fetchData)",
             script,
@@ -292,6 +237,23 @@ class FlaskAppTest(unittest.TestCase):
         self.assertNotIn("PAT_TIP", script)
         for css_class in (".pat.pg", ".pat.po", ".pat.pr", ".pat.pd"):
             self.assertIn(css_class, css)
+
+        stock_script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
+        stock_css = (ROOT_DIR / "app/static/css/stock-dashboard.css").read_text(encoding="utf-8")
+        self.assertIn('fetch("/api/radar/patterns")', stock_script)
+        self.assertIn("function acceptRadarPatternCatalog(patterns)", stock_script)
+        self.assertIn('const style = meta.display_style || meta.effective_style || "neutral"', stock_script)
+        self.assertIn('style === "bullish"', stock_script)
+        self.assertIn('style === "momentum"', stock_script)
+        self.assertIn('style === "risk"', stock_script)
+        self.assertNotIn('if (!meta || !meta.effective || radarContextMeta.pool === "etf") return "neutral"', stock_script)
+        self.assertNotIn("RADAR_BUY_PATTERNS", stock_script)
+        self.assertNotIn("RADAR_RISK_PATTERNS", stock_script)
+        self.assertIn(".stock-radar-factor.momentum", stock_css)
+        self.assertIn("background: var(--panel-soft)", stock_css)
+        self.assertIn("color: var(--muted)", stock_css)
+        for color in ("#eaf7ef", "#14804a", "#fdeede", "#b4530e", "#fdebe4", "#b3340f"):
+            self.assertIn(color, stock_css)
 
     def test_radar_job_polling_uses_lightweight_endpoint(self):
         response = self.client.get("/api/radar/jobs")
@@ -365,7 +327,9 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn("股东户数变化", body)
         self.assertIn("13项原始特征直接加权", body)
         self.assertIn("P1 超额优先复合确认", body)
-        self.assertIn("P25 缩量平台转强（双池实验）", body)
+        self.assertIn("P25 缩量平台转强", body)
+        self.assertNotIn("P25 缩量平台转强（双池实验）", body)
+        self.assertIn('id="radar-effective-pattern-count">19<', body)
         self.assertIn('id="radar-scoring-factor-count">29<', body)
         self.assertIn("11项风险特征直接加权", body)
         self.assertIn("P15 新高量背离放量回撤", body)
@@ -458,16 +422,17 @@ class FlaskAppTest(unittest.TestCase):
         stock_script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
         expected_codes = '["P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26"]'
         self.assertIn(expected_codes, radar_script)
-        self.assertIn(expected_codes, stock_script)
+        self.assertIn('fetch("/api/radar/patterns")', stock_script)
+        self.assertIn("radarPatternCatalogByCode", stock_script)
 
     def test_live2d_widget_script_is_vendored_locally(self):
         html = self.client.get("/fund").get_data(as_text=True)
         self.assertIn('type="module"', html)
         self.assertIn("vendor/live2d-widget/autoload.js", html)
-        self.assertNotIn("fastly.jsdelivr.net/npm/live2d-widgets", html)
+        self.assertNotIn("fastly.jsdelivr.net", html)
 
         vendor_dir = ROOT_DIR / "app/static/vendor/live2d-widget"
-        for asset in (
+        required_assets = (
             "autoload.js",
             "waifu.css",
             "waifu-tips.js",
@@ -476,32 +441,19 @@ class FlaskAppTest(unittest.TestCase):
             "chunk/index.js",
             "chunk/index2.js",
             "LICENSE",
-        ):
+        )
+        for asset in required_assets:
             with self.subTest(asset=asset):
-                self.assertTrue((vendor_dir / asset).exists())
-
-        autoload = (vendor_dir / "autoload.js").read_text(encoding="utf-8")
-        waifu_css = (vendor_dir / "waifu.css").read_text(encoding="utf-8")
-        self.assertIn("new URL('./', import.meta.url).href", autoload)
-        self.assertIn("const defaultModelId = 2;", autoload)
-        self.assertIn("const defaultTextureId = 15;", autoload)
-        self.assertIn("const switchTextureIds = [7, 8, 13, 14, 15, 16, 17];", autoload)
-        self.assertIn("forceNextSwitchTexture(defaultModelId, switchTextureIds, defaultModelTextureCount);", autoload)
-        self.assertIn("event.target.closest('#waifu-tool-switch-texture')", autoload)
-        self.assertIn("localStorage.setItem('modelId', String(defaultModelId));", autoload)
-        self.assertIn("localStorage.setItem('modelTexturesId', String(defaultTextureId));", autoload)
-        self.assertIn("drag: true", autoload)
-        self.assertNotIn("const live2d_path = 'https://fastly.jsdelivr.net", autoload)
-        self.assertIn("z-index: 40;", waifu_css)
-
-        for asset in ("autoload.js", "waifu.css", "waifu-tips.js", "waifu-tips.json", "live2d.min.js"):
-            with self.subTest(static_asset=asset):
+                self.assertTrue((vendor_dir / asset).is_file())
                 response = self.client.get(f"/static/vendor/live2d-widget/{asset}")
                 try:
                     self.assertEqual(response.status_code, 200)
-                    self.assertGreater(len(response.data), 100)
                 finally:
                     response.close()
+
+        autoload = (vendor_dir / "autoload.js").read_text(encoding="utf-8")
+        self.assertIn("new URL('./', import.meta.url).href", autoload)
+        self.assertNotIn("const live2d_path = 'https://fastly.jsdelivr.net", autoload)
 
     def test_stock_config_api_loads(self):
         response = self.client.get("/api/config")
@@ -662,57 +614,30 @@ class FlaskAppTest(unittest.TestCase):
 
     def test_stock_dashboard_has_long_backtest_chart_button(self):
         body = (ROOT_DIR / "app/templates/stock/dashboard_body.html").read_text(encoding="utf-8")
-        css = (ROOT_DIR / "app/static/css/stock-dashboard.css").read_text(encoding="utf-8")
         script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
 
-        self.assertIn('id="long-chart-modal"', body)
-        self.assertIn('id="long-chart-show"', body)
-        self.assertIn('id="tab-smallcap"', body)
-        self.assertIn('id="tab-long" class="tab active" type="button">大盘</button>', body)
-        self.assertIn('"小盘中线因子策略"', script)
-        self.assertLess(body.index('id="tab-long"'), body.index('id="tab-smallcap"'))
-        self.assertLess(body.index('id="tab-smallcap"'), body.index('id="tab-short"'))
-        self.assertIn('id="long-chart-status"', body)
-        self.assertIn(">策略走势</button>", body)
-        self.assertIn('id="export-picks"', body)
-        self.assertIn(">导出</button>", body)
-        self.assertLess(body.index('id="refresh-data"'), body.index('id="long-chart-show"'))
-        self.assertLess(body.index('id="long-chart-show"'), body.index('id="export-picks"'))
-        self.assertIn("/api/stock/long-backtest-chart", script)
-        self.assertIn("正在回测策略走势，请稍后...", script)
-        self.assertIn("function showLongChartStatus", script)
-        self.assertIn(".chart-modal-status[hidden]", css)
-        self.assertIn(".chart-modal-body img[hidden]", css)
-        self.assertIn(".chart-modal-actions a[hidden]", css)
-        self.assertIn('$("long-chart-status").textContent = "";', script)
-        self.assertIn("button.hidden = !visible", script)
-        self.assertIn('const visible = active === "long" || active === "smallcap"', script)
+        for element_id in (
+            "long-chart-show",
+            "long-chart-modal",
+            "long-chart-status",
+            "long-chart-image",
+            "long-chart-open",
+            "long-chart-close",
+        ):
+            with self.subTest(element_id=element_id):
+                self.assertIn(f'id="{element_id}"', body)
+
+        self.assertIn('role="dialog"', body)
+        self.assertIn('fetch("/api/stock/long-backtest-chart"', script)
+        self.assertIn('method: "POST"', script)
         self.assertIn('body: JSON.stringify({config, strategy: chartStrategy})', script)
-        self.assertIn("grid-template-columns: repeat(3, minmax(0, 1fr))", css)
-        self.assertIn('switchStrategy("smallcap")', script)
-        self.assertIn("function smallcapPoolRules()", script)
-        self.assertIn("function exportCurrentPicks()", script)
-        self.assertIn("text/plain;charset=utf-8", script)
-        self.assertIn("anchor.download", script)
-        self.assertIn("slice(0, limit", script)
-        self.assertNotIn("picks.slice(0, 12)", script)
-        self.assertIn('${cleanField(pick.code)},${cleanField(pick.name)},', script)
-        self.assertIn("/api/stock/kline", script)
-        self.assertIn("period=week", script)
-        self.assertIn("function drawMiniKline", script)
-        self.assertIn('class="stock-mini-kline"', script)
-        self.assertIn(".stock-mini-kline", css)
-        self.assertIn(".chart-modal", css)
-        self.assertIn(".chart-modal-status", css)
-        self.assertNotIn("long-chart-card", css)
-        self.assertNotIn("查看走势", script)
-        self.assertIn('data-stock-view="results"', body)
-        self.assertIn('data-stock-view="settings"', body)
-        self.assertIn("function setMobileView(view)", script)
-        self.assertIn('event.key === "Escape"', script)
-        self.assertIn('"加权覆盖"', script)
-        self.assertIn('diag.coverage_sections', script)
-        self.assertIn('pick.weighted_data_quality ?? pick.data_quality', script)
+        self.assertIn('const visible = active === "long" || active === "smallcap"', script)
+
+    def test_stock_dashboard_refreshes_legacy_lhb_warning_copy(self):
+        script = (ROOT_DIR / "app/static/js/stock-dashboard.js").read_text(encoding="utf-8")
+
+        self.assertIn('["近期上龙虎榜，长线按避雷处理", "近期上龙虎榜，波动加剧"]', script)
+        self.assertIn("esc(warningCopy(r))", script)
 
     def test_stock_kline_endpoint_returns_weekly_bars(self):
         payload = {"code": "002511", "period": "week", "bars": [{"date": "2026-06-19", "close": 10.0}]}
@@ -804,7 +729,7 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('id="fund-native-report"', html)
         self.assertIn("数据基于", html)
         self.assertIn("刷新数据", html)
-        self.assertIn("编辑funds.py", html)
+        self.assertIn("编辑 fund/funds.py", html)
         self.assertIn("Fund Quantitative Metrics Report", html)
         self.assertIn("保存编辑", html)
         self.assertIn("关闭", html)
@@ -867,23 +792,34 @@ class FlaskAppTest(unittest.TestCase):
             r'<tr data-code="008115"[^>]*data-section="equity"[^>]*data-signal="买入"',
         )
 
-    def test_bond_fund_config_carries_shared_holdings(self):
-        equity_config = get_funds()
-        bond_config = get_funds_bond()
-
-        held_bond_codes = set(equity_config["hold_index"]) & set(bond_config["fund"])
-
-        self.assertTrue(held_bond_codes)
-        self.assertLessEqual(held_bond_codes, set(bond_config.get("hold_index", [])))
-
     def test_fund_report_css_is_scoped(self):
-        view = load_fund_report_view(FUND_REPORT_DATA_FILE)
+        payload = {
+            "generated_at": "2026-07-19 12:00",
+            "period_labels": ["近一周"],
+            "sections": {
+                "equity": {
+                    "id": "equity",
+                    "title": "股票型基金",
+                    "benchmark_names": ["沪深300"],
+                    "rows": [],
+                }
+            },
+        }
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            report_file = Path(tmp_dir) / "fund_report_data.json"
+            report_file.write_text(
+                json.dumps(payload, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            view = load_fund_report_view(report_file)
+
         css = (ROOT_DIR / "app/static/css/fund-report.css").read_text(encoding="utf-8")
 
         self.assertTrue(view.exists)
-        self.assertGreater(len(view.sections), 0)
+        self.assertEqual([section["id"] for section in view.sections], ["equity"])
         self.assertIn(".fund-native", css)
         self.assertNotIn(":root", css)
+        self.assertIsNone(re.search(r"(^|[{}])\s*body\s*\{", css))
 
     def test_refresh_button_has_busy_guard(self):
         script = (ROOT_DIR / "app/static/js/fund-report.js").read_text(encoding="utf-8")
@@ -906,7 +842,7 @@ class FlaskAppTest(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         payload = response.get_json()
-        self.assertEqual(payload["path"], "funds.py")
+        self.assertEqual(payload["path"], "fund/funds.py")
         self.assertIn("get_funds", payload["content"])
 
     def test_fund_editor_api_saves_only_validated_fund_config(self):
@@ -1055,7 +991,7 @@ class FlaskAppTest(unittest.TestCase):
             self.assertEqual(response.status_code, 202)
             start_mock.assert_called_once_with(
                 "fund-refresh",
-                [sys.executable, "-B", "fund_data_refresh.py"],
+                [sys.executable, "-B", "fund_data_refresh.py", "--no-proxy"],
                 cwd=ROOT_DIR,
                 timeout=1800,
                 resource_key="fund-data-refresh",

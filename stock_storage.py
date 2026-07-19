@@ -1,4 +1,4 @@
-"""个股数据的 SQLite 持久化层（对照 fund_storage.py 的范式）。
+"""个股数据的 SQLite 持久化层（对照 fund/fund_storage.py 的范式）。
 
 设计要点（详见 schema 讨论）：
   - 混合存储：日线+估值时间序列(history)正规化进 stock_history 大表(~12M 行)，
@@ -18,7 +18,7 @@ import json
 import os
 import sqlite3
 import threading
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Sequence
 
@@ -35,7 +35,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 SQLITE_BUSY_TIMEOUT_MS = 120000
 # 批量刷新友好的连接级调优（均为连接局部或不写库文件，不扰动 user_version/mtime）：
 #   cache_size 负值=KB，每连接一块页缓存减少大表反复读盘（多线程下 N 连接各占一份，故默认偏保守 16MB）；
@@ -102,6 +102,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             code                    TEXT PRIMARY KEY,
             name                    TEXT NOT NULL,
             instrument_type         TEXT NOT NULL DEFAULT 'stock',
+            listing_date            TEXT,
             fetch_time              TEXT,
             financials_refetched_at TEXT,
             daily_refetched_at      TEXT,
@@ -220,6 +221,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
     _ensure_table_columns(conn, "stock_meta", {
         # ETF 与股票共用 OHLCV 表，但必须让财报/策略全库扫描能排除 ETF。
         "instrument_type": "TEXT NOT NULL DEFAULT 'stock'",
+        # 上市日期与本地历史起点不是同一概念；旧库保持 NULL，由刷新流程按需补齐。
+        "listing_date": "TEXT",
     })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -236,17 +239,80 @@ def _ensure_table_columns(conn: sqlite3.Connection, table: str, columns: Mapping
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {declaration}")
 
 
+def normalize_listing_date(value: Any) -> Optional[str]:
+    """Normalize an exchange listing date to ``YYYY-MM-DD``; invalid/missing values return None.
+
+    AkShare-backed exchange lists have returned strings, ``datetime.date`` values and pandas
+    timestamps across versions, so the storage boundary accepts the common representations while
+    keeping one stable SQLite format.  Missing sentinels must remain ``NULL`` so a later refresh can
+    retry them instead of treating an arbitrary marker as a cached date.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in {"nat", "nan", "none", "null", "--"}:
+        return None
+    if isinstance(value, datetime):
+        parsed = value.date()
+        return parsed.isoformat() if parsed <= date.today() else None
+    if isinstance(value, date):
+        return value.isoformat() if value <= date.today() else None
+
+    # Exchange spreadsheets normally arrive as dates/timestamps, but older Excel readers may leave
+    # the serial day value intact.  A-share listing dates are safely inside this narrow range; the
+    # upper bound also prevents an eight-digit YYYYMMDD value from being mistaken for a serial.
+    try:
+        serial = float(text)
+    except ValueError:
+        serial = -1.0
+    if serial.is_integer() and 20_000 <= serial <= 80_000:
+        parsed = date(1899, 12, 30) + timedelta(days=int(serial))
+        return parsed.isoformat() if parsed <= date.today() else None
+
+    candidates = [text]
+    if len(text) >= 10:
+        candidates.append(text[:10])
+    if len(text) >= 8 and text[:8].isdigit():
+        candidates.append(text[:8])
+
+    for candidate in dict.fromkeys(candidates):
+        try:
+            parsed = date.fromisoformat(candidate)
+            return parsed.isoformat() if parsed <= date.today() else None
+        except ValueError:
+            pass
+        # Python 3.10's date.fromisoformat() does not yet accept basic YYYYMMDD.
+        for fmt in ("%Y%m%d", "%Y/%m/%d", "%Y.%m.%d"):
+            try:
+                parsed = datetime.strptime(candidate, fmt).date()
+                return parsed.isoformat() if parsed <= date.today() else None
+            except ValueError:
+                continue
+    return None
+
+
 # ─── 动态 SQL（列集中定义，避免手抖漏列）────────────────────────
 
 _META_COLUMNS = (
-    "code", "name", "instrument_type", "fetch_time",
+    "code", "name", "instrument_type", "listing_date", "fetch_time",
     "financials_refetched_at", "daily_refetched_at", "history_refetched_at",
     "daily_stats_json", "financials_json", "indicators_json", "dividends_json",
     "pledge_ratio", "pledge_count", "pledge_trade_date", "industry",
     "candidate_for_json", "history_source", "history_start_date", "history_end_date",
     "price_adjust",
 )
-_META_UPDATE_SET = ", ".join(f"{c} = excluded.{c}" for c in _META_COLUMNS if c != "code")
+_META_UPDATE_SET = ", ".join(
+    (
+        # 上市日期是按需抓取的缓存。旧的 save_stock 调用普遍不带该字段，
+        # 因此只能补空，不能被 excluded.NULL 清掉；显式纠错走 upsert_listing_dates。
+        "listing_date = COALESCE(NULLIF(TRIM(stock_meta.listing_date), ''), "
+        "excluded.listing_date)"
+        if c == "listing_date"
+        else f"{c} = excluded.{c}"
+    )
+    for c in _META_COLUMNS
+    if c != "code"
+)
 _META_INSERT_SQL = (
     f"INSERT INTO stock_meta ({', '.join(_META_COLUMNS)}, updated_at) "
     f"VALUES ({', '.join('?' for _ in _META_COLUMNS)}, CURRENT_TIMESTAMP) "
@@ -294,6 +360,7 @@ def save_stock(
         code,
         str(data.get("name") or code),
         str(data.get("instrument_type") or "stock"),
+        normalize_listing_date(data.get("listing_date")),
         _optional_text(data.get("fetch_time")),
         _optional_text(data.get("financials_refetched_at")),
         _optional_text(data.get("daily_refetched_at")),
@@ -427,6 +494,61 @@ def update_stock_identity(
                 (str(name or code), str(instrument_type or "stock"), code),
             )
     return bool(cursor.rowcount)
+
+
+def upsert_listing_dates(
+    conn: sqlite3.Connection,
+    entries: Mapping[str, Any],
+    *,
+    overwrite: bool = False,
+) -> int:
+    """Persist listing dates in bulk, returning the number of inserted/updated ``stock_meta`` rows.
+
+    ``entries`` maps a stock code either to ``{"name": ..., "listing_date": ...}`` or directly to
+    a date value.  Existing non-empty dates are immutable by default: normal refreshes only fill
+    misses, while an explicit repair can opt into ``overwrite=True``.  A code that has not reached
+    ``stock_meta`` yet gets a lightweight row so its listing date survives a later history failure.
+    On conflict, name and instrument type are intentionally left untouched (notably for ETFs).
+    """
+    prepared_by_code: Dict[str, tuple[str, str, str, str]] = {}
+    for raw_code, raw_entry in entries.items():
+        code = _normalize_code(raw_code)
+        if not code:
+            continue
+        if isinstance(raw_entry, Mapping):
+            listing_date = normalize_listing_date(raw_entry.get("listing_date"))
+            name = str(raw_entry.get("name") or code)
+            instrument_type = str(raw_entry.get("instrument_type") or "stock")
+        else:
+            listing_date = normalize_listing_date(raw_entry)
+            name = code
+            instrument_type = "stock"
+        if not listing_date:
+            continue
+        prepared_by_code[code] = (code, name, instrument_type, listing_date)
+
+    if not prepared_by_code:
+        return 0
+
+    conflict_where = (
+        "COALESCE(stock_meta.listing_date, '') <> excluded.listing_date"
+        if overwrite
+        else "NULLIF(TRIM(stock_meta.listing_date), '') IS NULL"
+    )
+    sql = f"""
+        INSERT INTO stock_meta
+            (code, name, instrument_type, listing_date, updated_at)
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT(code) DO UPDATE SET
+            listing_date = excluded.listing_date,
+            updated_at = CURRENT_TIMESTAMP
+        WHERE {conflict_where}
+    """
+    with _WRITE_LOCK:
+        before = conn.total_changes
+        with conn:
+            conn.executemany(sql, prepared_by_code.values())
+        return conn.total_changes - before
 
 
 def save_index_nav(conn: sqlite3.Connection, payload: Mapping[str, Any], *, name: Optional[str] = None) -> int:
@@ -1268,6 +1390,35 @@ def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:
     return row["history_refetched_at"] if row else None
 
 
+def listing_date_map(
+    conn: sqlite3.Connection, codes: Optional[Sequence[str]] = None
+) -> Dict[str, Optional[str]]:
+    """Return ``{code: listing_date}``, including ``None`` for requested codes not yet cached.
+
+    Supplying the refresh universe performs bounded bulk ``IN`` queries instead of loading each
+    stock payload or issuing one SQLite query per worker.
+    """
+    if codes is None:
+        return {
+            row["code"]: normalize_listing_date(row["listing_date"])
+            for row in conn.execute("SELECT code, listing_date FROM stock_meta")
+        }
+
+    normalized = list(dict.fromkeys(_normalize_code(code) for code in codes if code))
+    out: Dict[str, Optional[str]] = {}
+    for i in range(0, len(normalized), 500):
+        chunk = normalized[i:i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT code, listing_date FROM stock_meta WHERE code IN ({placeholders})",
+            chunk,
+        ):
+            out[row["code"]] = normalize_listing_date(row["listing_date"])
+    for code in normalized:
+        out.setdefault(code, None)
+    return out
+
+
 def financials_refetched_map(
     conn: sqlite3.Connection, codes: Optional[Sequence[str]] = None
 ) -> Dict[str, Optional[str]]:
@@ -1379,6 +1530,9 @@ def _rebuild_stock(meta: sqlite3.Row, records: List[Dict[str, Any]]) -> Dict[str
     }
     if meta["fetch_time"]:
         data["fetch_time"] = meta["fetch_time"]
+    listing_date = normalize_listing_date(meta["listing_date"])
+    if listing_date:
+        data["listing_date"] = listing_date
 
     stats = _loads(meta["daily_stats_json"])
     data["daily"] = {"stats": stats} if stats is not None else {}

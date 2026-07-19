@@ -85,7 +85,7 @@ git status --short
 
 除非任务明确要求刷新真实数据，否则不要在验证阶段运行这些命令。
 
-两个 `.py` 刷新入口都会复用当前解释器，并在 Windows 与 POSIX 系统上通过参数列表启动子进程。两个 `.sh` 文件仅是 Unix 兼容包装器，不是 Flask 生产调用链；可用 `PYTHON_BIN=.venv/bin/python ./stock_radar_fresh_data.sh` 显式指定解释器。
+两个 `.py` 刷新入口都会复用当前解释器，并在 Windows 与 POSIX 系统上通过参数列表启动子进程。`fund_data_refresh.py` 保持为根目录基金刷新入口，内部子步骤通过 `python -m fund...` 运行。
 
 ### 看似读取、实际仍可能写
 
@@ -100,7 +100,7 @@ git status --short
 
 ### 源码与版本化依据
 
-- `app/`、顶层 `*.py`、`*.sh`、`tests/`：生产代码和测试。
+- `app/`、`fund/`、顶层 `*.py`、`*.sh`、`tests/`：生产代码和测试。
 - `README.md`：用户能力、操作命令和使用边界。
 - `ARCHITECTURE.md`：组件边界、数据流、存储与不变量。
 - `AGENTS.md`：维护工作流和验证要求。
@@ -120,14 +120,14 @@ git status --short
 
 - `app/routes/`：HTTP 参数解析、状态码和序列化。
 - `app/services/`：读取、缓存、任务启动与业务编排。
-- 顶层量化模块：可测试的策略、形态、存储和抓取逻辑。
+- `fund/` 与顶层量化模块：可测试的策略、形态、存储和抓取逻辑。
 - `app/templates/`、`app/static/js/`、`app/static/css/`：页面结构、行为和样式。
 
 不要在路由中复制大段策略逻辑，也不要让模板直接理解 SQLite schema。新的长任务应接入 `job_service.start_command_job()`；会读写同一股票数据库或雷达产物的任务必须复用 `stock-data-refresh` 资源锁。
 
 ### 存储
 
-- 通过 `fund_storage.py`、`stock_storage.py`、`plate_storage.py` 提供的 API 访问主库。
+- 通过 `fund/fund_storage.py`、`stock_storage.py`、`plate_storage.py` 提供的 API 访问主库。
 - Schema 改动要在 `ensure_schema()` 中提供幂等升级，并递增对应 schema 版本；不能要求用户删库重建。
 - 证券代码统一为六位字符串。名称可更新，代码才是稳定主键。
 - JSON/SVG 写入应使用现有原子写或公共 helper，失败时保留上一份完整产物。
@@ -176,7 +176,7 @@ git status --short
 | 行业周期/板块存储 | `test_industry_cycle_engine.py`、`test_data_integrity_fixes.py` |
 | SW3 归属、细分龙头或三级行业热度 | `test_core_logic.py`、`test_sw3_industry_heat.py`、`test_data_integrity_fixes.py`；接入页面再加 `test_flask_app.py` |
 | 后台任务 | `test_job_service.py`、对应 Flask API 测试 |
-| 只读研究脚本 | 对应研究测试；确认真实数据库不被创建或迁移 |
+| 只读研究脚本 | 使用脚本自身的离线/临时验证；不要让通用 `tests/` 依赖被忽略的 `research_*.py`；确认真实数据库不被创建或迁移 |
 | 模板、JS、CSS | `test_flask_app.py`，并在相关页面做人工交互检查 |
 
 测试新增要求：
@@ -189,13 +189,9 @@ git status --short
 
 ## 9. 当前测试基线
 
-截至 2026-07-15，完整 `unittest` 套件并非全绿。最近一次从仓库根运行共发现 370 个测试，其中 364 通过、4 失败、2 个模块导入错误。已知基线包括：
+截至 2026-07-19，最近一次从仓库根运行共发现 368 个测试，全部通过，无模块导入错误。
 
-- 两个研究测试导入了仓库中不存在的 `research_p25_p26_horizon_backtest.py`、`research_p25_buy_factor.py` / `research_p26_vcp_factor.py`。
-- 两个 ETF 测试仍断言配置池为 78 只，当前配置实际为 82 只。
-- optimizer 一项折偏移断言与实现不一致，另一项小盘持有期仍期望 40 日而当前实现为 60 日。
-
-后续 agent 不能把“已有失败”当作忽略新回归的理由：先跑相关基线，区分任务前后结果；交付时列出精确失败，并说明是否由本次修改引入。上述问题修复后应同步更新本节。
+后续 agent 应以这份全绿结果为基线；出现任何新失败时都要定位原因，并在测试数量或基线状态变化后同步更新本节。
 
 ## 10. 文档同步规则
 

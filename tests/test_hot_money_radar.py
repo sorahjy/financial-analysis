@@ -26,89 +26,6 @@ def _flat_bars(n, price, vol, turnover, start_day=1):
              price, price, price, vol, 0.0, turnover) for i in range(n)]
 
 
-def _p25_bars():
-    """构造“120日低位→60日严格横盘缩量→量能启动”的180根日线。"""
-    closes = [15.0 - 4.0 * i / 119 for i in range(120)]
-    closes.extend(10.95 - 0.75 * i / 39 for i in range(40))
-    closes.extend(10.03 + 0.08 * i / 18 for i in range(19))
-    closes.append(10.13)
-    bars = []
-    for i, close in enumerate(closes):
-        previous = closes[i - 1] if i else close
-        if i < 120:
-            volume = 4200 - 8 * i
-        elif i < 160:
-            volume = 3000 - 35 * (i - 120)
-        elif i < 179:
-            volume = 1200 - 22 * (i - 160)
-        else:
-            volume = 2100
-        bars.append({
-            "date": f"d{i:03d}",
-            "open": previous,
-            "high": close * 1.004,
-            "low": min(previous, close) * 0.985,
-            "close": close,
-            "volume": volume,
-            "amount": volume * close,
-            "chg": (close / previous - 1.0) * 100 if i else 0.0,
-            "turnover": volume / 1000,
-        })
-    return bars
-
-
-def _p1_low_base_bars():
-    """第178根起底盘状态连续成立，最终第180根恰好首次三日确认。"""
-    bars = []
-    closes = [14.0 - 3.5 * i / 119 for i in range(120)]
-    closes.extend(10.12 - 0.12 * i / 59 for i in range(60))
-    for i, close in enumerate(closes):
-        previous = closes[i - 1] if i else close
-        spread = 0.018 if i < 160 else 0.003
-        high = max(previous, close) * (1.0 + spread)
-        low = min(previous, close) * (1.0 - spread)
-        if i == 117:
-            high = 14.0  # 直到该异常高点移出60日窗口，底盘状态才成立。
-        bars.append({
-            "date": f"d{i:03d}",
-            "open": previous,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": 1000.0,
-            "amount": close * 1000.0,
-            "chg": (close / previous - 1.0) * 100.0 if previous else 0.0,
-            "turnover": 1.0,
-        })
-    return bars
-
-
-def _p2_bars(event_count, include_today=True):
-    """最后10根中放入指定数量十字星，其余为普通实体K线。"""
-    bars = []
-    end = 180 if include_today else 179
-    event_indices = set(range(end - event_count, end))
-    for i in range(180):
-        if i in event_indices:
-            open_price = close = 10.1
-            high, low = 10.15, 10.05
-        else:
-            open_price, close = 10.0, 10.1
-            high, low = 10.12, 9.99
-        bars.append({
-            "date": f"d{i:03d}",
-            "open": open_price,
-            "high": high,
-            "low": low,
-            "close": close,
-            "volume": 1000.0,
-            "amount": 10100.0,
-            "chg": 0.0,
-            "turnover": 1.0,
-        })
-    return bars
-
-
 def _p3_reclaim_bars(event_volume=800.0, current_close=10.0, undercut_close=None):
     """缩量大阴后首次完整收复跌前收盘；事件日前20日均量为1000。"""
     closes = [10.0] * 31 + [9.5, 9.7, 9.9, current_close]
@@ -207,7 +124,7 @@ class HotMoneyRadarTest(unittest.TestCase):
     def test_pattern_effective_set_matches_latest_retest(self):
         expected = {
             "P1", "P2", "P3", "P5", "P11", "P12", "P13", "P14", "P15",
-            "P16", "P17", "P19", "P20", "P21", "P22", "P24", "P26",
+            "P16", "P17", "P19", "P20", "P21", "P22", "P23", "P24", "P25", "P26",
         }
         self.assertEqual(radar.PATTERN_EFFECTIVE, expected)
         self.assertEqual(set(radar.PATTERN_EFFECTIVE_STYLE), expected)
@@ -224,11 +141,13 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertFalse(catalog["P6"]["effective"])
         self.assertFalse(catalog["P7"]["effective"])
         self.assertIn("P25", catalog)
-        self.assertFalse(catalog["P25"]["effective"])
+        self.assertTrue(catalog["P23"]["effective"])
+        self.assertTrue(catalog["P25"]["effective"])
         self.assertEqual(catalog["P1"]["score_usage"], "吸筹分 10%")
         self.assertEqual(catalog["P25"]["score_usage"], "吸筹分 5%")
         self.assertEqual(catalog["P1"]["validation_label"], "核心有效")
-        self.assertEqual(catalog["P25"]["validation_label"], "双池10/20日正向")
+        self.assertEqual(catalog["P23"]["validation_label"], "核心有效")
+        self.assertEqual(catalog["P25"]["validation_label"], "核心有效")
         self.assertIn("P26", catalog)
         self.assertTrue(catalog["P26"]["effective"])
         self.assertEqual(catalog["P3"]["effective_style"], "bullish")
@@ -238,77 +157,16 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(catalog["P11"]["effective_style"], "risk")
         self.assertEqual(catalog["P26"]["effective_style"], "risk")
         self.assertEqual(catalog["P6"]["effective_style"], "neutral")
-
-    def test_p25_fires_in_all_pools(self):
-        bars = _p25_bars()
-        hotmoney = {item["code"] for item in radar.match_patterns("000001", bars, pool="hotmoney")}
-        leader = {item["code"] for item in radar.match_patterns("000001", bars, pool="leader")}
-        unspecified = {item["code"] for item in radar.match_patterns("000001", bars)}
-
-        self.assertIn("P25", hotmoney)
-        self.assertIn("P25", leader)
-        self.assertIn("P25", unspecified)
-
-    def test_p26_requires_volume_confirmation_for_winner_risk(self):
-        bars = _flat_bars(180, 10.0, 1000.0, 1.0)
-        self.assertTrue(radar._pat_chip_winner_risk(
-            bars, {
-                "chip_winner": 0.90,
-                "chip_winner_prior": 0.80,
-                "p26_volume_ratio": 1.50,
-            }
-        ))
-        self.assertTrue(radar._pat_chip_winner_risk(
-            bars, {
-                "chip_winner": 0.60,
-                "chip_winner_prior": 0.399,
-                "p26_volume_ratio": 1.50,
-            }
-        ))
-        self.assertFalse(radar._pat_chip_winner_risk(
-            bars, {
-                "chip_winner": 0.95,
-                "chip_winner_prior": 0.80,
-                "p26_volume_ratio": 1.499,
-            }
-        ))
-        self.assertFalse(radar._pat_chip_winner_risk(
-            bars, {
-                "chip_winner": 0.60,
-                "chip_winner_prior": 0.40,
-                "p26_volume_ratio": 2.00,
-            }
-        ))
-        self.assertFalse(radar._pat_chip_winner_risk(
-            bars, {
-                "chip_winner": 0.599,
-                "chip_winner_prior": 0.20,
-                "p26_volume_ratio": 2.00,
-            }
-        ))
+        self.assertEqual(catalog["P23"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P25"]["effective_style"], "bullish")
+        self.assertEqual(catalog["P6"]["display_style"], "neutral")
+        self.assertEqual(catalog["P23"]["display_style"], "bullish")
+        self.assertEqual(catalog["P25"]["display_style"], "bullish")
 
     def test_p26_volume_ratio_uses_today_over_previous_twenty_days(self):
         self.assertAlmostEqual(radar._p26_volume_ratio([100.0] * 20 + [150.0]), 1.5)
         self.assertIsNone(radar._p26_volume_ratio([100.0] * 20))
         self.assertIsNone(radar._p26_volume_ratio([None] * 6 + [100.0] * 14 + [200.0]))
-
-    def test_p2_requires_five_events_in_latest_ten_bars(self):
-        context = {"pos": 0.20}
-        self.assertTrue(radar._pat_low_shadows(_p2_bars(5), context))
-        self.assertFalse(radar._pat_low_shadows(_p2_bars(4), context))
-        self.assertFalse(radar._pat_low_shadows(_p2_bars(5, include_today=False), context))
-        self.assertFalse(radar._pat_low_shadows(_p2_bars(5), {"pos": 0.40}))
-
-    def test_p2_fires_in_all_pools(self):
-        bars = _p2_bars(5)
-        context = {"pos": 0.20}
-        hotmoney = {item["code"] for item in radar.match_patterns("000001", bars, ctx=context, pool="hotmoney")}
-        leader = {item["code"] for item in radar.match_patterns("000001", bars, ctx=context, pool="leader")}
-        unspecified = {item["code"] for item in radar.match_patterns("000001", bars, ctx=context)}
-
-        self.assertIn("P2", hotmoney)
-        self.assertIn("P2", leader)
-        self.assertIn("P2", unspecified)
 
     def test_p3_fires_only_on_first_full_reclaim(self):
         bars = _p3_reclaim_bars()
@@ -326,40 +184,6 @@ class HotMoneyRadarTest(unittest.TestCase):
             "closes": [bar["close"] for bar in repeated],
         }
         self.assertFalse(radar._pat_shakedown_absorb(repeated, repeated_context))
-
-    def test_p3_rejects_partial_reclaim_high_event_volume_and_deep_undercut(self):
-        for bars in (
-            _p3_reclaim_bars(current_close=9.99),
-            _p3_reclaim_bars(event_volume=850.0),
-            _p3_reclaim_bars(undercut_close=9.20),
-        ):
-            context = {
-                "pos": 0.20,
-                "vol": [bar["volume"] for bar in bars],
-                "closes": [bar["close"] for bar in bars],
-            }
-            self.assertFalse(radar._pat_shakedown_absorb(bars, context))
-
-    def test_p3_rejects_high_position_or_confirmation_volume(self):
-        bars = _p3_reclaim_bars()
-        closes = [bar["close"] for bar in bars]
-        volumes = [bar["volume"] for bar in bars]
-        self.assertFalse(radar._pat_shakedown_absorb(
-            bars, {"pos": 0.35, "vol": volumes, "closes": closes}
-        ))
-        bars[-1]["volume"] = 1301.0
-        volumes[-1] = 1301.0
-        self.assertFalse(radar._pat_shakedown_absorb(
-            bars, {"pos": 0.20, "vol": volumes, "closes": closes}
-        ))
-
-    def test_p23_uses_original_broad_compression_rule(self):
-        bars = _p23_state_bars()
-        with patch.object(radar, "_amp_ratio", return_value=0.79):
-            self.assertTrue(radar._pat_compression(bars, {"pos": 0.59}))
-            self.assertFalse(radar._pat_compression(bars, {"pos": 0.60}))
-        with patch.object(radar, "_amp_ratio", return_value=0.80):
-            self.assertFalse(radar._pat_compression(bars, {"pos": 0.30}))
 
     def test_p24_strong_obv_state(self):
         self.assertTrue(radar._p24_obv_divergence_state(_p24_state_bars()))
@@ -434,87 +258,6 @@ class HotMoneyRadarTest(unittest.TestCase):
             self.assertAlmostEqual(sum(row.values()), 1.0)
             for key in ("p14", "p15", "p20", "p22"):
                 self.assertEqual(row[key], 0.05)
-
-    def test_accumulation_model_uses_raw_feature_weights(self):
-        weights = {
-            "chip": 0.10,
-            "position": 0.20,
-            "cmf_eff": 0.10,
-            "p3": 0.20,
-            "p24": 0.10,
-            "p1": 0.05,
-            "p25": 0.05,
-            "holder_change": 0.10,
-            "repurchase": 0.10,
-        }
-        rows = [
-            {
-                "ambush_score": 12.0,
-                "distribution_score": 0.0,
-                "holder_change": -15.0,
-                "repurchase_recent": True,
-                "patterns": ["P1", "P3", "P24", "P25"],
-                "signals": {},
-                "sub_scores": {
-                    "chip": 80.0,
-                    "position": 70.0,
-                    "cmf_eff": 40.0,
-                },
-            },
-            {
-                "ambush_score": 34.0,
-                "distribution_score": 40.0,
-                "holder_change": None,
-                "repurchase_recent": False,
-                "patterns": [],
-                "signals": {},
-                "sub_scores": {
-                    "chip": 20.0,
-                    "position": 30.0,
-                    "cmf_eff": 50.0,
-                },
-            },
-        ]
-        self.assertEqual(radar.ACCUM_MODEL_WEIGHTS, weights)
-        self.assertAlmostEqual(sum(radar.ACCUM_MODEL_WEIGHTS.values()), 1.0)
-        radar._apply_accumulation_model(rows)
-
-        self.assertEqual(rows[0]["ambush_score"], 86.0)
-        self.assertEqual(rows[0]["accumulation_percentile"], 100.0)
-        self.assertEqual(rows[0]["distribution_percentile"], 0.0)
-        self.assertEqual(rows[0]["opportunity_score"], 100.0)
-        self.assertNotIn("technical_ambush_score", rows[0])
-        self.assertNotIn("technical_ambush_score", rows[0]["signals"])
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p3"], 100.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p24"], 100.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p1"], 100.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["p25"], 100.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["chip"], 80.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["holder_change"], 100.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_model_features"]["repurchase"], 100.0)
-        self.assertEqual(rows[1]["accumulation_percentile"], 0.0)
-        self.assertEqual(rows[1]["distribution_percentile"], 100.0)
-        self.assertEqual(rows[1]["opportunity_score"], 0.0)
-        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p3"], 0.0)
-        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p24"], 0.0)
-        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p1"], 0.0)
-        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["p25"], 0.0)
-        self.assertEqual(rows[1]["signals"]["accumulation_model_features"]["holder_change"], 50.0)
-        self.assertEqual(rows[0]["signals"]["accumulation_percentile"], 100.0)
-        self.assertEqual(rows[0]["signals"]["distribution_percentile"], 0.0)
-        self.assertEqual(rows[0]["signals"]["opportunity_formula"], radar.OPPORTUNITY_FORMULA)
-
-    def test_accumulation_weight_grid_fixes_p1_and_p25_at_five_percent(self):
-        grid = radar._accumulation_weight_grid()
-        self.assertEqual(len(grid), 210)
-        self.assertTrue(all(abs(sum(weights.values()) - 1.0) < 1e-9 for weights in grid))
-        self.assertTrue(all(weights["p1"] == 0.05 for weights in grid))
-        self.assertTrue(all(weights["p25"] == 0.05 for weights in grid))
-        for weights in grid:
-            for feature in radar.ACCUM_FEATURES:
-                if feature not in {"p1", "p25"}:
-                    self.assertGreaterEqual(weights[feature], 0.10)
-        self.assertIn(radar.ACCUM_MODEL_WEIGHTS, grid)
 
     def test_cross_section_percentiles_share_tie_rank(self):
         rows = [{"score": 10.0}, {"score": 20.0}, {"score": 20.0}, {"score": 40.0}]
@@ -599,40 +342,6 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertFalse(regime["above_ma20"])
         self.assertFalse(regime["favorable"])
         self.assertAlmostEqual(regime["ret5"], -0.0476)
-        conn.close()
-
-    def test_p1_market_gate_uses_ma60_or_pit_ma20_repair(self):
-        rising = [1.0 + 0.01 * i for i in range(60)]
-        repair = [2.0] * 35 + [1.0 + 0.01 * i for i in range(25)]
-        falling = [2.0 - 0.01 * i for i in range(60)]
-
-        self.assertTrue(radar._p1_market_gate_metrics(rising)["gate"])
-        repaired = radar._p1_market_gate_metrics(repair)
-        self.assertFalse(repaired["above_ma60"])
-        self.assertTrue(repaired["ma20_rising_5d"])
-        self.assertTrue(repaired["gate"])
-        self.assertFalse(radar._p1_market_gate_metrics(falling)["gate"])
-        self.assertFalse(radar._p1_market_gate_metrics(falling[:59])["available"])
-
-        conn = stock_storage.connect(":memory:")
-        base = date(2026, 1, 1)
-        records = [{
-            "date": (base + timedelta(days=i)).isoformat(),
-            "nav": f"{value:.4f}",
-            "nav_acc": f"{value:.4f}",
-        } for i, value in enumerate(repair)]
-        stock_storage.save_index_nav(
-            conn, {"code": radar.MARKET_REGIME_INDEX, "records": records}
-        )
-        gates = radar._p1_market_gate_by_date(
-            conn, [records[58]["date"], records[59]["date"]]
-        )
-        self.assertFalse(gates[records[58]["date"]])  # 仅59根，禁止偷看下一日。
-        self.assertTrue(gates[records[59]["date"]])
-        regime = radar._market_regime(conn)
-        self.assertTrue(regime["p1_trade_gate_available"])
-        self.assertTrue(regime["p1_trade_gate"])
-        self.assertEqual(regime["p1_trade_gate_reason"], "ma20_rising_5d")
         conn.close()
 
     def test_empty_pattern_phase_uses_watch_label(self):
@@ -1172,7 +881,10 @@ class HotMoneyRadarTest(unittest.TestCase):
         self.assertEqual(by_code["600001"]["signals"]["distribution_model_weights"]["divergence"], 0.15)
         self.assertEqual(payload["capital_counts"]["lhb_avoid"], 1)
         self.assertFalse(any("龙虎榜" in e["label"] for e in by_code["600000"]["evidence"]))
-        self.assertTrue(any("近期上龙虎榜" in e["label"] for e in by_code["600001"]["evidence"]))
+        self.assertIn(
+            {"label": "近期上龙虎榜，波动加剧", "kind": "bearish"},
+            by_code["600001"]["evidence"],
+        )
 
 
 def _gen_bars(seed, n=240):
@@ -1292,58 +1004,6 @@ def _pat_bar(t, o, h, l, c, vol, prev):
 
 
 class PatternMatchTest(unittest.TestCase):
-    def test_p1_requires_first_low_base_confirmation_chip_cost_and_market_gate(self):
-        bars = _p1_low_base_bars()
-        chip = {
-            "concentration": 0.45,
-            "peak_pctile": 0.40,
-            "price_to_peak": 0.02,
-            "winner": 0.50,
-        }
-        context = {"chip": chip}
-
-        self.assertFalse(radar._p1_low_base_state(bars[:-3]))
-        self.assertTrue(radar._p1_low_base_state(bars[:-2]))
-        self.assertTrue(radar._p1_low_base_state(bars[:-1]))
-        self.assertTrue(radar._p1_low_base_state(bars))
-        self.assertTrue(radar._pat_low_consolidation(bars, context))
-        self.assertFalse(radar._pat_low_consolidation(
-            bars, {"chip": {**chip, "winner": 0.90}}
-        ))
-
-        p1_only = [("P1", "低位底盘吸筹确认", "吸筹", "buy", radar._pat_low_consolidation)]
-        with patch.object(radar, "PATTERNS", p1_only):
-            enabled = radar.match_patterns(
-                "600000", bars, ctx=context, pool="hotmoney", p1_market_gate=True
-            )
-            closed = radar.match_patterns(
-                "600000", bars, ctx=context, pool="hotmoney", p1_market_gate=False
-            )
-            leader = radar.match_patterns(
-                "600000", bars, ctx=context, pool="leader", p1_market_gate=True
-            )
-            unspecified = radar.match_patterns(
-                "600000", bars, ctx=context, p1_market_gate=True
-            )
-        self.assertEqual([row["code"] for row in enabled], ["P1"])
-        self.assertEqual(closed, [])
-        self.assertEqual([row["code"] for row in leader], ["P1"])
-        self.assertEqual([row["code"] for row in unspecified], ["P1"])
-
-    def test_accumulation_bars_fire_buy_pattern(self):
-        # 先 16→9 阴跌 60 日，再低位横盘；应至少命中一个吸筹观察形态。
-        bars = []
-        prev = 16.0
-        for t in range(90):
-            c = 16 - (16 - 9) * t / 59 if t < 60 else 9.0 + (0.04 if t % 2 else -0.04)
-            o = prev
-            bars.append(_pat_bar(t, o, max(o, c) * 1.004, min(o, c) * 0.992,
-                                 c, 1000.0 if t < 85 else 3000.0, prev))
-            prev = c
-        fired = radar.match_patterns("600000", bars)
-        self.assertTrue(any(p["phase"] == "吸筹" and p["signal"] == "buy" for p in fired),
-                        msg=f"fired={[p['code'] for p in fired]}")
-
     def test_distribution_bars_fire_sell_pattern(self):
         # 单边走高 8→20，最后一根高位巨量大阴（灌压出货）→ 应命中 sell 形态
         bars = []

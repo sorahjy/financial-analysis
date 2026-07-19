@@ -18,7 +18,7 @@ from app.utils import file_status
 
 
 bp = Blueprint("fund", __name__)
-FUND_EDITOR_FILE = ROOT_DIR / "funds.py"
+FUND_EDITOR_FILE = ROOT_DIR / "fund" / "funds.py"
 FUND_CODES_FILE = ROOT_DIR / "data" / "fund_codes.json"
 
 _FUND_LIST_NAMES = (
@@ -328,7 +328,7 @@ def generate_fund_report():
 
         started = start_command_job(
             "fund-report-generate",
-            [sys.executable, "-B", "fund_generate_output.py"],
+            [sys.executable, "-B", "-m", "fund.fund_generate_output"],
             cwd=ROOT_DIR,
             timeout=300,
             resource_key=_FUND_RESOURCE_KEY,
@@ -349,7 +349,7 @@ def refresh_fund_report():
 
         started = start_command_job(
             "fund-refresh",
-            [sys.executable, "-B", "fund_data_refresh.py"],
+            [sys.executable, "-B", "fund_data_refresh.py", "--no-proxy"],
             cwd=ROOT_DIR,
             timeout=1800,
             resource_key=_FUND_RESOURCE_KEY,

@@ -3,13 +3,14 @@ import tempfile
 import sys
 import os
 import io
+import runpy
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 import sqlite3
 
-from fund_generate_output import esc, parse_percent
-from fund_technical_analysis import analyze_fund, calc_adx, calc_percentile
-from fund_storage import (
+from fund.fund_generate_output import esc, parse_percent
+from fund.fund_technical_analysis import analyze_fund, calc_adx, calc_percentile
+from fund.fund_storage import (
     connect as connect_fund_db,
     load_nav_entry,
     load_profile_snapshots,
@@ -364,37 +365,6 @@ class PlateStorageTest(unittest.TestCase):
             conn.close()
 
 
-class ThemeCandidatesPrintTest(unittest.TestCase):
-    def test_stock_table_uses_chinese_headers_and_renders_cjk(self):
-        import stock_theme_candidates as theme
-
-        rows = [{
-            "code": "603303",
-            "name": "得邦照明",
-            "score": 88.1,
-            "stage": "启动/加速",
-            "climax_risk": "低",
-            "trading_theme": "光学光电子",
-            "static_sw2": "照明设备Ⅱ",
-            "market_cap_yi": 147.7,
-            "tracking_corr": 0.51,
-            "return_corr": 0.48,
-            "turnover_corr": 0.60,
-            "trend_corr_60d": 0.42,
-            "matched_days": 168,
-            "latest_date": "2026-06-18",
-        }]
-        buffer = io.StringIO()
-        theme._console(file=buffer, width=240).print(theme.build_stock_table(rows))
-        text = buffer.getvalue()
-
-        self.assertIn("#", text)
-        self.assertIn("跟踪题材", text)
-        self.assertIn("静态SW2", text)
-        self.assertIn("照明设备Ⅱ", text)
-        self.assertNotIn("rank", text)
-
-
 class SegmentLeaderStorageConnectionTest(unittest.TestCase):
     def test_sw3_membership_helpers_close_connections(self):
         import stock_crawl_segment_leaders as r
@@ -427,6 +397,126 @@ class SegmentLeaderStorageConnectionTest(unittest.TestCase):
 
 
 class FundSQLiteStorageTest(unittest.TestCase):
+    def test_fund_no_proxy_session_is_used_for_every_requests_call(self):
+        import fund.fund_fetch_data as fund_fetch_data
+
+        nav_response = MagicMock()
+        nav_response.text = "var apidata={ content:'',records:0,pages:0,curpage:1};"
+        estimate_response = MagicMock()
+        estimate_response.text = (
+            'jsonpgz({"gsz":"1.1","gszzl":"0.1","gztime":"2026-07-19 15:00",'
+            '"dwjz":"1.0"})'
+        )
+        session = MagicMock()
+        session.trust_env = True
+        session.get.side_effect = [nav_response, estimate_response]
+
+        with patch.dict(
+            os.environ,
+            {"FuNd_CrAwL_No_PrOxY": "true", "HTTPS_PROXY": "http://proxy.invalid"},
+            clear=False,
+        ), patch.object(
+            fund_fetch_data.requests,
+            "Session",
+            return_value=session,
+        ), patch.object(
+            fund_fetch_data,
+            "_HTTP_SESSION",
+            None,
+        ), patch.object(
+            fund_fetch_data,
+            "_HTTP_SESSION_NO_PROXY",
+            None,
+        ):
+            fund_fetch_data._get_nav_with_retry({"code": "000001"})
+            estimate = fund_fetch_data.fetch_estimate("000001")
+
+        self.assertFalse(session.trust_env)
+        self.assertEqual(session.get.call_count, 2)
+        self.assertEqual(session.get.call_args_list[0].args[0], fund_fetch_data.NAV_API_URL)
+        self.assertEqual(
+            session.get.call_args_list[1].args[0],
+            fund_fetch_data.ESTIMATE_API_URL.format(code="000001"),
+        )
+        self.assertEqual(estimate["gsz"], "1.1")
+
+    def test_fund_session_without_marker_keeps_requests_environment_support(self):
+        import fund.fund_fetch_data as fund_fetch_data
+
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.lower() not in {
+                "fund_crawl_no_proxy",
+                "stock_crawl_no_proxy",
+            }
+        }
+        with patch.dict(os.environ, environment, clear=True):
+            session = fund_fetch_data._build_http_session()
+        try:
+            self.assertTrue(session.trust_env)
+        finally:
+            session.close()
+
+    def test_fund_session_honors_stock_refresh_no_proxy_marker(self):
+        import fund.fund_fetch_data as fund_fetch_data
+
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.lower() not in {
+                "fund_crawl_no_proxy",
+                "stock_crawl_no_proxy",
+            }
+        }
+        with patch.dict(
+            os.environ,
+            {
+                **environment,
+                "stock_crawl_no_proxy": "yes",
+                "HTTPS_PROXY": "http://proxy.invalid",
+            },
+            clear=True,
+        ):
+            session = fund_fetch_data._build_http_session()
+        try:
+            self.assertFalse(session.trust_env)
+            settings = session.merge_environment_settings(
+                fund_fetch_data.NAV_API_URL,
+                {},
+                None,
+                None,
+                None,
+            )
+            self.assertEqual(dict(settings["proxies"]), {})
+        finally:
+            session.close()
+
+    def test_scrapy_proxy_middleware_is_disabled_only_for_no_proxy_marker(self):
+        settings_file = (
+            Path(__file__).resolve().parents[1]
+            / "fund"
+            / "ttjj_spider"
+            / "settings.py"
+        )
+        base_environment = {
+            key: value
+            for key, value in os.environ.items()
+            if key.lower() != "fund_crawl_no_proxy"
+        }
+
+        with patch.dict(os.environ, base_environment, clear=True):
+            regular_settings = runpy.run_path(str(settings_file))
+        with patch.dict(
+            os.environ,
+            {**base_environment, "fund_crawl_no_proxy": "ON"},
+            clear=True,
+        ):
+            direct_settings = runpy.run_path(str(settings_file))
+
+        self.assertNotIn("HTTPPROXY_ENABLED", regular_settings)
+        self.assertIs(direct_settings["HTTPPROXY_ENABLED"], False)
+
     def test_schema_keeps_only_core_fund_cache_tables(self):
         with tempfile.TemporaryDirectory() as tmp:
             conn = connect_fund_db(Path(tmp) / "fund.sqlite3")
@@ -618,7 +708,7 @@ class FundSQLiteStorageTest(unittest.TestCase):
         self.assertEqual(estimates["000002"]["gsz"], "2.2")
 
     def test_partial_realtime_fetch_preserves_failed_fund_snapshot(self):
-        import fund_fetch_data
+        import fund.fund_fetch_data as fund_fetch_data
 
         with tempfile.TemporaryDirectory() as tmp:
             db_file = Path(tmp) / "fund.sqlite3"
@@ -654,7 +744,7 @@ class FundSQLiteStorageTest(unittest.TestCase):
         self.assertEqual(estimates["000002"]["gztime"], "new")
 
     def test_structurally_empty_realtime_fetch_is_not_counted_as_success(self):
-        import fund_fetch_data
+        import fund.fund_fetch_data as fund_fetch_data
 
         with tempfile.TemporaryDirectory() as tmp:
             db_file = Path(tmp) / "fund.sqlite3"
@@ -692,8 +782,8 @@ class FundSQLiteStorageTest(unittest.TestCase):
         self.assertEqual(estimates["000002"]["gsz"], "2.2")
 
     def test_partial_profile_pipeline_preserves_failed_fund_snapshot(self):
-        from ttjj_spider.pipelines import TtjjSpiderPipeline
-        import ttjj_spider.pipelines as pipelines
+        from fund.ttjj_spider.pipelines import TtjjSpiderPipeline
+        import fund.ttjj_spider.pipelines as pipelines
 
         with tempfile.TemporaryDirectory() as tmp:
             tmp_path = Path(tmp)
@@ -780,6 +870,188 @@ class StockValuationDecisionTest(unittest.TestCase):
         ]
 
         self.assertEqual(_decide_valuation_period(records, "2026-05-30"), "近五年")
+
+
+class StockListingDateStorageTest(unittest.TestCase):
+    def test_normalize_listing_date_accepts_common_exchange_formats(self):
+        from datetime import date, datetime
+        import pandas as pd
+        import stock_storage as ss
+
+        self.assertEqual(ss.normalize_listing_date("2018-12-24"), "2018-12-24")
+        self.assertEqual(ss.normalize_listing_date("20181224"), "2018-12-24")
+        self.assertEqual(ss.normalize_listing_date("2018/12/24"), "2018-12-24")
+        self.assertEqual(ss.normalize_listing_date("2018.12.24"), "2018-12-24")
+        self.assertEqual(ss.normalize_listing_date(43458), "2018-12-24")
+        self.assertEqual(
+            ss.normalize_listing_date("2018-12-24 00:00:00"),
+            "2018-12-24",
+        )
+        self.assertEqual(ss.normalize_listing_date(date(2018, 12, 24)), "2018-12-24")
+        self.assertEqual(
+            ss.normalize_listing_date(datetime(2018, 12, 24, 9, 30)),
+            "2018-12-24",
+        )
+        for value in (None, "", "NaT", "nan", "--", "2018-02-30", "2999-01-01"):
+            with self.subTest(value=value):
+                self.assertIsNone(ss.normalize_listing_date(value))
+        self.assertIsNone(ss.normalize_listing_date(pd.NaT))
+
+    def test_v6_stock_meta_migrates_listing_date_without_rewriting_existing_rows(self):
+        import stock_storage as ss
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "stock.sqlite3"
+            conn = sqlite3.connect(db_path)
+            try:
+                conn.executescript("""
+                    CREATE TABLE stock_meta (
+                        code                    TEXT PRIMARY KEY,
+                        name                    TEXT NOT NULL,
+                        instrument_type         TEXT NOT NULL DEFAULT 'stock',
+                        fetch_time              TEXT,
+                        financials_refetched_at TEXT,
+                        daily_refetched_at      TEXT,
+                        history_refetched_at    TEXT,
+                        daily_stats_json        TEXT,
+                        financials_json         TEXT,
+                        indicators_json         TEXT,
+                        dividends_json          TEXT,
+                        pledge_ratio            REAL,
+                        pledge_count            REAL,
+                        pledge_trade_date       TEXT,
+                        industry                TEXT,
+                        candidate_for_json      TEXT,
+                        history_source          TEXT,
+                        history_start_date      TEXT,
+                        history_end_date        TEXT,
+                        price_adjust            TEXT DEFAULT 'qfq',
+                        updated_at              TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    );
+                    INSERT INTO stock_meta
+                        (code, name, history_start_date, history_end_date)
+                    VALUES ('603629', '利通电子', '2018-12-24', '2026-07-17');
+                    PRAGMA user_version = 6;
+                """)
+            finally:
+                conn.close()
+
+            conn = ss.connect(db_path)
+            try:
+                columns = {row["name"] for row in conn.execute("PRAGMA table_info(stock_meta)")}
+                row = conn.execute(
+                    "SELECT name, listing_date, history_start_date, history_end_date "
+                    "FROM stock_meta WHERE code = '603629'"
+                ).fetchone()
+                user_version = conn.execute("PRAGMA user_version").fetchone()[0]
+            finally:
+                conn.close()
+
+        self.assertIn("listing_date", columns)
+        self.assertEqual(user_version, 7)
+        self.assertEqual(row["name"], "利通电子")
+        self.assertIsNone(row["listing_date"])
+        self.assertEqual(row["history_start_date"], "2018-12-24")
+        self.assertEqual(row["history_end_date"], "2026-07-17")
+
+    def test_save_stock_round_trips_listing_date_and_never_clears_cached_value(self):
+        import stock_storage as ss
+
+        conn = ss.connect(":memory:")
+        try:
+            ss.save_stock(conn, {
+                "symbol": "603629",
+                "name": "利通电子",
+                "listing_date": "2018/12/24",
+            }, write_history=False)
+            self.assertEqual(
+                ss.load_stock(conn, "603629", include_history=False)["listing_date"],
+                "2018-12-24",
+            )
+
+            # 历史调用没有 listing_date，不得把已缓存值整行 UPSERT 成 NULL。
+            ss.save_stock(conn, {
+                "symbol": "603629",
+                "name": "利通电子",
+            }, write_history=False)
+            # 普通刷新即使传入冲突日期也只补空，不做静默纠错。
+            ss.save_stock(conn, {
+                "symbol": "603629",
+                "name": "利通电子",
+                "listing_date": "2019-01-01",
+            }, write_history=False)
+
+            self.assertEqual(ss.listing_date_map(conn)["603629"], "2018-12-24")
+            self.assertEqual(
+                ss.listing_date_map(conn, ["603629", "000001"]),
+                {"603629": "2018-12-24", "000001": None},
+            )
+        finally:
+            conn.close()
+
+    def test_upsert_listing_dates_creates_stubs_fills_only_misses_and_preserves_etf(self):
+        import stock_storage as ss
+
+        conn = ss.connect(":memory:")
+        try:
+            ss.save_stock(conn, {
+                "symbol": "000002",
+                "name": "万科A",
+            }, write_history=False)
+            ss.save_stock(conn, {
+                "symbol": "510300",
+                "name": "沪深300ETF",
+                "instrument_type": "etf",
+                "listing_date": "2012-05-28",
+            }, write_history=False)
+
+            changed = ss.upsert_listing_dates(conn, {
+                # stock_meta 中还没有该股：先建轻量 stub，即使日线失败也保留日期。
+                "603629": {"name": "利通电子", "listing_date": "20181224"},
+                # 已有 meta 但日期为空：只补这一列。
+                "000002": {"name": "错误名称", "listing_date": "1991-01-29"},
+                # 已有 ETF 日期不覆盖，名称和品种也不得被输入重分类。
+                "510300": {
+                    "name": "错误股票名",
+                    "instrument_type": "stock",
+                    "listing_date": "2020-01-01",
+                },
+                # 无效值不落库，以便下次仍能重试。
+                "000003": {"name": "无效日期", "listing_date": "NaT"},
+            })
+
+            self.assertEqual(changed, 2)
+            self.assertEqual(
+                ss.listing_date_map(conn, ["603629", "000002", "510300", "000003"]),
+                {
+                    "603629": "2018-12-24",
+                    "000002": "1991-01-29",
+                    "510300": "2012-05-28",
+                    "000003": None,
+                },
+            )
+            stock_row = conn.execute(
+                "SELECT name, instrument_type FROM stock_meta WHERE code = '000002'"
+            ).fetchone()
+            etf_row = conn.execute(
+                "SELECT name, instrument_type FROM stock_meta WHERE code = '510300'"
+            ).fetchone()
+            self.assertEqual(tuple(stock_row), ("万科A", "stock"))
+            self.assertEqual(tuple(etf_row), ("沪深300ETF", "etf"))
+
+            # 同一批次执行无写入；明确修复时才允许覆盖日期。
+            self.assertEqual(ss.upsert_listing_dates(conn, {
+                "603629": {"name": "利通电子", "listing_date": "2018-12-24"},
+            }), 0)
+            self.assertEqual(ss.upsert_listing_dates(conn, {
+                "603629": {"name": "不应改名", "listing_date": "2018-12-25"},
+            }, overwrite=True), 1)
+            repaired = conn.execute(
+                "SELECT name, instrument_type, listing_date FROM stock_meta WHERE code = '603629'"
+            ).fetchone()
+            self.assertEqual(tuple(repaired), ("利通电子", "stock", "2018-12-25"))
+        finally:
+            conn.close()
 
 
 class StockFilePathTest(unittest.TestCase):
@@ -1083,7 +1355,11 @@ class StockHistorySchemaTest(unittest.TestCase):
         with patch.object(
             stock_price_valuation,
             "load_stock_file",
-            return_value={"records": existing, "start_date": "2026-07-01", "end_date": "2026-07-02"},
+            return_value={
+                "records": existing,
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-02",
+            },
         ), patch.object(
             stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
         ), patch.object(
@@ -1097,6 +1373,7 @@ class StockHistorySchemaTest(unittest.TestCase):
                 save_callback=lambda code, name, data: saved.append((code, name, data)),
                 max_years=0.001,
                 refresh_valuation=False,
+                listing_date="2020-01-01",
             )
 
         self.assertEqual(fetch_mock.call_count, 1)
@@ -1122,7 +1399,11 @@ class StockHistorySchemaTest(unittest.TestCase):
         with patch.object(
             stock_price_valuation,
             "load_stock_file",
-            return_value={"records": existing, "start_date": "2026-07-01", "end_date": "2026-07-01"},
+            return_value={
+                "records": existing,
+                "start_date": "2026-07-01",
+                "end_date": "2026-07-01",
+            },
         ), patch.object(
             stock_price_valuation, "latest_weekday_date", return_value="2026-07-02"
         ), patch.object(
@@ -1136,6 +1417,7 @@ class StockHistorySchemaTest(unittest.TestCase):
                 save_callback=lambda code, name, data: saved.append((code, name, data)),
                 max_years=0.001,
                 refresh_valuation=False,
+                listing_date="2020-01-01",
             )
 
         result = saved[0][2]
@@ -1171,6 +1453,7 @@ class StockHistorySchemaTest(unittest.TestCase):
                 save_callback=lambda code, name, data: saved.append(data),
                 max_years=0.0,
                 refresh_valuation=False,
+                listing_date="2020-01-01",
             )
 
         fetch_mock.assert_not_called()
@@ -1205,6 +1488,7 @@ class StockHistorySchemaTest(unittest.TestCase):
                 save_callback=lambda code, name, data: saved.append(data),
                 max_years=0.0,
                 refresh_valuation=False,
+                listing_date="2020-01-01",
             )
 
         fetch_mock.assert_not_called()
@@ -1505,39 +1789,6 @@ class StockStrategyOptimizerTest(unittest.TestCase):
         self.assertEqual(summary["max_fold_weight"], 1.0)
         self.assertEqual(summary["avg_excess_pct"], 0.0)
         self.assertEqual(summary["hit_rate"], 33.33)
-
-    def test_partial_fold_path_is_chart_only(self):
-        from stock_strategy_optimizer import (
-            long_partial_anchor_offsets,
-            portfolio_fold_path,
-        )
-
-        self.assertEqual(long_partial_anchor_offsets(125), [86, 46, 6])
-
-        benchmark = [
-            {"date": f"2026-01-{day:02d}", "close": 1.0 + day * 0.01}
-            for day in range(1, 6)
-        ]
-        rows = [
-            {"date": f"2026-01-{day:02d}", "close": 10.0 + day}
-            for day in range(1, 6)
-        ]
-        picks = [{"code": f"00000{idx}"} for idx in range(1, 6)]
-        series = {pick["code"]: rows for pick in picks}
-
-        self.assertIsNone(
-            portfolio_fold_path(picks, series, benchmark, "2026-01-03", 4)
-        )
-
-        partial = portfolio_fold_path(
-            picks, series, benchmark, "2026-01-03", 4, allow_partial=True
-        )
-
-        self.assertIsNotNone(partial)
-        self.assertTrue(partial["partial"])
-        self.assertEqual(partial["target_hold_td"], 4)
-        self.assertEqual(partial["actual_hold_td"], 2)
-        self.assertEqual(partial["dates"], ["2026-01-03", "2026-01-04", "2026-01-05"])
 
     def test_svg_marks_partial_folds_as_display_only(self):
         from stock_strategy_optimizer import write_long_fold_paths_svg

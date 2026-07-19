@@ -26,10 +26,18 @@
     const klineCache = new Map();
     let radarContextMeta = {};
     let radarContextByCode = new Map();
-    const RADAR_BUY_PATTERNS = new Set(["P1", "P2", "P3", "P5", "P21", "P23", "P24", "P25"]);
-    const RADAR_RISK_PATTERNS = new Set(["P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26"]);
+    let radarPatternCatalogByCode = new Map();
+    const HIDDEN_NOTE_PREFIXES = [
+      "长线资金面已挂载：",
+      "CSI300 long-term membership is proxied",
+    ];
+    const WARNING_COPY_OVERRIDES = new Map([
+      ["近期上龙虎榜，长线按避雷处理", "近期上龙虎榜，波动加剧"],
+      ["近期上龙虎榜(避雷)", "近期上龙虎榜，波动加剧"],
+    ]);
 
     const $ = (id) => document.getElementById(id);
+    const warningCopy = (value) => WARNING_COPY_OVERRIDES.get(String(value)) || String(value);
     const status = (text) => {
       const node = $("status");
       if (node) node.textContent = text;
@@ -75,6 +83,13 @@
       return payload;
     }
 
+    async function fetchRadarPatternCatalog() {
+      const resp = await fetch("/api/radar/patterns");
+      const payload = await resp.json();
+      if (!resp.ok) throw new Error(payload.error || "radar pattern catalog failed");
+      return Array.isArray(payload.patterns) ? payload.patterns : [];
+    }
+
     function acceptRadarContext(payload) {
       const context = payload || {};
       radarContextMeta = context;
@@ -85,13 +100,23 @@
       );
     }
 
+    function acceptRadarPatternCatalog(patterns) {
+      radarPatternCatalogByCode = new Map(
+        (Array.isArray(patterns) ? patterns : [])
+          .map((pattern) => [String((pattern && pattern.code) || "").toUpperCase(), pattern])
+          .filter(([code]) => /^P\d+$/.test(code))
+      );
+    }
+
     async function loadRadarContext() {
-      try {
-        const payload = await fetchRadarContext();
-        if (!disposed) acceptRadarContext(payload);
-      } catch (err) {
-        /* 雷达缓存不可用时不阻塞策略计算。 */
-      }
+      const [contextResult, catalogResult] = await Promise.allSettled([
+        fetchRadarContext(),
+        fetchRadarPatternCatalog(),
+      ]);
+      if (disposed) return;
+      if (contextResult.status === "fulfilled") acceptRadarContext(contextResult.value);
+      if (catalogResult.status === "fulfilled") acceptRadarPatternCatalog(catalogResult.value);
+      /* 雷达缓存或形态目录不可用时不阻塞策略计算，未知形态使用中性色。 */
     }
 
     async function init() {
@@ -918,9 +943,7 @@
     function longPoolRules() {
       const cfg = config.long;
       return [
-        ["基础范围", "A股基础股票池，叠加沪深300成员、行情快照、财务与K线数据"],
         ["ST过滤", cfg.exclude_st ? "剔除名称包含 ST、*ST 或 S 前缀的股票" : "不过滤ST股票，风险只进入结果提示"],
-        ["沪深300", cfg.require_csi300 ? "必须是当前沪深300成分股" : "不强制当前成分股，成分稳定性只参与打分"],
         ["历史回撤", cfg.require_high_drawdown ? `已启用：历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `未启用：勾选「高点回撤过滤」后，才会按跌幅下限 ${fmt(cfg.min_high_drawdown_pct, 0)}% 硬过滤`],
         ["市值门槛", `总市值不低于 ${fmt(cfg.min_market_cap_yi, 0)} 亿元`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
@@ -943,9 +966,7 @@
     function smallcapPoolRules() {
       const cfg = config.smallcap;
       return [
-        ["基础范围", "股票池与短线/游资雷达共用 is_hot_money=1 游资小盘成员，因子与回测框架复用长线"],
         ["ST过滤", cfg.exclude_st ? "剔除名称包含 ST、*ST 或 S 前缀的股票" : "不过滤ST股票，风险只进入结果提示"],
-        ["指数约束", "不要求当前沪深300；两个指数约束因子均不展示、不评分"],
         ["市值因子", "不使用总市值、小市值因子或总市值硬门槛；小盘属性由共享股票池保证"],
         ["历史回撤", cfg.require_high_drawdown ? `已启用：历史最高收盘价至今跌幅不低于 ${fmt(cfg.min_high_drawdown_pct, 0)}%` : `未启用：勾选「高点回撤过滤」后，才会按跌幅下限 ${fmt(cfg.min_high_drawdown_pct, 0)}% 硬过滤`],
         ["评分出池", `综合分不低于 ${fmt(cfg.min_score, 0)}，按得分取前 ${fmt(cfg.top_n, 0)} 只`],
@@ -953,7 +974,10 @@
     }
 
     function renderNotes(notes) {
-      $("notes").innerHTML = notes.map((n) => `<div class="note">${esc(n)}</div>`).join("");
+      const visibleNotes = (Array.isArray(notes) ? notes : []).filter((note) =>
+        !HIDDEN_NOTE_PREFIXES.some((prefix) => String(note).startsWith(prefix))
+      );
+      $("notes").innerHTML = visibleNotes.map((note) => `<div class="note">${esc(note)}</div>`).join("");
     }
 
     function renderBars(picks) {
@@ -989,8 +1013,12 @@
     }
 
     function radarPatternTone(code) {
-      if (RADAR_BUY_PATTERNS.has(code)) return "buy";
-      if (RADAR_RISK_PATTERNS.has(code)) return "risk";
+      const meta = radarPatternCatalogByCode.get(String(code || "").toUpperCase());
+      if (!meta || radarContextMeta.pool === "etf") return "neutral";
+      const style = meta.display_style || meta.effective_style || "neutral";
+      if (style === "bullish") return "buy";
+      if (style === "momentum") return "momentum";
+      if (style === "risk") return "risk";
       return "neutral";
     }
 
@@ -1044,7 +1072,7 @@
           </td>
           <td class="score-cell"><span class="score">${fmt(pick.score)}</span><div class="name">加权覆盖 ${fmt(((pick.weighted_data_quality ?? pick.data_quality) || 0) * 100, 1)}%</div>${cachedRadarContext(pick)}</td>
           <td><div class="chips">${(pick.reasons || []).map((r) => `<span class="chip good">${esc(r)}</span>`).join("")}</div></td>
-          <td><div class="chips">${(pick.warnings || []).map((r) => `<span class="chip warn">${esc(r)}</span>`).join("") || `<span class="chip">无显著提示</span>`}</div></td>
+          <td><div class="chips">${(pick.warnings || []).map((r) => `<span class="chip warn">${esc(warningCopy(r))}</span>`).join("") || `<span class="chip">无显著提示</span>`}</div></td>
           <td><div class="chips">${topFactors.map((f) => `<span class="chip">${esc(f.label)} ${fmt(f.score, 0)}×${fmt(f.weight, 1)}</span>`).join("")}</div></td>
           <td>${detailBlock(pick)}</td>
         </tr>

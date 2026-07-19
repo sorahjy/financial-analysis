@@ -16,7 +16,7 @@
       data-fund-editor-open
       data-read-url="{{ url_for('fund.read_fund_editor_file') }}"
       data-save-url="{{ url_for('fund.save_fund_editor_file') }}"
-    >编辑funds.py</button>
+    >编辑 fund/funds.py</button>
     <button class="btn primary" type="button" data-post-url="{{ url_for('fund.refresh_fund_report') }}">刷新数据</button>
   </div>
 </section>
@@ -25,14 +25,14 @@
   <div class="fund-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="fund-editor-title">
     <header class="fund-editor-head">
       <div>
-        <h2 id="fund-editor-title">编辑funds.py</h2>
+        <h2 id="fund-editor-title">编辑 fund/funds.py</h2>
         <p data-fund-editor-path>读取中</p>
       </div>
       <button class="btn ghost" type="button" data-fund-editor-cancel>关闭</button>
     </header>
     <div class="python-editor" data-python-editor>
       <pre class="python-highlight" aria-hidden="true"><code data-fund-editor-highlight></code></pre>
-      <textarea data-fund-editor-code spellcheck="false" aria-label="funds.py Python 编辑器"></textarea>
+      <textarea data-fund-editor-code spellcheck="false" aria-label="fund/funds.py Python 编辑器"></textarea>
     </div>
     <footer class="fund-editor-actions">
       <span data-fund-editor-status role="status" aria-live="polite">未加载</span>

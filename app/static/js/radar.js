@@ -8,6 +8,15 @@
     return String(label || "").replace("空仓观望", "观望");
   }
 
+  const WARNING_COPY_OVERRIDES = new Map([
+    ["近期上龙虎榜，长线按避雷处理", "近期上龙虎榜，波动加剧"],
+    ["近期上龙虎榜(避雷)", "近期上龙虎榜，波动加剧"],
+  ]);
+
+  function normalizeEvidenceLabel(label) {
+    return WARNING_COPY_OVERRIDES.get(String(label)) || String(label || "");
+  }
+
   function phaseClass(label) {
     label = String(label || "");
     if (label.includes("🟢")) return "g";
@@ -43,6 +52,10 @@
   const SIG_ACCENT = { buy: "sg", hold: "sh", sell: "ss" };
   const PATTERN_BACKTEST_BUY_CODES = ["P1", "P2", "P3", "P5", "P21", "P23", "P24", "P25"];
   const DISTRIBUTION_WARNING_PATTERN_CODES = ["P14", "P15", "P16", "P17", "P19", "P20", "P22", "P26"];
+  const PATTERN_SELL_PRESET_CODES = ["P11", ...DISTRIBUTION_WARNING_PATTERN_CODES];
+  const PATTERN_BACKTEST_BUY_CODE_SET = new Set(PATTERN_BACKTEST_BUY_CODES);
+  const PATTERN_SELL_PRESET_CODE_SET = new Set(PATTERN_SELL_PRESET_CODES);
+  const NO_PATTERN_FILTER = "__none__";
   const patternRuleCodes = (rule, fallback) => {
     const source = Array.isArray(rule && rule.pattern_codes) ? rule.pattern_codes : fallback;
     return Array.from(new Set(source.map((code) => String(code || "").toUpperCase()).filter((code) => /^P\d+$/.test(code))))
@@ -117,6 +130,8 @@
     let industryHeatFetchSeq = 0;
     let sw2Options = [];
     let selectedSw2Industries = new Set();
+    let patternOptions = [];
+    let selectedPatterns = new Set();
     const $ = (id) => document.getElementById(id);
 
     function openInsightModal(id) {
@@ -364,10 +379,11 @@
 
     function patternTagClass(code) {
       const meta = patternMap[code];
-      if (!meta || !meta.effective || isEtfMode()) return "pd";
-      if (meta.effective_style === "bullish") return "pg";
-      if (meta.effective_style === "momentum") return "po";
-      if (meta.effective_style === "risk") return "pr";
+      if (!meta || isEtfMode()) return "pd";
+      const style = meta.display_style || meta.effective_style || "neutral";
+      if (style === "bullish") return "pg";
+      if (style === "momentum") return "po";
+      if (style === "risk") return "pr";
       return "pd";
     }
 
@@ -378,6 +394,13 @@
         ? (isEtfMode() ? "股票池实测有效，ETF尚未专项回测" : "★全历史实测有效")
         : "";
       return [validation, meta.name, meta.desc].filter(Boolean).join(" · ");
+    }
+
+    function stockPatternCodes(stock) {
+      const source = Array.isArray(stock && stock.patterns) ? stock.patterns : [];
+      return Array.from(new Set(source
+        .map((code) => String(code || "").toUpperCase())
+        .filter((code) => /^P\d+$/.test(code))));
     }
 
     function normalizePayload(raw) {
@@ -643,9 +666,12 @@
     function setSw2PanelOpen(open) {
       const panel = $("radar-sw2-panel");
       const trigger = $("radar-sw2-trigger");
+      const container = $("radar-sw2-filter");
       if (!panel || !trigger) return;
+      if (open) setPatternPanelOpen(false);
       panel.hidden = !open;
       trigger.setAttribute("aria-expanded", open ? "true" : "false");
+      if (container) container.classList.toggle("is-open", open);
       if (open) {
         renderSw2Filter();
         const search = $("radar-sw2-search");
@@ -656,6 +682,8 @@
     function onDocumentClick(ev) {
       const box = $("radar-sw2-filter");
       if (box && !box.contains(ev.target)) setSw2PanelOpen(false);
+      const patternBox = $("radar-pattern-filter");
+      if (patternBox && !patternBox.contains(ev.target)) setPatternPanelOpen(false);
     }
 
     function onDocumentKeyDown(ev) {
@@ -664,10 +692,14 @@
         return;
       }
       if (ev.key !== "Escape") return;
-      const panel = $("radar-sw2-panel");
-      const wasOpen = Boolean(panel && !panel.hidden);
+      const sw2Panel = $("radar-sw2-panel");
+      const patternPanel = $("radar-pattern-panel");
+      const sw2WasOpen = Boolean(sw2Panel && !sw2Panel.hidden);
+      const patternWasOpen = Boolean(patternPanel && !patternPanel.hidden);
       setSw2PanelOpen(false);
-      if (wasOpen) $("radar-sw2-trigger").focus();
+      setPatternPanelOpen(false);
+      if (patternWasOpen) $("radar-pattern-trigger").focus();
+      else if (sw2WasOpen) $("radar-sw2-trigger").focus();
     }
 
     // ---------- 数据加载 ----------
@@ -682,6 +714,7 @@
         renderProductionPatterns(patternCatalog);
         renderScoringModel(scoringModel);
         renderPhaseFilter();
+        syncPatternFilter();
         renderPhaseChips();
         applyFilters();
         if (selectedCode) {
@@ -749,6 +782,7 @@
         renderProductionPatterns(patternCatalog);
         renderScoringModel(scoringModel);
         renderPhaseFilter();
+        syncPatternFilter();
         renderPhaseChips();
         applyFilters();
         if (selectedCode) {
@@ -893,11 +927,178 @@
       if (cur && orderedPhases().includes(cur)) sel.value = cur;
     }
 
+    function buildPatternOptions() {
+      const counts = new Map();
+      let unmatched = 0;
+      stocks.forEach((stock) => {
+        const codes = stockPatternCodes(stock);
+        if (!codes.length) unmatched += 1;
+        codes.forEach((code) => counts.set(code, (counts.get(code) || 0) + 1));
+      });
+      const catalogCodes = patternCatalog
+        .map((pattern) => String((pattern && pattern.code) || "").toUpperCase())
+        .filter((code) => counts.has(code));
+      const seen = new Set(catalogCodes);
+      const extras = Array.from(counts.keys())
+        .filter((code) => !seen.has(code))
+        .sort((a, b) => (Number(a.slice(1)) || 0) - (Number(b.slice(1)) || 0));
+      const options = catalogCodes.concat(extras).map((code) => {
+        const meta = patternMap[code] || {};
+        return {
+          code,
+          name: meta.name || code,
+          category: meta.category || "其他",
+          signal: meta.signal || "observe",
+          count: counts.get(code) || 0,
+        };
+      });
+      if (unmatched) {
+        options.push({
+          code: NO_PATTERN_FILTER,
+          name: "未命中形态",
+          category: "其他",
+          signal: "observe",
+          count: unmatched,
+        });
+      }
+      return options;
+    }
+
+    function patternOptionTone(option) {
+      if (!option || option.code === NO_PATTERN_FILTER) return "";
+      if (option.category === "拉升") return "rally";
+      if (PATTERN_BACKTEST_BUY_CODE_SET.has(option.code)) return "buy";
+      if (PATTERN_SELL_PRESET_CODE_SET.has(option.code)) return "sell";
+      return "";
+    }
+
+    function isPatternBuyPreset(option) {
+      return !!option && PATTERN_BACKTEST_BUY_CODE_SET.has(option.code);
+    }
+
+    function isPatternSellPreset(option) {
+      return !!option && PATTERN_SELL_PRESET_CODE_SET.has(option.code);
+    }
+
+    function isPatternRallyPreset(option) {
+      return !!option && option.category === "拉升";
+    }
+
+    function pickedPatternOptions() {
+      return patternOptions.filter((option) => selectedPatterns.has(option.code));
+    }
+
+    function syncPatternFilter() {
+      patternOptions = buildPatternOptions();
+      const validCodes = new Set(patternOptions.map((option) => option.code));
+      selectedPatterns = new Set(Array.from(selectedPatterns).filter((code) => validCodes.has(code)));
+      renderPatternFilter();
+    }
+
+    function visiblePatternOptions() {
+      const q = (($("radar-pattern-search") && $("radar-pattern-search").value) || "").trim().toLowerCase();
+      if (!q) return patternOptions;
+      return patternOptions.filter((option) =>
+        `${option.code} ${option.name} ${option.category}`.toLowerCase().includes(q)
+      );
+    }
+
+    function renderPatternFilter() {
+      const trigger = $("radar-pattern-trigger");
+      const summary = $("radar-pattern-summary");
+      const selectedBox = $("radar-pattern-selected");
+      const optionsBox = $("radar-pattern-options");
+      if (!trigger || !summary || !selectedBox || !optionsBox) return;
+
+      const picked = pickedPatternOptions();
+      if (!picked.length) summary.textContent = patternOptions.length ? "全部" : "无形态";
+      else if (picked.length === 1) summary.textContent = picked[0].code === NO_PATTERN_FILTER ? "未命中" : picked[0].code;
+      else summary.textContent = `已选 ${picked.length} 个`;
+      trigger.disabled = !patternOptions.length;
+      trigger.classList.toggle("is-filtered", picked.length > 0);
+
+      selectedBox.innerHTML = picked.length
+        ? picked.map((option) => `<button type="button" class="industry-chip pattern-chip ${patternOptionTone(option)}" data-code="${esc(option.code)}" title="移除 ${esc(option.name)}">${esc(option.code === NO_PATTERN_FILTER ? "未命中" : option.code)}</button>`).join("")
+        : "<span>全部命中形态</span>";
+      selectedBox.querySelectorAll("button").forEach((button) => {
+        button.onclick = () => {
+          selectedPatterns.delete(button.dataset.code);
+          renderPatternFilter();
+          applyFilters();
+        };
+      });
+
+      const shown = visiblePatternOptions();
+      optionsBox.innerHTML = shown.length ? shown.map((option) => {
+        const checked = selectedPatterns.has(option.code) ? " checked" : "";
+        const displayCode = option.code === NO_PATTERN_FILTER ? "—" : option.code;
+        return `<label class="industry-option pattern-option" title="${esc(option.code === NO_PATTERN_FILTER ? option.name : `${option.code} ${option.name}`)} · ${option.count}只">
+          <input type="checkbox" value="${esc(option.code)}"${checked}>
+          <span class="pattern-option-code">${esc(displayCode)}</span>
+          <span class="industry-option-name">${esc(option.name)}</span>
+          <span class="pattern-option-category">${esc(option.category)}</span>
+          <span class="industry-option-count">${option.count}只</span>
+        </label>`;
+      }).join("") : '<div class="industry-empty">无匹配形态</div>';
+      optionsBox.querySelectorAll("input[type='checkbox']").forEach((input) => {
+        input.onchange = () => {
+          if (input.checked) selectedPatterns.add(input.value);
+          else selectedPatterns.delete(input.value);
+          renderPatternFilter();
+          applyFilters();
+        };
+      });
+
+      const clear = $("radar-pattern-clear");
+      if (clear) clear.disabled = picked.length === 0;
+      const selectAll = $("radar-pattern-select-all");
+      if (selectAll) selectAll.disabled = shown.length === 0;
+      const presets = {
+        "radar-pattern-buy": isPatternBuyPreset,
+        "radar-pattern-sell": isPatternSellPreset,
+        "radar-pattern-rally": isPatternRallyPreset,
+      };
+      Object.entries(presets).forEach(([id, predicate]) => {
+        const button = $(id);
+        if (!button) return;
+        const presetCodes = patternOptions.filter(predicate).map((option) => option.code);
+        const active = presetCodes.length > 0
+          && presetCodes.length === selectedPatterns.size
+          && presetCodes.every((code) => selectedPatterns.has(code));
+        button.disabled = presetCodes.length === 0;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-pressed", active ? "true" : "false");
+      });
+    }
+
+    function setPatternPanelOpen(open) {
+      const panel = $("radar-pattern-panel");
+      const trigger = $("radar-pattern-trigger");
+      const container = $("radar-pattern-filter");
+      if (!panel || !trigger) return;
+      if (open) setSw2PanelOpen(false);
+      panel.hidden = !open;
+      trigger.setAttribute("aria-expanded", open ? "true" : "false");
+      if (container) container.classList.toggle("is-open", open);
+      if (open) {
+        renderPatternFilter();
+        const search = $("radar-pattern-search");
+        if (search) search.focus({ preventScroll: true });
+      }
+    }
+
+    function selectPatternPreset(predicate) {
+      selectedPatterns = new Set(patternOptions.filter(predicate).map((option) => option.code));
+      renderPatternFilter();
+      applyFilters();
+    }
+
     // ---------- 筛选 + 表格 ----------
     function currentFilters() {
       return {
         q: ($("radar-search").value || "").trim().toLowerCase(),
         phase: $("radar-phase-filter").value || "",
+        patterns: new Set(selectedPatterns),
         minScore: Number($("radar-min-score").value || 0),
         hideDist: $("radar-hide-dist").checked,
         sw2: new Set(selectedSw2Industries),
@@ -908,6 +1109,12 @@
       const f = currentFilters();
       const list = stocks.filter((s) => {
         if (f.phase && s.pattern_phase !== f.phase) return false;
+        const patterns = stockPatternCodes(s);
+        if (f.patterns.size) {
+          const matchedSelected = patterns.some((code) => f.patterns.has(code));
+          const matchedUnhit = !patterns.length && f.patterns.has(NO_PATTERN_FILTER);
+          if (!matchedSelected && !matchedUnhit) return false;
+        }
         if (f.hideDist && String(s.pattern_phase || "").includes("出货")) return false;
         if ((Number(s.ambush_score) || 0) < f.minScore) return false;
         if (f.sw2.size && !f.sw2.has(stockSw2Name(s))) return false;
@@ -1002,7 +1209,7 @@
           : "<span class='dim'>-</span>";
         const evCell = (s.evidence && s.evidence.length)
           ? s.evidence.map((e) => {
-              const lab = (typeof e === "string") ? e : (e.label || "");
+              const lab = normalizeEvidenceLabel((typeof e === "string") ? e : (e.label || ""));
               const kind = (typeof e === "string") ? "" : (e.kind || "");
               const cls = kind === "bullish" ? "ev-bull" : kind === "bearish" ? "ev-warn" : "ev-neutral";
               return `<span class="ev ${cls}">${esc(lab)}</span>`;
@@ -2014,6 +2221,16 @@
         startJob("/api/radar/refresh-data", "全量数据刷新", null);
       };
       $("radar-live-quote").addEventListener("change", (ev) => setRealtimeEnabled(ev.target.checked));
+      $("radar-pattern-trigger").onclick = () => setPatternPanelOpen($("radar-pattern-panel").hidden);
+      $("radar-pattern-search").addEventListener("input", renderPatternFilter);
+      $("radar-pattern-clear").onclick = () => selectPatternPreset(() => false);
+      $("radar-pattern-select-all").onclick = () => {
+        const visibleCodes = new Set(visiblePatternOptions().map((option) => option.code));
+        selectPatternPreset((option) => visibleCodes.has(option.code));
+      };
+      $("radar-pattern-buy").onclick = () => selectPatternPreset(isPatternBuyPreset);
+      $("radar-pattern-sell").onclick = () => selectPatternPreset(isPatternSellPreset);
+      $("radar-pattern-rally").onclick = () => selectPatternPreset(isPatternRallyPreset);
       $("radar-sw2-trigger").onclick = () => setSw2PanelOpen($("radar-sw2-panel").hidden);
       $("radar-sw2-search").addEventListener("input", renderSw2Filter);
       $("radar-sw2-min-heat").addEventListener("input", renderSw2Filter);

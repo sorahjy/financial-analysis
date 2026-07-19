@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 
+from refresh_workflow import is_no_proxy_enabled
+
 # Scrapy settings for ttjj_spider project
 #
 # For simplicity, this file contains only settings considered important or
@@ -11,8 +13,14 @@
 
 BOT_NAME = 'ttjj_spider'
 
-SPIDER_MODULES = ['ttjj_spider.spiders']
-NEWSPIDER_MODULE = 'ttjj_spider.spiders'
+if is_no_proxy_enabled("FUND_CRAWL_NO_PROXY"):
+    # Prevent Scrapy's HttpProxyMiddleware from consulting environment proxy
+    # variables.  fund_data_refresh also strips them from child processes, but
+    # this setting keeps direct/legacy marker launches deterministic as well.
+    HTTPPROXY_ENABLED = False
+
+SPIDER_MODULES = ['fund.ttjj_spider.spiders']
+NEWSPIDER_MODULE = 'fund.ttjj_spider.spiders'
 
 
 # Crawl responsibly by identifying yourself (and your website) on the user-agent
@@ -85,14 +93,14 @@ DOWNLOAD_TIMEOUT = 20
 # Enable or disable spider middlewares
 # See https://doc.scrapy.org/en/latest/topics/spider-middleware.html
 #SPIDER_MIDDLEWARES = {
-#    'ttjj_spider.middlewares.TtjjSpiderSpiderMiddleware': 543,
+#    'fund.ttjj_spider.middlewares.TtjjSpiderSpiderMiddleware': 543,
 #}
 
 # Enable or disable downloader middlewares
 # See https://doc.scrapy.org/en/latest/topics/downloader-middleware.html
 DOWNLOADER_MIDDLEWARES = {
-    'ttjj_spider.middlewares.TtjjSpiderDownloaderMiddleware': 543,
-    'ttjj_spider.middlewares.MyUserAgent': 544,
+    'fund.ttjj_spider.middlewares.TtjjSpiderDownloaderMiddleware': 543,
+    'fund.ttjj_spider.middlewares.MyUserAgent': 544,
 }
 
 # Enable or disable extensions
@@ -104,7 +112,7 @@ DOWNLOADER_MIDDLEWARES = {
 # Configure item pipelines
 # See https://doc.scrapy.org/en/latest/topics/item-pipeline.html
 ITEM_PIPELINES = {
-    'ttjj_spider.pipelines.TtjjSpiderPipeline': 300,
+    'fund.ttjj_spider.pipelines.TtjjSpiderPipeline': 300,
 }
 
 # Enable and configure the AutoThrottle extension (disabled by default)

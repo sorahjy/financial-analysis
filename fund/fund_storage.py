@@ -1,3 +1,5 @@
+"""基金数据的 SQLite 持久化层。"""
+
 from __future__ import annotations
 
 import json

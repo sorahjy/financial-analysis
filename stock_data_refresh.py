@@ -22,6 +22,11 @@ from typing import Any, Dict, Iterable, List, Optional
 
 import stock_storage as ss
 from app.services.job_service import terminate_process_tree
+from refresh_workflow import (
+    build_child_environment,
+    is_no_proxy_enabled,
+    strip_proxy_environment,
+)
 from stock_crawl_common import (
     daily_payload_from_history_records,
     history_payload_from_records,
@@ -134,9 +139,6 @@ def _attach_failure_sidecar(step: StepResult, path: Path) -> None:
             "processed",
             "write_enqueued",
             "write_completed",
-            "retry_attempted",
-            "retry_recovered",
-            "retry_failed",
             "failed",
             "failure_details",
         ):
@@ -444,7 +446,19 @@ def refresh_before_server(
     no_proxy: bool = False,
 ) -> Dict[str, Any]:
     python_bin = resolve_python()
-    env = os.environ.copy()
+    effective_no_proxy = no_proxy or is_no_proxy_enabled("STOCK_CRAWL_NO_PROXY")
+    if effective_no_proxy:
+        # Local refresh steps run inside this process, so clearing only the
+        # child environment would still leave them routed through the proxy.
+        strip_proxy_environment(
+            os.environ,
+            no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+        )
+    env = build_child_environment(
+        os.environ,
+        no_proxy=effective_no_proxy,
+        no_proxy_marker="STOCK_CRAWL_NO_PROXY",
+    )
     env.setdefault("PYTHONUNBUFFERED", "1")
     env.setdefault("TQDM_DISABLE", "1")
     # 并发按本机 CPU 核数自适应（旧硬编码 48 线程 + 32 进程在 ~10 核机器上是数倍过订阅，
@@ -455,16 +469,6 @@ def refresh_before_server(
     # 日线源进程池：腾讯,新浪；用 STOCK_DAILY_PROCESS_WORKERS / _SOURCES 环境变量可覆盖
     env.setdefault("STOCK_DAILY_PROCESS_WORKERS", str(min(32, cpu)))
     env.setdefault("STOCK_DAILY_PROCESS_SOURCES", "腾讯,新浪")
-    if no_proxy:
-        # 数据源均为境内接口，绕过本地代理直连；NO_PROXY=* 同时屏蔽系统代理
-        for var in ("http_proxy", "https_proxy", "all_proxy",
-                    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"):
-            env.pop(var, None)
-            os.environ.pop(var, None)
-        for key, value in (("NO_PROXY", "*"), ("no_proxy", "*"), ("STOCK_CRAWL_NO_PROXY", "1")):
-            env[key] = value
-            os.environ[key] = value
-
     full = mode == "full"
     if mode not in {"full", "quick", "capital-only"}:
         raise ValueError(f"unsupported refresh mode: {mode}")
@@ -618,20 +622,37 @@ def main() -> None:
     report = refresh_before_server(
         mode=args.mode,
         timeout=args.timeout or None,
-        no_proxy=args.no_proxy,
+        no_proxy=(
+            args.no_proxy
+            or is_no_proxy_enabled("STOCK_CRAWL_NO_PROXY")
+        ),
     )
-    print(json.dumps(report, ensure_ascii=False, indent=2))
+    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
     if not report.get("ok"):
         # Print concise diagnostics after the large JSON payload so the web
         # job's retained log tail shows the actual stock/stage/error instead
         # of ending on unrelated health-report braces.
-        for detail in report.get("failures", [])[:10]:
-            if not isinstance(detail, dict):
-                continue
+        failures = [
+            detail for detail in report.get("failures", [])
+            if isinstance(detail, dict)
+        ]
+        if failures:
+            print(
+                f"[refresh] 失败明细共 {len(failures)} 条：",
+                file=sys.stderr,
+                flush=True,
+            )
+        for detail in failures:
             code = detail.get("code") or "全局"
+            name = str(detail.get("name") or "").strip()
             stage = detail.get("stage") or detail.get("step") or "stock_refresh"
             error = detail.get("error") or "unknown error"
-            print(f"[refresh failure] {code} [{stage}] {error}", file=sys.stderr)
+            identity = f"{code} {name}" if name else str(code)
+            print(
+                f"[refresh failure] {identity} [{stage}] {error}",
+                file=sys.stderr,
+                flush=True,
+            )
         raise SystemExit(1)
 
 
