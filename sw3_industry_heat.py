@@ -23,7 +23,8 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Seque
 import requests
 
 
-SW3_INDUSTRY_HEAT_SCHEMA = "sw3_industry_heat.v2"
+SW3_INDUSTRY_HEAT_SCHEMA = "sw3_industry_heat.v3"
+SW3_INDUSTRY_HEAT_V2_SCHEMA = "sw3_industry_heat.v2"
 SW3_INDUSTRY_HEAT_LEGACY_SCHEMA = "sw3_industry_heat.v1"
 SW3_INDUSTRY_HEAT_FILE = Path("data/capital/sw3_industry_heat.json")
 SW3_INDUSTRY_HEAT_HISTORY_CACHE_SCHEMA = "sw3_industry_heat_history_cache.v1"
@@ -419,6 +420,9 @@ def _base_payload(
             "hottest_rank": "近20个共同交易日成交额合计降序（日均排序等价）",
             "rising_candidate": "末5日平均成交额份额高于首5日，且20日趋势相关系数>0",
             "rising_score": "60%×份额增幅横截面分位 + 40%×趋势相关系数横截面分位",
+            "falling_candidate": "末5日平均成交额份额低于首5日，且20日趋势相关系数<0",
+            "falling_score": "-份额增幅与-趋势相关系数分别取横截面分位，按60%/40%合成后记为负数",
+            "trend_score": "升温沿用正上升分，降温使用负下降分；合并趋势榜按带符号分数降序",
             "ranking_storage": "rankings保存全量紧凑排名；完整指标与20日序列统一保存在industries",
             "amount_fallback": (
                 "申万趋势停更行业可用官方成交额份额估算；若全市场只多出一个已收盘交易日，"
@@ -439,6 +443,8 @@ def _base_payload(
             "eligible_segment_count": 0,
             "eligible_coverage_pct": 0.0,
             "rising_candidate_count": 0,
+            "falling_candidate_count": 0,
+            "trend_candidate_count": 0,
             "market_cap_source": market_cap_source,
             "market_cap_expected_memberships": 0,
             "market_cap_known_memberships": 0,
@@ -458,7 +464,7 @@ def _base_payload(
             "latest_amount_added_industry_count": 0,
             "latest_amount_snapshot": {},
         },
-        "rankings": {"hottest": [], "rising": []},
+        "rankings": {"hottest": [], "rising": [], "falling": [], "trend": []},
         "industries": [],
         "errors": errors,
     }
@@ -649,32 +655,94 @@ def compute_sw3_industry_heat(
             "rising_trend_percentile": None,
             "rising_score": None,
             "is_rising_candidate": False,
+            "falling_growth_percentile": None,
+            "falling_trend_percentile": None,
+            "falling_score": None,
+            "is_falling_candidate": False,
+            "trend_score": None,
             "daily": daily,
         })
 
-    candidates = [
+    rising_candidates = [
         row for row in industries
         if row["last5_vs_first5_share_pct"] is not None
         and row["last5_vs_first5_share_pct"] > 0
         and row["trend_correlation"] > 0
     ]
-    growth_scores = _average_rank_percentiles(candidates, "last5_vs_first5_share_pct")
-    trend_scores = _average_rank_percentiles(candidates, "trend_correlation")
-    for row in candidates:
+    rising_growth_scores = _average_rank_percentiles(
+        rising_candidates, "last5_vs_first5_share_pct"
+    )
+    rising_trend_scores = _average_rank_percentiles(
+        rising_candidates, "trend_correlation"
+    )
+    for row in rising_candidates:
         code = row["segment_code"]
         row["is_rising_candidate"] = True
-        row["rising_growth_percentile"] = round(growth_scores[code], 2)
-        row["rising_trend_percentile"] = round(trend_scores[code], 2)
-        row["rising_score"] = round(growth_scores[code] * 0.60 + trend_scores[code] * 0.40, 2)
+        row["rising_growth_percentile"] = round(rising_growth_scores[code], 2)
+        row["rising_trend_percentile"] = round(rising_trend_scores[code], 2)
+        row["rising_score"] = round(
+            rising_growth_scores[code] * 0.60 + rising_trend_scores[code] * 0.40,
+            2,
+        )
+        row["trend_score"] = row["rising_score"]
+
+    falling_candidates = [
+        row for row in industries
+        if row["last5_vs_first5_share_pct"] is not None
+        and row["last5_vs_first5_share_pct"] < 0
+        and row["trend_correlation"] < 0
+    ]
+    falling_magnitudes = [
+        {
+            "segment_code": row["segment_code"],
+            "share_decline": -row["last5_vs_first5_share_pct"],
+            "negative_correlation": -row["trend_correlation"],
+        }
+        for row in falling_candidates
+    ]
+    falling_growth_scores = _average_rank_percentiles(
+        falling_magnitudes, "share_decline"
+    )
+    falling_trend_scores = _average_rank_percentiles(
+        falling_magnitudes, "negative_correlation"
+    )
+    for row in falling_candidates:
+        code = row["segment_code"]
+        row["is_falling_candidate"] = True
+        row["falling_growth_percentile"] = round(falling_growth_scores[code], 2)
+        row["falling_trend_percentile"] = round(falling_trend_scores[code], 2)
+        row["falling_score"] = round(
+            -(falling_growth_scores[code] * 0.60 + falling_trend_scores[code] * 0.40),
+            2,
+        )
+        row["trend_score"] = row["falling_score"]
 
     hottest_all = sorted(
         industries,
         key=lambda row: (-row["amount_20d_yi"], row["segment_code"]),
     )
     rising_all = sorted(
-        candidates,
+        rising_candidates,
         key=lambda row: (
             -row["rising_score"],
+            -row["last5_vs_first5_share_pct"],
+            -row["trend_correlation"],
+            row["segment_code"],
+        ),
+    )
+    falling_all = sorted(
+        falling_candidates,
+        key=lambda row: (
+            row["falling_score"],
+            row["last5_vs_first5_share_pct"],
+            row["trend_correlation"],
+            row["segment_code"],
+        ),
+    )
+    trend_all = sorted(
+        rising_candidates + falling_candidates,
+        key=lambda row: (
+            -row["trend_score"],
             -row["last5_vs_first5_share_pct"],
             -row["trend_correlation"],
             row["segment_code"],
@@ -684,9 +752,17 @@ def compute_sw3_industry_heat(
         row["hottest_rank"] = rank
     for rank, row in enumerate(rising_all, 1):
         row["rising_rank"] = rank
+    for rank, row in enumerate(falling_all, 1):
+        row["falling_rank"] = rank
+    for rank, row in enumerate(trend_all, 1):
+        row["trend_rank"] = rank
     for row in industries:
         if "rising_rank" not in row:
             row["rising_rank"] = None
+        if "falling_rank" not in row:
+            row["falling_rank"] = None
+        if "trend_rank" not in row:
+            row["trend_rank"] = None
 
     quality = payload["data_quality"]
     quality["eligible_segment_count"] = len(industries)
@@ -694,6 +770,8 @@ def compute_sw3_industry_heat(
         len(industries) / len(segment_map) * 100.0, 2
     ) if segment_map else 0.0
     quality["rising_candidate_count"] = len(rising_all)
+    quality["falling_candidate_count"] = len(falling_all)
+    quality["trend_candidate_count"] = len(trend_all)
     quality["market_cap_expected_memberships"] = sum(
         row["market_cap_expected_member_count"] for row in industries
     )
@@ -760,6 +838,31 @@ def compute_sw3_industry_heat(
             }
             for rank, row in enumerate(rising_all, 1)
         ],
+        "falling": [
+            {
+                "rank": rank,
+                "segment_code": row["segment_code"],
+                "segment_name": row["segment_name"],
+                "parent_segment": row["parent_segment"],
+                "last5_vs_first5_share_pct": row["last5_vs_first5_share_pct"],
+                "trend_correlation": row["trend_correlation"],
+                "falling_score": row["falling_score"],
+            }
+            for rank, row in enumerate(falling_all, 1)
+        ],
+        "trend": [
+            {
+                "rank": rank,
+                "segment_code": row["segment_code"],
+                "segment_name": row["segment_name"],
+                "parent_segment": row["parent_segment"],
+                "last5_vs_first5_share_pct": row["last5_vs_first5_share_pct"],
+                "trend_correlation": row["trend_correlation"],
+                "trend_score": row["trend_score"],
+                "direction": "rising" if row["is_rising_candidate"] else "falling",
+            }
+            for rank, row in enumerate(trend_all, 1)
+        ],
     }
     payload["industries"] = sorted(industries, key=lambda row: row["segment_code"])
     payload["errors"] = sorted(
@@ -782,8 +885,10 @@ def validate_complete_report(
         except (TypeError, ValueError):
             return 0
 
-    if payload.get("schema") != SW3_INDUSTRY_HEAT_SCHEMA:
+    schema = payload.get("schema")
+    if schema not in {SW3_INDUSTRY_HEAT_SCHEMA, SW3_INDUSTRY_HEAT_V2_SCHEMA}:
         raise IndustryHeatIncompleteError("热度报告 schema 无效")
+    is_v3 = schema == SW3_INDUSTRY_HEAT_SCHEMA
     required_date = _date_text(required_as_of_date)
     actual_date = _date_text(payload.get("as_of_date"))
     if required_as_of_date and not required_date:
@@ -855,6 +960,91 @@ def validate_complete_report(
         if not is_candidate and row.get("rising_rank") is not None:
             raise IndustryHeatIncompleteError("非升温行业不应包含升温排名")
 
+    falling_candidates: List[Mapping[str, Any]] = []
+    trend_candidates: List[Mapping[str, Any]] = []
+    if is_v3:
+        falling_candidates = [
+            row for row in industries
+            if (_float_or_none(row.get("last5_vs_first5_share_pct")) or 0.0) < 0
+            and (_float_or_none(row.get("trend_correlation")) or 0.0) < 0
+        ]
+        falling_candidate_codes = {
+            _segment_code(row.get("segment_code")) for row in falling_candidates
+        }
+        falling_count = len(falling_candidates)
+        if rank_value(quality.get("falling_candidate_count")) != falling_count:
+            raise IndustryHeatIncompleteError("降温行业数量与数据质量摘要不一致")
+        falling_ranks = sorted(
+            rank_value(row.get("falling_rank")) for row in falling_candidates
+        )
+        if falling_ranks != list(range(1, falling_count + 1)):
+            raise IndustryHeatIncompleteError("降温行业全量排名不连续或不完整")
+
+        trend_candidates = rising_candidates + falling_candidates
+        trend_candidate_codes = rising_candidate_codes | falling_candidate_codes
+        trend_count = len(trend_candidates)
+        if rank_value(quality.get("trend_candidate_count")) != trend_count:
+            raise IndustryHeatIncompleteError("趋势行业数量与数据质量摘要不一致")
+        trend_ranks = sorted(
+            rank_value(row.get("trend_rank")) for row in trend_candidates
+        )
+        if trend_ranks != list(range(1, trend_count + 1)):
+            raise IndustryHeatIncompleteError("趋势行业全量排名不连续或不完整")
+
+        for row in industries:
+            code = _segment_code(row.get("segment_code"))
+            is_rising = code in rising_candidate_codes
+            is_falling = code in falling_candidate_codes
+            is_trend = code in trend_candidate_codes
+            falling_score = _float_or_none(row.get("falling_score"))
+            rising_score = _float_or_none(row.get("rising_score"))
+            trend_score = _float_or_none(row.get("trend_score"))
+
+            if bool(row.get("is_falling_candidate")) != is_falling:
+                raise IndustryHeatIncompleteError("降温候选标记与计算口径不一致")
+            if is_rising:
+                if rising_score is None or rising_score < 0:
+                    raise IndustryHeatIncompleteError("升温行业缺少非负上升分")
+                if trend_score != rising_score:
+                    raise IndustryHeatIncompleteError("升温行业趋势分与上升分不一致")
+            elif is_falling:
+                if falling_score is None or falling_score > 0:
+                    raise IndustryHeatIncompleteError("降温行业缺少非正下降分")
+                if trend_score != falling_score:
+                    raise IndustryHeatIncompleteError("降温行业趋势分与下降分不一致")
+            elif trend_score is not None:
+                raise IndustryHeatIncompleteError("方向冲突或缺失行业不应包含趋势分")
+
+            if not is_rising and rising_score is not None:
+                raise IndustryHeatIncompleteError("非升温行业不应包含上升分")
+            if not is_falling:
+                if falling_score is not None or row.get("falling_rank") is not None:
+                    raise IndustryHeatIncompleteError("非降温行业不应包含下降分或降温排名")
+            if not is_trend and row.get("trend_rank") is not None:
+                raise IndustryHeatIncompleteError("非趋势行业不应包含趋势排名")
+
+        ordered_trend_codes = [
+            _segment_code(row.get("segment_code"))
+            for row in sorted(
+                trend_candidates,
+                key=lambda row: (
+                    -float(row["trend_score"]),
+                    -float(row["last5_vs_first5_share_pct"]),
+                    -float(row["trend_correlation"]),
+                    _segment_code(row.get("segment_code")),
+                ),
+            )
+        ]
+        ranked_trend_codes = [
+            _segment_code(row.get("segment_code"))
+            for row in sorted(
+                trend_candidates,
+                key=lambda row: rank_value(row.get("trend_rank")),
+            )
+        ]
+        if ranked_trend_codes != ordered_trend_codes:
+            raise IndustryHeatIncompleteError("趋势榜未按带符号趋势分降序排列")
+
     rankings = payload.get("rankings") or {}
     hottest = rankings.get("hottest")
     rising = rankings.get("rising")
@@ -862,12 +1052,23 @@ def validate_complete_report(
         raise IndustryHeatIncompleteError("最热门全量榜单不完整")
     if not isinstance(rising, list) or len(rising) != rising_count:
         raise IndustryHeatIncompleteError("升温行业全量榜单不完整")
+    falling = rankings.get("falling") if is_v3 else []
+    trend = rankings.get("trend") if is_v3 else []
+    if is_v3 and (
+        not isinstance(falling, list) or len(falling) != len(falling_candidates)
+    ):
+        raise IndustryHeatIncompleteError("降温行业全量榜单不完整")
+    if is_v3 and (
+        not isinstance(trend, list) or len(trend) != len(trend_candidates)
+    ):
+        raise IndustryHeatIncompleteError("趋势行业全量榜单不完整")
 
     def validate_refs(
         refs: Sequence[Mapping[str, Any]],
         expected_rows: Sequence[Mapping[str, Any]],
         rank_field: str,
         label: str,
+        score_field: Optional[str] = None,
     ) -> None:
         expected_codes = {
             _segment_code(row.get("segment_code"))
@@ -884,6 +1085,11 @@ def validate_complete_report(
                 raise IndustryHeatIncompleteError(f"{label}榜引用了未知行业{code}")
             if rank_value(industry_by_code[code].get(rank_field)) != rank:
                 raise IndustryHeatIncompleteError(f"{label}榜排名与行业明细不一致")
+            if score_field is not None:
+                ref_score = _float_or_none(ref.get(score_field))
+                row_score = _float_or_none(industry_by_code[code].get(score_field))
+                if ref_score is None or ref_score != row_score:
+                    raise IndustryHeatIncompleteError(f"{label}榜分数与行业明细不一致")
             ref_codes.append(code)
             ref_ranks.append(rank)
         if set(ref_codes) != expected_codes or len(ref_codes) != len(set(ref_codes)):
@@ -892,7 +1098,35 @@ def validate_complete_report(
             raise IndustryHeatIncompleteError(f"{label}榜排名不连续")
 
     validate_refs(hottest, industries, "hottest_rank", "最热门")
-    validate_refs(rising, rising_candidates, "rising_rank", "升温")
+    validate_refs(
+        rising,
+        rising_candidates,
+        "rising_rank",
+        "升温",
+        "rising_score" if is_v3 else None,
+    )
+    if is_v3:
+        validate_refs(
+            falling,
+            falling_candidates,
+            "falling_rank",
+            "降温",
+            "falling_score",
+        )
+        validate_refs(
+            trend,
+            trend_candidates,
+            "trend_rank",
+            "趋势",
+            "trend_score",
+        )
+        for ref in trend:
+            code = _segment_code(ref.get("segment_code"))
+            expected_direction = (
+                "rising" if code in rising_candidate_codes else "falling"
+            )
+            if ref.get("direction") != expected_direction:
+                raise IndustryHeatIncompleteError("趋势榜方向与行业明细不一致")
 
 
 def atomic_write_report(output_file: Path, payload: Mapping[str, Any]) -> None:

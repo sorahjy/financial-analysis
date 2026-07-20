@@ -162,9 +162,9 @@ A 股模块分为长线、小盘和短线三套策略，统一由 `stock_advance
 
 ### 5.4 股票数据持久化
 
-v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、`listing_date` 上市日期、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
+v3.1.4 起，A 股主数据不再以 `data/stock_data/CN_{code}_{name}.json` 作为主链路，而是统一写入 `data/stock_data.sqlite3`。`stock_storage.py` 负责建库、连接、schema 版本、upsert 和旧 JSON 导入：`stock_meta` 以 6 位股票代码为主键，保存名称、`listing_date` 上市日期、`history_coverage_start_date` 已验证历史覆盖边界、抓取时间、行业、质押、日线统计，以及财报、指标、分红、候选来源等 JSON blob；`stock_history` 按 `(code, date)` 存前复权日线 OHLCV、换手、涨跌幅和估值字段；`sw3_member` 保存申万三级成分、官方市值占比和本地主库回补后的市值/ROE/成长字段；`index_nav` / `index_nav_meta` 保存 510310、510580 等基准 ETF NAV。主键从文件名切到代码后，股票改名只更新 `name`，不会造成旧缓存失联。
 
-股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 补齐龙头股票基本面；游资小盘建池完成筛选后，再为本轮最终 `is_hot_money=1` 成员补齐估值、财报、指标、分红和质押。任一小盘成员补齐失败时保留上一份有效股票池，并阻止策略快照更新，避免新池与旧数据混合。`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
+股票爬虫、刷新、策略、主力资金雷达框架和优化器都改为优先读写 SQLite：`stock_crawl_price_valuation.py` 先维护细分行业龙头池并把长历史写入 `stock_history`，`stock_crawl_fundamentals.py --mode full` 补齐龙头股票基本面；游资小盘建池完成筛选后，再为本轮最终 `is_hot_money=1` 成员补齐估值、财报、指标、分红和质押。基本面刷新计划不仅检查时间戳，还会重新校验财报、财务指标和分红三类必需数据；财务指标按上市年份收紧新浪请求范围，新浪空响应或字段不兼容时回退东财，两处都为空仍按真实缺失失败。任一小盘成员补齐或补齐后完整性复核失败时保留上一份有效股票池，并阻止策略快照更新，避免新池与旧数据混合。`stock_data_refresh.py` 的健康检查和 fallback 面向 DB 表计数，`stock_advanced_strategies.py` 用 `iter_history()` / `db_signature()` 构建和失效候选池缓存，`stock_strategy_optimizer.py` 优先从 `index_nav` 读取 510310+510580 等权基准。`stock_storage.import_stock_data_dir()` 保留旧 `CN_*.json` 批量导入，便于已有缓存过渡。
 
 当前 schema 通过 `stock_meta.instrument_type` 区分 `stock` 与 `etf`。两者复用 `stock_history` 的前复权行情，但 `list_codes()`、`codes_with_history()` 和 `iter_history()` 默认只返回股票；只有显式传入 `instrument_type=None` 才扫描全部证券。这个隔离保证 ETF 不会进入财报、股东、质押、回购、龙虎榜或股票策略任务。
 
@@ -228,7 +228,7 @@ python stock_crawl_segment_leaders.py recrawl
 
 `stock_data_refresh.py` 的 full 流程会先刷新细分行业龙头行情、估值与基本面，随后刷新基准 ETF、指数成分和资本事件；游资小盘筛选完成后，对最终成员补齐长线因子所需的估值与基本面，再刷新席位/技术快照，最后自动运行 `stock_advanced_strategies.py --persist --rebuild-cache` 生成最新策略结果并预构建候选池缓存。申万三级 membership 默认每轮滚动刷新最旧 15 个行业：legulegu 总表可用时优先使用 legulegu 成分接口，成员接口失败才回退官方；总表不可用时直接用官方数据刷新最旧 15 个。日常打开 Flask 不再启动时重算候选池；如果只是修改因子权重、最低分或输出数量，Dashboard 会复用缓存中的候选池并快速重打分。
 
-A 股个股日线按 `新浪 -> 腾讯 -> 东财` 依次回退，每只股票在一轮全量刷新中只处理一次，不再对失败代码做批次末尾复刷。刷新前先读取 `stock_meta.listing_date`；只有缺失的股票才通过交易所批量清单补齐，已有值不会重复请求。所有历史行情请求的起点都不早于上市日，避免把上市前的正常空区间误报为行情源失败。上市日期获取或匹配失败以 `listing_date` 阶段写入刷新报告；其他抓取异常、所有来源空响应和写库异常同样记录股票代码、失败阶段与异常内容，并在 CLI 尾部逐条输出。ETF 继续使用自身清单和基金行情接口，不调用股票上市日期接口。
+A 股个股日线按 `新浪 -> 腾讯 -> 东财` 依次回退，每只股票在一轮全量刷新中只处理一次，不再对失败代码做批次末尾复刷。刷新前先读取 `stock_meta.listing_date`；只有缺失的股票才通过交易所批量清单补齐，已有值不会重复请求。所有历史行情请求的起点都不早于上市日。向左补历史时，请求会包含本地最早一根日线作为已知交易日锚点：锚点缺失仍严格失败；锚点存在则合并返回记录，但只有响应同时含有请求起点的完整 OHLCV 时才持久化覆盖边界并在后续跳过该区间，防止上游静默截断被误记为“历史完整”。全量替换历史也会清除本轮未重新证明的旧覆盖边界。初次抓取和最新区间空响应仍严格按失败处理。上市日期获取或匹配失败以 `listing_date` 阶段写入刷新报告；其他抓取异常、实际尝试过的来源均为空、返回范围无效和写库异常同样记录股票代码、失败阶段、请求区间与来源明细，并在 CLI 尾部逐条输出。ETF 继续使用自身清单和基金行情接口，不调用股票上市日期接口。
 
 ## 6. 主力资金与 ETF 雷达
 
@@ -291,7 +291,7 @@ python stock_radar_fresh_data.py
 - 支持盘中实时行情开关：腾讯批量行情优先，新浪批量行情备用，东方财富全 A 快照兜底；开启后页面每 3 分钟刷新当前雷达股票池，只在内存中重算形态与分数，不写回离线结果文件。
 - 实时价格展示保留接口原始现价，形态计算会把当日涨跌幅投影到本地前复权日线基准，避免把不复权实时价直接拼进前复权序列；实时成交量、成交额和换手率保留 `raw_*` 原始累计值，并按内置 A 股 U 型日内成交曲线估算全天值后供量比、换手分位、CMF、筹码和放量形态使用。
 - 二级行业筛选支持多选、热度 Top10、可调热度阈值和当前筛选结果全选，便于在行业数量较多时快速聚焦高热度方向。
-- “三级行业热度”按钮懒加载 `data/capital/sw3_industry_heat.json`，同时展示全部有效三级行业的近 20 日成交额排名，以及全部满足“末 5 日成交份额增长且 20 日趋势为正”的升温行业；每个行业给出成交额、日均成交额、当前成分市值及覆盖率，并用 20 日热度指数折线展示变化。摘要会标明最新日来源，使用 AkShare/Sina 成分汇总的行业会单独显示汇总天数。两张长榜各自滚动，排名不会因展示而重算。
+- “三级行业热度”按钮懒加载 `data/capital/sw3_industry_heat.json`，同时展示全部有效三级行业的近 20 日成交额排名，以及份额变化与 20 日趋势同向的升降趋势榜：升温行业显示正分，降温行业显示负分，方向冲突或无法比较的行业不强行入榜；每个行业给出成交额、日均成交额、当前成分市值及覆盖率，并用 20 日热度指数折线展示变化。摘要会标明最新日来源，使用 AkShare/Sina 成分汇总的行业会单独显示汇总天数。两张长榜各自滚动，新版报告直接使用后端趋势排名；旧版报告由页面兼容展示下降行业。
 - K 线支持日/周/月聚合、拖拽平移、缩放和全历史范围条；“形态回测”会按每日当时可见数据逐日回放生产买卖点，并把普通买点、动量点、疑似吸筹和出货预警标记在日 K 上。
 - ETF 模式会把行业筛选切换为 ETF 类别，并明确标注“股票池实测、ETF 待专项验证”。
 - “导出”按钮按当前候选池的页面排序导出 TopN，输入框默认 10，每行格式为 `股票代码,股票名,`。
@@ -306,7 +306,7 @@ python stock_radar_fresh_data.py
 - `data/capital/hot_money_distribution_experiment.json`：出货分权重网格搜索和消融实验结果。
 - `data/capital/hot_money_accumulation_experiment.json`：十三项原始特征吸筹总分权重网格搜索和消融实验结果。
 - `data/capital/hot_money_latent.json`：低位潜伏观察名单；它不是买点触发器。
-- `data/capital/sw3_industry_heat.json`：申万三级行业统一 20 日成交额、当前成员市值快照、全部有效行业热门排名、全部正向升温行业排名与每日图表序列。
+- `data/capital/sw3_industry_heat.json`：申万三级行业统一 20 日成交额、当前成员市值快照、全部有效行业热门排名、正向升温/负向降温及合并趋势排名与每日图表序列。
 - `data/capital/sw3_akshare_latest_cache.json`：通过日期、全市场快照与 SW3 membership 校验后的最新单日成分汇总缓存；它不是历史数据源或可展示报告。
 - `data/etf_pool_refresh_report.json`：ETF 配置、主清单校验、无效代码和行情刷新结果。
 
@@ -315,7 +315,7 @@ python stock_radar_fresh_data.py
 - 盘中没有席位级实时数据，雷达输出是行为推断，不是席位实锤。
 - 潜伏吸筹可能持续多天到数周，高分不代表马上启动。
 - 机会分、反转分和阶段把握度都是排序或解释信号，不是未来收益概率，也不构成交易指令。
-- 三级行业“最热门”按统一 20 个交易日成交额排序；“逐渐上升”按行业日成交额占全部有效三级行业的份额，综合末 5 日相对首 5 日增幅和趋势相关性排序。两者都是相对活跃度，不是行业收益预测。
+- 三级行业“最热门”按统一 20 个交易日成交额排序；“升降趋势”按行业日成交额占全部有效三级行业的份额，对“末 5 日相对首 5 日变化”和 20 日趋势相关性同为正或同为负的行业分别做同口径分位打分，升温为正、降温为负，再合并降序。方向冲突或缺少可比基数的行业不进入趋势榜。两者都是相对活跃度，不是行业收益预测。
 - 行业市值是当前 SW3 membership 成分的总市值快照。现有 membership 会排除 ST、北交和部分新股，因此报告始终同时给出成员覆盖率；覆盖不完整时页面显示“约”，不能解读为官方完整行业总市值。
 - 个别当前行业在申万“指数详情趋势”接口中可能停更。报告会优先使用精确 `bargainsum`；仅对缺失的近 20 日，用同一官方站点的行业成交额份额和其他精确行业汇总反推估算，并在行业与每日记录中设置 `amount_is_estimate`，页面以“约/含估算”标注。若份额接口本轮临时返回空，只允许续用上一份已通过完整性校验且明确标为估算的日度点，不会把旧 AkShare 派生点滚动成多日历史。
 - AkShare/Sina 只补申万之后紧邻的一个已收盘交易日：成交额来自全 A 收盘快照按 SW3 成分求和，属于“成分汇总”而不是申万指数直接值，也不标成份额反推估算。交易日间隔超过一天、快照不完整或行业成分覆盖不足时不拼接、不补零，并保留旧报告。
@@ -365,13 +365,13 @@ python industry_cycle_engine.py --write
 | `data/stock_strategy_smallcap_optimized_config.json` | 小盘独立优化权重；缺失时回退 `meta_data_backup/stock_strategy_smallcap_optimized_config.json`，再回退代码默认值 |
 | `data/stock_strategy_best_fold_paths.svg` | 长线默认参数历史折走势小图矩阵 |
 | `data/capital/segment_leader_pool.json` | 申万三级细分行业龙头池，包含行业内龙头分、规模口径和候选来源 |
-| `data/capital/sw3_industry_heat.json` | 申万三级行业近 20 个共同交易日热度报告，含成交额、当前成员市值覆盖、全部有效行业热门排名、全部正向升温行业排名和日度图表序列 |
+| `data/capital/sw3_industry_heat.json` | 申万三级行业近 20 个共同交易日热度报告，含成交额、当前成员市值覆盖、全部有效行业热门排名、正向升温/负向降温及合并趋势排名和日度图表序列 |
 | `data/capital/sw3_akshare_latest_cache.json` | 通过日期、全市场快照与 SW3 membership 校验后的最新单日成分汇总缓存，不是展示报告 |
-| `data/stock_data.sqlite3` | 股票/ETF 证券主数据库：`stock_meta.instrument_type` 隔离品种，`stock_meta.listing_date` 缓存股票上市日期，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存策略基准 ETF NAV |
+| `data/stock_data.sqlite3` | 股票/ETF 证券主数据库：`stock_meta.instrument_type` 隔离品种，`stock_meta.listing_date` 缓存股票上市日期，`stock_meta.history_coverage_start_date` 保存同时命中请求起点与已知交易日锚点后验证的最早边界，`stock_history` 存长历史 OHLCV 与估值序列，`sw3_member.is_hot_money` 存游资雷达/A股短线共用池成员，`short_signal_snapshot` 存龙虎榜席位与技术面补充信号，`index_nav` / `index_nav_meta` 存策略基准 ETF NAV |
 | `data/etf_pool_refresh_report.json` | ETF 配置池的主清单校验、有效/无效代码和行情刷新结果 |
 | `data/plate_data.sqlite3` | 申万二级行业日线缓存，供题材热度、游资形态和行业周期使用 |
 | `data/stock_data/CN_*.json` | 旧版个股 JSON 缓存；v3.1.4 主流程不再依赖，可通过 `stock_storage.import_stock_data_dir()` 批量导入 SQLite |
-| `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时、健康检查和结构化失败明细；`failures[]` 记录股票代码、名称、失败阶段与异常内容 |
+| `data/stock_data_refresh_report.json` | 数据刷新步骤、耗时、健康检查和结构化失败明细；龙头与游资小盘子进程通过临时 sidecar 回传逐股错误，`failures[]` 记录股票代码、名称、失败阶段与异常内容 |
 | `data/capital/theme_candidates.json` | SW2 板块热度与个股题材跟踪关系 |
 | `data/capital/hot_money_ambush.json` | 主力资金吸筹分、出货分、阶段和形态输出 |
 | `data/capital/hot_money_patterns.json` / `.csv` | 游资形态匹配输出 |

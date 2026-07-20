@@ -165,6 +165,7 @@ body.radar-modal-open { overflow: hidden; }
 .industry-heat-row:hover { background: #f8fafc; }
 .industry-heat-rank { display: grid; place-items: center; width: 23px; height: 23px; border-radius: 8px; background: #eef4fb; color: #1874bf; font-size: 9px; font-weight: 750; font-variant-numeric: tabular-nums; }
 .industry-heat-row.is-rising .industry-heat-rank { background: #eaf7ef; color: #16804a; }
+.industry-heat-row.is-falling .industry-heat-rank { background: #fff0f1; color: #c2414b; }
 .industry-heat-name { min-width: 0; }
 .industry-heat-name strong,.industry-heat-name small,.industry-heat-name em { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .industry-heat-name strong { color: #25282d; font-size: 11px; }
@@ -173,9 +174,11 @@ body.radar-modal-open { overflow: hidden; }
 .industry-heat-bar { height: 3px; margin-top: 5px; overflow: hidden; border-radius: 999px; background: #e9edf2; }
 .industry-heat-bar i { display: block; height: 100%; border-radius: inherit; background: linear-gradient(90deg,#58a9ef,#0879e8); }
 .industry-heat-row.is-rising .industry-heat-bar i { background: linear-gradient(90deg,#67c98d,#16804a); }
+.industry-heat-row.is-falling .industry-heat-bar i { background: linear-gradient(90deg,#f3a0a6,#c2414b); }
 .industry-heat-numbers { min-width: 0; text-align: right; font-variant-numeric: tabular-nums; }
 .industry-heat-numbers b,.industry-heat-numbers span,.industry-heat-numbers small { display: block; white-space: nowrap; }
 .industry-heat-numbers b { color: #202328; font-size: 11px; }
+.industry-heat-row.is-falling .industry-heat-numbers b { color: #c2414b; }
 .industry-heat-numbers span { margin-top: 2px; color: #5d6570; font-size: 9px; }
 .industry-heat-numbers small { margin-top: 3px; color: #9297a0; font-size: 7px; }
 .industry-heat-chart { min-width: 0; height: 42px; }
@@ -183,6 +186,7 @@ body.radar-modal-open { overflow: hidden; }
 .industry-heat-sparkline line { stroke: #dfe5ec; stroke-width: 1; stroke-dasharray: 3 3; }
 .industry-heat-sparkline polyline { fill: none; stroke: #16804a; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
 .industry-heat-row.is-hot .industry-heat-sparkline polyline { stroke: #0879e8; }
+.industry-heat-row.is-falling .industry-heat-sparkline polyline { stroke: #c2414b; }
 .industry-heat-no-chart { display: grid; place-items: center; height: 42px; color: #a0a5ae; font-size: 8px; }
 .industry-heat-panel-empty { padding: 32px 18px; color: #858b95; font-size: 10px; line-height: 1.6; text-align: center; }
 .industry-heat-state { min-height: 260px; display: grid; place-items: center; align-content: center; gap: 9px; color: #7d838d; text-align: center; }

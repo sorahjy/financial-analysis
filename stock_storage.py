@@ -35,7 +35,7 @@ from stock_crawl_common import (
 DATA_DIR = Path("data")
 DEFAULT_DB_FILE = DATA_DIR / "stock_data.sqlite3"
 STOCK_DATA_DIR = DATA_DIR / "stock_data"
-SCHEMA_VERSION = 7
+SCHEMA_VERSION = 8
 SQLITE_BUSY_TIMEOUT_MS = 120000
 # 批量刷新友好的连接级调优（均为连接局部或不写库文件，不扰动 user_version/mtime）：
 #   cache_size 负值=KB，每连接一块页缓存减少大表反复读盘（多线程下 N 连接各占一份，故默认偏保守 16MB）；
@@ -107,6 +107,7 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
             financials_refetched_at TEXT,
             daily_refetched_at      TEXT,
             history_refetched_at    TEXT,
+            history_coverage_start_date TEXT,
             daily_stats_json        TEXT,
             financials_json         TEXT,
             indicators_json         TEXT,
@@ -223,6 +224,8 @@ def ensure_schema(conn: sqlite3.Connection) -> None:
         "instrument_type": "TEXT NOT NULL DEFAULT 'stock'",
         # 上市日期与本地历史起点不是同一概念；旧库保持 NULL，由刷新流程按需补齐。
         "listing_date": "TEXT",
+        # 已向行情源验证过的最早请求边界，与第一条真实成交日分开保存。
+        "history_coverage_start_date": "TEXT",
     })
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
     conn.commit()
@@ -296,6 +299,7 @@ def normalize_listing_date(value: Any) -> Optional[str]:
 _META_COLUMNS = (
     "code", "name", "instrument_type", "listing_date", "fetch_time",
     "financials_refetched_at", "daily_refetched_at", "history_refetched_at",
+    "history_coverage_start_date",
     "daily_stats_json", "financials_json", "indicators_json", "dividends_json",
     "pledge_ratio", "pledge_count", "pledge_trade_date", "industry",
     "candidate_for_json", "history_source", "history_start_date", "history_end_date",
@@ -308,7 +312,18 @@ _META_UPDATE_SET = ", ".join(
         "listing_date = COALESCE(NULLIF(TRIM(stock_meta.listing_date), ''), "
         "excluded.listing_date)"
         if c == "listing_date"
-        else f"{c} = excluded.{c}"
+        else (
+            "history_coverage_start_date = CASE "
+            "WHEN NULLIF(TRIM(excluded.history_coverage_start_date), '') IS NULL "
+            "THEN stock_meta.history_coverage_start_date "
+            "WHEN NULLIF(TRIM(stock_meta.history_coverage_start_date), '') IS NULL "
+            "THEN excluded.history_coverage_start_date "
+            "WHEN excluded.history_coverage_start_date < stock_meta.history_coverage_start_date "
+            "THEN excluded.history_coverage_start_date "
+            "ELSE stock_meta.history_coverage_start_date END"
+            if c == "history_coverage_start_date"
+            else f"{c} = excluded.{c}"
+        )
     )
     for c in _META_COLUMNS
     if c != "code"
@@ -336,12 +351,15 @@ def save_stock(
     *,
     replace_history: bool = True,
     write_history: bool = True,
+    replace_history_coverage: bool = False,
 ) -> Optional[str]:
     """把一只股票的完整 JSON dict 落库（stock_meta 一行 + stock_history 多行）。
 
     replace_history=True（默认）：先删该 code 全部日线再整段写入，匹配爬虫"内存合并后
     写全集"的语义。置 False 时改走纯 upsert，仅补/改传入的日期，适合增量补日。
     write_history=False 时完全不动 stock_history（只 upsert meta），用于只改财报/指标的场景。
+    replace_history_coverage=True 仅供已重新验证整段历史的调用方使用：它会把覆盖边界
+    精确替换为本次值（允许清空或向后移动），而普通 upsert 仍只能保留或向更早推进。
     返回写入的 code；symbol 缺失则跳过返回 None。
     """
     code = _normalize_code(data.get("symbol"))
@@ -365,6 +383,7 @@ def save_stock(
         _optional_text(data.get("financials_refetched_at")),
         _optional_text(data.get("daily_refetched_at")),
         _optional_text(data.get("history_refetched_at")),
+        normalize_listing_date(data.get("history_coverage_start_date")),
         _json_or_none(daily.get("stats")),
         _json_or_none(data.get("financials")),
         _json_or_none(data.get("indicators")),
@@ -383,6 +402,14 @@ def save_stock(
     with _WRITE_LOCK:
         with conn:
             conn.execute(_META_INSERT_SQL, meta_row)
+            if replace_history_coverage:
+                conn.execute(
+                    "UPDATE stock_meta SET history_coverage_start_date = ? WHERE code = ?",
+                    (
+                        normalize_listing_date(data.get("history_coverage_start_date")),
+                        code,
+                    ),
+                )
             if write_history:
                 if replace_history:
                     conn.execute("DELETE FROM stock_history WHERE code = ?", (code,))
@@ -1383,11 +1410,57 @@ def load_recent_news(conn: sqlite3.Connection, code: str, *,
     return [dict(r) for r in rows]
 
 
-def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:
+def history_refresh_state(conn: sqlite3.Connection, code: str) -> Dict[str, Optional[str]]:
     row = conn.execute(
-        "SELECT history_refetched_at FROM stock_meta WHERE code = ?", (_normalize_code(code),)
+        "SELECT history_refetched_at, history_coverage_start_date "
+        "FROM stock_meta WHERE code = ?",
+        (_normalize_code(code),),
     ).fetchone()
-    return row["history_refetched_at"] if row else None
+    if not row:
+        return {
+            "history_refetched_at": None,
+            "history_coverage_start_date": None,
+        }
+    return {
+        "history_refetched_at": row["history_refetched_at"],
+        "history_coverage_start_date": normalize_listing_date(
+            row["history_coverage_start_date"]
+        ),
+    }
+
+
+def history_refetched_at(conn: sqlite3.Connection, code: str) -> Optional[str]:
+    return history_refresh_state(conn, code)["history_refetched_at"]
+
+
+def history_coverage_start_date(conn: sqlite3.Connection, code: str) -> Optional[str]:
+    return history_refresh_state(conn, code)["history_coverage_start_date"]
+
+
+def update_history_coverage_start_date(
+    conn: sqlite3.Connection, code: str, coverage_start_date: Any
+) -> bool:
+    """Persist the earliest verified request boundary without moving it forward."""
+    code = _normalize_code(code)
+    coverage = normalize_listing_date(coverage_start_date)
+    if not code or not coverage:
+        return False
+    with _WRITE_LOCK:
+        with conn:
+            cursor = conn.execute(
+                """
+                UPDATE stock_meta
+                SET history_coverage_start_date = CASE
+                        WHEN NULLIF(TRIM(history_coverage_start_date), '') IS NULL THEN ?
+                        WHEN ? < history_coverage_start_date THEN ?
+                        ELSE history_coverage_start_date
+                    END,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE code = ?
+                """,
+                (coverage, coverage, coverage, code),
+            )
+    return bool(cursor.rowcount)
 
 
 def listing_date_map(
@@ -1444,6 +1517,56 @@ def financials_refetched_map(
             out[row["code"]] = row["financials_refetched_at"]
     for code in norm:
         out.setdefault(code, None)
+    return out
+
+
+def fundamentals_state_map(
+    conn: sqlite3.Connection, codes: Optional[Sequence[str]] = None
+) -> Dict[str, Dict[str, Any]]:
+    """Bulk-load freshness plus decoded fundamental families for refresh planning.
+
+    JSON decode failures remain visible as ``None`` so the planner can force a repair instead of
+    trusting a recent timestamp attached to an incomplete legacy row.
+    """
+    columns = (
+        "financials_refetched_at", "financials_json", "indicators_json", "dividends_json"
+    )
+
+    def decode(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "financials_refetched_at": row["financials_refetched_at"],
+            "financials": _loads(row["financials_json"]),
+            "indicators": _loads(row["indicators_json"]),
+            "dividends": _loads(row["dividends_json"]),
+        }
+
+    if codes is None:
+        return {
+            row["code"]: decode(row)
+            for row in conn.execute(
+                f"SELECT code, {', '.join(columns)} FROM stock_meta"
+            )
+        }
+
+    normalized = list(dict.fromkeys(_normalize_code(code) for code in codes if code))
+    out: Dict[str, Dict[str, Any]] = {}
+    for i in range(0, len(normalized), 500):
+        chunk = normalized[i:i + 500]
+        placeholders = ",".join("?" for _ in chunk)
+        for row in conn.execute(
+            f"SELECT code, {', '.join(columns)} FROM stock_meta "
+            f"WHERE code IN ({placeholders})",
+            chunk,
+        ):
+            out[row["code"]] = decode(row)
+    missing_state = {
+        "financials_refetched_at": None,
+        "financials": None,
+        "indicators": None,
+        "dividends": None,
+    }
+    for code in normalized:
+        out.setdefault(code, dict(missing_state))
     return out
 
 
@@ -1560,6 +1683,8 @@ def _rebuild_stock(meta: sqlite3.Row, records: List[Dict[str, Any]]) -> Dict[str
     for field in META_TIMESTAMP_FIELDS:
         if meta[field]:
             data[field] = meta[field]
+    if meta["history_coverage_start_date"]:
+        data["history_coverage_start_date"] = meta["history_coverage_start_date"]
 
     history: Dict[str, Any] = {
         "symbol": code,

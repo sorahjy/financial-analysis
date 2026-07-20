@@ -173,6 +173,21 @@ class FlaskAppTest(unittest.TestCase):
         self.assertIn('aria-sort="${ariaSort}"', script)
         self.assertIn('key: "opportunity_score"', script)
 
+    def test_radar_industry_heat_lists_falling_trends_with_negative_scores(self):
+        body = (ROOT_DIR / "app/templates/radar/dashboard.html").read_text(encoding="utf-8")
+        script = (ROOT_DIR / "app/static/js/radar.js").read_text(encoding="utf-8")
+        styles = (ROOT_DIR / "app/static/css/radar.css").read_text(encoding="utf-8")
+
+        self.assertIn("成交额活跃度、升降趋势与数据来源", body)
+        self.assertIn("function industryHeatTrendRows(report)", script)
+        self.assertIn('industryHeatRankedRows(report, "trend", "trend_rank")', script)
+        self.assertIn("growth < 0", script)
+        self.assertIn("correlation < 0", script)
+        self.assertIn("下降行业显示负分", script)
+        self.assertIn("趋势分 ${fmtSigned(trendScore, 1, falling)}", script)
+        self.assertIn('rowClass = hot ? "is-hot" : (falling ? "is-falling" : "is-rising")', script)
+        self.assertIn(".industry-heat-row.is-falling", styles)
+
     def test_radar_payload_refreshes_legacy_lhb_warning_copy(self):
         legacy = {
             "stocks": [{

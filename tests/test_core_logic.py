@@ -132,6 +132,7 @@ class DataRefreshPipelineTest(unittest.TestCase):
         self.assertLess(run_steps.index("hot_money_small_cap_universe"), run_steps.index("short_signal_enrichment"))
         self.assertLess(run_steps.index("short_signal_enrichment"), run_steps.index("strategy_results"))
         self.assertIn("--enrich-long-factors", step_commands["hot_money_small_cap_universe"])
+        self.assertIn("--failure-report", step_commands["hot_money_small_cap_universe"])
         self.assertEqual(
             step_commands["short_signal_enrichment"][-4:],
             ["--days", "14", "--top-yyb", "30"],
@@ -193,32 +194,92 @@ class HotMoneyHistoryRefreshTest(unittest.TestCase):
 
     def test_factor_refresh_failure_preserves_previous_hotmoney_pool(self):
         import stock_crawl_hot_money_universe as universe
+        from stock_crawl_common import load_json_file
 
         conn = MagicMock()
         conn.execute.return_value.fetchone.return_value = ["2026-07-17"]
-        with patch.object(sys, "argv", [
-                 "stock_crawl_hot_money_universe.py", "--enrich-long-factors"
-             ]), \
-             patch.object(universe.stock_storage, "connect", return_value=conn), \
-             patch.object(universe.stock_storage, "_ensure_table_columns"), \
-             patch.object(universe, "select_seed", return_value={
-                 "in_member": ["000002"],
-                 "not_member": [],
-                 "names": {"000002": "万科A"},
-             }), \
-             patch.object(universe, "refresh_seed_histories", return_value={"failed": []}), \
-             patch.object(universe, "latest_history_dates", return_value={"000002": "2026-07-17"}), \
-             patch.object(universe, "_bars_count", return_value=300), \
-             patch.object(universe, "history_is_fresh", return_value=True), \
-             patch.object(universe, "float_cap_yi", return_value=50.0), \
-             patch.object(universe, "refresh_selected_factor_data", return_value={
-                 "failed": ["000002"],
-             }):
-            with self.assertRaisesRegex(RuntimeError, "保留上一份有效股票池"):
-                universe.main()
+        detail = {
+            "code": "000002",
+            "name": "万科A",
+            "stage": "fundamentals",
+            "error": "RuntimeError: 基本面数据不完整: indicators.records",
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "hot-money-failures.json"
+            with patch.object(sys, "argv", [
+                     "stock_crawl_hot_money_universe.py", "--enrich-long-factors",
+                     "--failure-report", str(report_path),
+                 ]), \
+                 patch.object(universe.stock_storage, "connect", return_value=conn), \
+                 patch.object(universe.stock_storage, "_ensure_table_columns"), \
+                 patch.object(universe, "select_seed", return_value={
+                     "in_member": ["000002"],
+                     "not_member": [],
+                     "names": {"000002": "万科A"},
+                 }), \
+                 patch.object(universe, "refresh_seed_histories", return_value={"failed": []}), \
+                 patch.object(universe, "latest_history_dates", return_value={"000002": "2026-07-17"}), \
+                 patch.object(universe, "_bars_count", return_value=300), \
+                 patch.object(universe, "history_is_fresh", return_value=True), \
+                 patch.object(universe, "float_cap_yi", return_value=50.0), \
+                 patch.object(universe, "refresh_selected_factor_data", return_value={
+                     "requested": 1,
+                     "processed": 1,
+                     "write_enqueued": 0,
+                     "write_completed": 0,
+                     "failed": ["000002"],
+                     "failure_details": [detail],
+                 }):
+                with self.assertRaisesRegex(RuntimeError, "保留上一份有效股票池"):
+                    universe.main()
+            payload = load_json_file(report_path)
 
         executed = [call.args[0] for call in conn.execute.call_args_list]
         self.assertFalse(any("UPDATE sw3_member SET is_hot_money = 0" in sql for sql in executed))
+        self.assertEqual(payload["failed"], ["000002"])
+        self.assertEqual(payload["failure_details"], [detail])
+
+    def test_post_enrichment_completeness_failure_preserves_pool_and_reports_stock(self):
+        import stock_crawl_hot_money_universe as universe
+        from stock_crawl_common import load_json_file
+
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = ["2026-07-17"]
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_path = Path(tmpdir) / "hot-money-validation.json"
+            with patch.object(universe.stock_storage, "connect", return_value=conn), \
+                 patch.object(universe.stock_storage, "_ensure_table_columns"), \
+                 patch.object(universe, "select_seed", return_value={
+                     "in_member": ["603075"],
+                     "not_member": [],
+                     "names": {"603075": "热威股份"},
+                 }), \
+                 patch.object(universe, "refresh_seed_histories", return_value={"failed": []}), \
+                 patch.object(universe, "latest_history_dates", return_value={"603075": "2026-07-17"}), \
+                 patch.object(universe, "_bars_count", return_value=300), \
+                 patch.object(universe, "history_is_fresh", return_value=True), \
+                 patch.object(universe, "float_cap_yi", return_value=50.0), \
+                 patch.object(universe, "refresh_selected_factor_data", return_value={
+                     "requested": 1, "processed": 1, "failed": [],
+                 }), \
+                 patch.object(universe, "incomplete_selected_fundamentals", return_value={
+                     "603075": ["indicators.records"],
+                 }):
+                with self.assertRaisesRegex(RuntimeError, "完整性复核失败"):
+                    universe.main([
+                        "--enrich-long-factors",
+                        "--failure-report", str(report_path),
+                    ])
+            payload = load_json_file(report_path)
+
+        executed = [call.args[0] for call in conn.execute.call_args_list]
+        self.assertFalse(any("UPDATE sw3_member SET is_hot_money = 0" in sql for sql in executed))
+        self.assertEqual(payload["failed"], ["603075"])
+        self.assertEqual(
+            payload["failure_details"][0]["stage"],
+            "fundamentals_validation",
+        )
+        self.assertIn("indicators.records", payload["failure_details"][0]["error"])
 
     def test_history_freshness_uses_actual_latest_bar_date(self):
         import stock_crawl_hot_money_universe as universe
@@ -940,7 +1001,8 @@ class StockListingDateStorageTest(unittest.TestCase):
             try:
                 columns = {row["name"] for row in conn.execute("PRAGMA table_info(stock_meta)")}
                 row = conn.execute(
-                    "SELECT name, listing_date, history_start_date, history_end_date "
+                    "SELECT name, listing_date, history_coverage_start_date, "
+                    "history_start_date, history_end_date "
                     "FROM stock_meta WHERE code = '603629'"
                 ).fetchone()
                 user_version = conn.execute("PRAGMA user_version").fetchone()[0]
@@ -948,9 +1010,11 @@ class StockListingDateStorageTest(unittest.TestCase):
                 conn.close()
 
         self.assertIn("listing_date", columns)
-        self.assertEqual(user_version, 7)
+        self.assertIn("history_coverage_start_date", columns)
+        self.assertEqual(user_version, 8)
         self.assertEqual(row["name"], "利通电子")
         self.assertIsNone(row["listing_date"])
+        self.assertIsNone(row["history_coverage_start_date"])
         self.assertEqual(row["history_start_date"], "2018-12-24")
         self.assertEqual(row["history_end_date"], "2026-07-17")
 
@@ -985,6 +1049,66 @@ class StockListingDateStorageTest(unittest.TestCase):
             self.assertEqual(
                 ss.listing_date_map(conn, ["603629", "000001"]),
                 {"603629": "2018-12-24", "000001": None},
+            )
+        finally:
+            conn.close()
+
+    def test_history_coverage_boundary_only_moves_earlier_and_round_trips(self):
+        import stock_storage as ss
+
+        conn = ss.connect(":memory:")
+        try:
+            ss.save_stock(conn, {
+                "symbol": "600822",
+                "name": "上海物贸",
+                "history_coverage_start_date": "2018-01-01",
+            }, write_history=False)
+            ss.save_stock(conn, {
+                "symbol": "600822",
+                "name": "上海物贸",
+            }, write_history=False)
+            ss.save_stock(conn, {
+                "symbol": "600822",
+                "name": "上海物贸",
+                "history_coverage_start_date": "2019-01-01",
+            }, write_history=False)
+            self.assertEqual(
+                ss.load_stock(conn, "600822", include_history=False)[
+                    "history_coverage_start_date"
+                ],
+                "2018-01-01",
+            )
+
+            self.assertTrue(
+                ss.update_history_coverage_start_date(conn, "600822", "2016-07-19")
+            )
+            self.assertEqual(
+                ss.history_coverage_start_date(conn, "600822"),
+                "2016-07-19",
+            )
+            ss.update_history_coverage_start_date(conn, "600822", "2017-01-01")
+            self.assertEqual(
+                ss.history_coverage_start_date(conn, "600822"),
+                "2016-07-19",
+            )
+
+            ss.save_stock(conn, {
+                "symbol": "600822",
+                "name": "上海物贸",
+                "history_coverage_start_date": "2019-01-01",
+            }, write_history=False, replace_history_coverage=True)
+            self.assertEqual(
+                ss.history_coverage_start_date(conn, "600822"),
+                "2019-01-01",
+            )
+            ss.save_stock(
+                conn,
+                {"symbol": "600822", "name": "上海物贸"},
+                write_history=False,
+                replace_history_coverage=True,
+            )
+            self.assertIsNone(
+                ss.history_coverage_start_date(conn, "600822")
             )
         finally:
             conn.close()

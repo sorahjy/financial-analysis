@@ -20,8 +20,11 @@ from stock_hot_money_radar import (
     realtime_rescore_payload,
 )
 from sw3_industry_heat import (
+    IndustryHeatIncompleteError,
     SW3_INDUSTRY_HEAT_LEGACY_SCHEMA,
     SW3_INDUSTRY_HEAT_SCHEMA,
+    SW3_INDUSTRY_HEAT_V2_SCHEMA,
+    validate_complete_report,
 )
 
 
@@ -64,7 +67,11 @@ def radar_industry_heat_payload() -> Dict[str, Any]:
     payload = load_json_file(RADAR_INDUSTRY_HEAT_FILE, {}) or {}
     schema = payload.get("schema") if isinstance(payload, dict) else None
     industries = payload.get("industries") if isinstance(payload, dict) else None
-    if schema not in {SW3_INDUSTRY_HEAT_SCHEMA, SW3_INDUSTRY_HEAT_LEGACY_SCHEMA}:
+    if schema not in {
+        SW3_INDUSTRY_HEAT_SCHEMA,
+        SW3_INDUSTRY_HEAT_V2_SCHEMA,
+        SW3_INDUSTRY_HEAT_LEGACY_SCHEMA,
+    }:
         industries = None
 
     valid_rows = isinstance(industries, list) and bool(industries)
@@ -102,12 +109,15 @@ def radar_industry_heat_payload() -> Dict[str, Any]:
         ):
             valid_rows = False
 
-    if valid_rows and schema == SW3_INDUSTRY_HEAT_SCHEMA:
+    if valid_rows and schema in {
+        SW3_INDUSTRY_HEAT_SCHEMA,
+        SW3_INDUSTRY_HEAT_V2_SCHEMA,
+    }:
         rankings = payload.get("rankings")
         quality = payload.get("data_quality") or {}
         try:
             rising_candidate_count = int(quality.get("rising_candidate_count") or 0)
-        except (TypeError, ValueError):
+        except (AttributeError, OverflowError, TypeError, ValueError):
             rising_candidate_count = -1
         if (
             not isinstance(rankings, dict)
@@ -116,6 +126,19 @@ def radar_industry_heat_payload() -> Dict[str, Any]:
             or len(rankings["hottest"]) != len(industries)
             or len(rankings["rising"]) != len(rising_ranks)
             or rising_candidate_count != len(rising_ranks)
+        ):
+            valid_rows = False
+
+    if valid_rows and schema == SW3_INDUSTRY_HEAT_SCHEMA:
+        try:
+            validate_complete_report(payload)
+        except (
+            IndustryHeatIncompleteError,
+            AttributeError,
+            KeyError,
+            OverflowError,
+            TypeError,
+            ValueError,
         ):
             valid_rows = False
 

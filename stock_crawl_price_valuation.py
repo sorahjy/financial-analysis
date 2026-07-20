@@ -72,6 +72,25 @@ def _date_dash(value):
     return text[:10]
 
 
+def _verified_history_coverage_start(request_start, records):
+    """Return the requested boundary only when the source actually contains it.
+
+    Seeing only the known right-hand anchor does not prove that a wide historical response was
+    complete: providers may silently truncate old rows. Requiring a complete OHLCV row exactly at
+    the requested boundary is deliberately conservative. A weekend/holiday boundary can therefore
+    be retried on a later refresh, but it can never become a permanently false coverage claim.
+    """
+    boundary = ss.normalize_listing_date(request_start)
+    if not boundary:
+        return None
+    return boundary if any(
+        isinstance(row, dict)
+        and str(row.get("date") or "")[:10] == boundary
+        and history_record_has_daily_ohlcv(row)
+        for row in records or []
+    ) else None
+
+
 def _env_int(name, default, minimum=1, maximum=None):
     raw = os.getenv(name)
     if raw is None:
@@ -107,6 +126,42 @@ def _failure_detail(code, name, stage, error):
         "stage": str(stage or "stock_refresh"),
         "error": str(error or "unknown error")[:4000],
     }
+
+
+def _daily_failure_message(outcome):
+    reason = str(outcome.get("reason") or "daily_history_unavailable")
+    reason_labels = {
+        "left_boundary_anchor_empty": "历史左边界锚点请求未返回日线数据",
+        "left_boundary_anchor_missing": "历史左边界响应未返回已知交易日锚点",
+        "latest_overlap_empty": "最新行情重叠校验未返回日线数据",
+        "initial_history_empty": "首次行情请求未返回日线数据",
+        "full_backfill_empty": "OHLCV 全量回补未返回日线数据",
+        "qfq_refetch_empty": "前复权全量重刷未返回日线数据",
+        "all_requests_empty": "本轮行情请求均未返回日线数据",
+        "daily_history_unavailable": "本次实际尝试的行情源未返回日线数据",
+    }
+    parts = [reason_labels.get(reason, reason)]
+    range_start = outcome.get("range_start")
+    range_end = outcome.get("range_end")
+    if range_start or range_end:
+        parts.append(f"区间={range_start or '-'}~{range_end or '-'}")
+    attempts = outcome.get("source_attempts") or []
+    if attempts:
+        parts.append(
+            "实际尝试=" + ",".join(
+                f"{item.get('source', '?')}:{item.get('status', '?')}"
+                for item in attempts
+            )
+        )
+    expected_anchor = outcome.get("expected_anchor")
+    if expected_anchor:
+        parts.append(f"应含锚点={expected_anchor}")
+    received_dates = outcome.get("received_dates")
+    if received_dates is not None:
+        preview = received_dates[:5]
+        suffix = "..." if len(received_dates) > len(preview) else ""
+        parts.append(f"响应日期={','.join(preview) or '-'}{suffix}")
+    return "；".join(parts)
 
 
 _LISTING_MARKET_SPECS = {
@@ -341,11 +396,12 @@ def load_stock_file(code, name):
     records = ss.load_history_records(conn, normalized_code)
     if not records:
         return {}
+    refresh_state = ss.history_refresh_state(conn, normalized_code)
     return {
         "records": records,
         "start_date": records[0]["date"],
         "end_date": records[-1]["date"],
-        "history_refetched_at": ss.history_refetched_at(conn, normalized_code),
+        **refresh_state,
     }
 
 
@@ -384,6 +440,10 @@ def save_stock_file(code, name, data):
             daily_stats=daily_payload_from_history_records(full_records).get("stats"),
             instrument_type=str(data.get("instrument_type") or "stock"),
         )
+        if data.get("history_coverage_start_date"):
+            ss.update_history_coverage_start_date(
+                conn, code, data["history_coverage_start_date"]
+            )
         return
 
     # 读回整只(保留已有 financials/indicators/... 等 meta blob)，按需更新 history/daily 与财报。
@@ -394,6 +454,11 @@ def save_stock_file(code, name, data):
     payload["instrument_type"] = str(data.get("instrument_type") or payload.get("instrument_type") or "stock")
     if data.get("listing_date"):
         payload["listing_date"] = data["listing_date"]
+    replace_history_coverage = bool(data.get("history_coverage_replace"))
+    if replace_history_coverage:
+        payload["history_coverage_start_date"] = data.get("history_coverage_start_date")
+    elif data.get("history_coverage_start_date"):
+        payload["history_coverage_start_date"] = data["history_coverage_start_date"]
     replace_history = True
     if full_records:
         # history 元信息(start/end)与 daily.stats 取全量序列；实际写入的行可能只是增量(append)。
@@ -417,7 +482,13 @@ def save_stock_file(code, name, data):
     if data.get("financials_refetched_at"):
         payload["financials_refetched_at"] = data["financials_refetched_at"]
     # 无新日线(仅刷财报)→不写 history；增量→replace_history=False 只 upsert 新增行，不整段重写
-    ss.save_stock(conn, payload, replace_history=replace_history, write_history=bool(full_records))
+    ss.save_stock(
+        conn,
+        payload,
+        replace_history=replace_history,
+        write_history=bool(full_records),
+        replace_history_coverage=replace_history_coverage,
+    )
 
 
 _DB_WRITE_STOP = object()
@@ -486,7 +557,7 @@ class StockDbWriter:
 # ─── 数据爬取 ─────────────────────────────────────────────────
 
 
-def fetch_daily_range(symbol, start_date, end_date):
+def fetch_daily_range(symbol, start_date, end_date, *, attempt_callback=None):
     """爬取 [start_date, end_date] 的日频数据，返回 records 列表。
     """
     return fetch_qfq_daily_records(
@@ -495,6 +566,7 @@ def fetch_daily_range(symbol, start_date, end_date):
         end_date,
         include_trading_value=True,
         warn=lambda message: safe_print(f"  [FALLBACK] {message}"),
+        attempt_callback=attempt_callback,
     )
 
 
@@ -725,17 +797,66 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         raise RuntimeError("缺少有效上市日期，已停止行情刷新")
     mark_stage("load_local_history")
     existing = load_stock_file(code, name)
-    source_fetch_history = daily_fetcher or fetch_daily_range
-    daily_fetch_attempted = False
-    daily_rows_received = 0
+    daily_source_attempts = []
+    daily_requests = []
+    if daily_fetcher is None:
+        def source_fetch_history(symbol, range_start, range_end):
+            return fetch_daily_range(
+                symbol,
+                range_start,
+                range_end,
+                attempt_callback=daily_source_attempts.append,
+            )
+    else:
+        source_fetch_history = daily_fetcher
 
-    def fetch_history(symbol, range_start, range_end):
-        nonlocal daily_fetch_attempted, daily_rows_received
-        daily_fetch_attempted = True
-        rows = source_fetch_history(symbol, range_start, range_end)
-        if rows:
-            daily_rows_received += len(rows)
-        return rows
+    def fetch_history(symbol, range_start, range_end, purpose):
+        attempt_offset = len(daily_source_attempts)
+        try:
+            rows = list(source_fetch_history(symbol, range_start, range_end) or [])
+        except Exception:
+            daily_requests.append({
+                "purpose": purpose,
+                "start_date": range_start,
+                "end_date": range_end,
+                "row_count": 0,
+                "source_attempts": daily_source_attempts[attempt_offset:],
+            })
+            raise
+        request = {
+            "purpose": purpose,
+            "start_date": range_start,
+            "end_date": range_end,
+            "row_count": len(rows),
+            "source_attempts": daily_source_attempts[attempt_offset:],
+        }
+        daily_requests.append(request)
+        return rows, request
+
+    def daily_failure(status, reason, request, *, expected_anchor=None, received_dates=None):
+        safe_print(
+            f"[{idx}/{total}] {code} {name}: 行情请求未通过完整性校验 "
+            f"({reason}, {request['start_date']} ~ {request['end_date']})，保留旧历史"
+        )
+        outcome = {
+            "status": status,
+            "reason": reason,
+            "range_start": request["start_date"],
+            "range_end": request["end_date"],
+            "request_purpose": request["purpose"],
+            "attempted_sources": [
+                attempt.get("source")
+                for attempt in request.get("source_attempts", [])
+                if attempt.get("source")
+            ],
+            "source_attempts": request.get("source_attempts", []),
+        }
+        if expected_anchor:
+            outcome["expected_anchor"] = expected_anchor
+        if received_dates is not None:
+            outcome["received_dates"] = received_dates
+        return outcome
+
     existing_records = existing.get("records", [])
     raw_count = len(existing_records)  # C: 增量快路用——现有行是否被 prune/日期边界过滤改动
     snapshot_removed = 0
@@ -743,6 +864,9 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         existing_records, snapshot_removed = prune_snapshot_only_history_records(existing_records)
     start_date = existing.get("start_date")
     end_date = existing.get("end_date")
+    existing_coverage_start = ss.normalize_listing_date(
+        existing.get("history_coverage_start_date")
+    )
     today = latest_weekday_date()
     if existing_records:
         existing_records = sorted(
@@ -768,6 +892,7 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
 
     mark_stage("daily_history")
     hist_new_records = []
+    verified_coverage_start = None
     full_daily_backfill = bool(existing_records and records_need_ohlcv_backfill(existing_records))
     qfq_rebased = False
     existing_qfq_seam = (
@@ -782,7 +907,10 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         full_refetch_start = max(full_refetch_start, listing_date)
     if full_daily_backfill:
         safe_print(f"[{idx}/{total}] {code} {name}: 回补OHLCV {full_refetch_start} ~ {today}")
-        hist_new_records.extend(fetch_history(code, full_refetch_start, today))
+        rows, request = fetch_history(code, full_refetch_start, today, "ohlcv_full_backfill")
+        if not rows:
+            return daily_failure("source_empty", "full_backfill_empty", request)
+        hist_new_records.extend(rows)
     elif existing_qfq_seam:
         qfq_rebased = True
         safe_print(
@@ -792,14 +920,71 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             f"源涨跌={existing_qfq_seam['source_change_pct']:.2f}%)，"
             f"全量重刷 {full_refetch_start} ~ {today}"
         )
-        hist_new_records.extend(fetch_history(code, full_refetch_start, today))
+        rows, request = fetch_history(code, full_refetch_start, today, "qfq_seam_refetch")
+        if not rows:
+            return daily_failure("source_empty", "qfq_refetch_empty", request)
+        hist_new_records.extend(rows)
 
     if (not full_daily_backfill and not qfq_rebased and existing_records
-            and start_date and start_date > history_floor):
-        prev_day = (datetime.strptime(start_date, "%Y-%m-%d") - timedelta(days=1)).strftime("%Y-%m-%d")
-        if history_floor <= prev_day:
-            safe_print(f"[{idx}/{total}] {code} {name}: 回补历史 {history_floor} ~ {prev_day}")
-            hist_new_records.extend(fetch_history(code, history_floor, prev_day))
+            and start_date and start_date > history_floor
+            and (not existing_coverage_start or existing_coverage_start > history_floor)):
+        safe_print(
+            f"[{idx}/{total}] {code} {name}: 锚点校验并回补历史 "
+            f"{history_floor} ~ {start_date}"
+        )
+        anchor_rows, request = fetch_history(
+            code, history_floor, start_date, "left_boundary_anchor"
+        )
+        if not anchor_rows:
+            return daily_failure(
+                "source_empty",
+                "left_boundary_anchor_empty",
+                request,
+                expected_anchor=start_date,
+            )
+        anchor_records = [
+            row
+            for row in normalize_history_records(
+                anchor_rows, include_valuation=False, drop_future=False
+            )
+            if history_floor <= row["date"] <= start_date
+        ]
+        anchor_record = next(
+            (row for row in anchor_records if row["date"] == start_date),
+            None,
+        )
+        received_dates = [row["date"] for row in anchor_records]
+        if not anchor_record or not history_record_has_daily_ohlcv(anchor_record):
+            return daily_failure(
+                "source_invalid",
+                "left_boundary_anchor_missing",
+                request,
+                expected_anchor=start_date,
+                received_dates=received_dates,
+            )
+        verified_coverage_start = _verified_history_coverage_start(
+            history_floor, anchor_records
+        )
+        if not verified_coverage_start:
+            safe_print(
+                f"[{idx}/{total}] {code} {name}: 响应含已知锚点但没有覆盖请求起点 "
+                f"{history_floor}，合并已返回日线但不持久化覆盖边界"
+            )
+        scale_change = qfq_overlap_scale_change(existing_records, anchor_records)
+        if scale_change:
+            qfq_rebased = True
+            safe_print(
+                f"[{idx}/{total}] {code} {name}: 历史锚点显示前复权尺度已变 "
+                f"{scale_change['date']} {scale_change['old_close']:.2f} -> "
+                f"{scale_change['new_close']:.2f}，全量重刷 {full_refetch_start} ~ {today}"
+            )
+            hist_new_records, request = fetch_history(
+                code, full_refetch_start, today, "qfq_anchor_refetch"
+            )
+            if not hist_new_records:
+                return daily_failure("source_empty", "qfq_refetch_empty", request)
+        else:
+            hist_new_records.extend(anchor_records)
 
     if full_daily_backfill or qfq_rebased:
         pass
@@ -813,7 +998,11 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
             ).strftime("%Y-%m-%d")
             overlap_start = max(date for date in (overlap_start, start_date, history_floor) if date)
             safe_print(f"[{idx}/{total}] {code} {name}: 重叠校验并补行情 {overlap_start} ~ {today}")
-            overlap_records = fetch_history(code, overlap_start, today)
+            overlap_records, request = fetch_history(
+                code, overlap_start, today, "latest_overlap"
+            )
+            if not overlap_records:
+                return daily_failure("source_empty", "latest_overlap_empty", request)
             scale_change = qfq_overlap_scale_change(existing_records, overlap_records)
             if scale_change:
                 qfq_rebased = True
@@ -823,21 +1012,24 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
                     f"{scale_change['new_close']:.2f}，全量重刷 "
                     f"{full_refetch_start} ~ {today}"
                 )
-                hist_new_records = fetch_history(code, full_refetch_start, today)
+                hist_new_records, request = fetch_history(
+                    code, full_refetch_start, today, "qfq_overlap_refetch"
+                )
+                if not hist_new_records:
+                    return daily_failure("source_empty", "qfq_refetch_empty", request)
             else:
                 # 重叠窗口不仅用于检测前复权尺度，也要用收盘后的完整 OHLCV 覆盖同日
                 # 旧值；否则曾在盘中写入的成交量/最高最低价会因日期相同被永久跳过。
                 hist_new_records.extend(overlap_records)
     else:
         safe_print(f"[{idx}/{total}] {code} {name}: 首次爬取行情 {history_floor} ~ {today}")
-        hist_new_records.extend(fetch_history(code, history_floor, today))
+        rows, request = fetch_history(code, history_floor, today, "initial_history")
+        if not rows:
+            return daily_failure("source_empty", "initial_history_empty", request)
+        hist_new_records.extend(rows)
 
-    if daily_fetch_attempted and daily_rows_received == 0:
-        # Keep the last complete local history, but do not turn a fully empty
-        # upstream response into a successful refresh merely because old rows
-        # happen to exist.
-        safe_print(f"[{idx}/{total}] {code} {name}: 本轮行情请求全部为空，保留旧历史")
-        return {"status": "source_empty"}
+    if daily_requests and not any(request["row_count"] for request in daily_requests):
+        return daily_failure("source_empty", "all_requests_empty", daily_requests[-1])
 
     # SQLite rows use daily_* names while crawler rows use compact aliases.
     # Normalize fetched daily fields first so same-date full refetches actually
@@ -847,6 +1039,14 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         include_valuation=False,
         drop_future=False,
     )
+    force_history_replace = full_daily_backfill or qfq_rebased
+    if force_history_replace:
+        # A full replacement invalidates the old coverage claim unless this response itself reaches
+        # the requested left boundary. This prevents a truncated refetch from permanently inheriting
+        # a stronger boundary that the replacement rows no longer prove.
+        verified_coverage_start = _verified_history_coverage_start(
+            full_refetch_start, normalized_new_records
+        )
     existing_by_date = {
         str(row.get("date", ""))[:10]: row
         for row in existing_records
@@ -866,6 +1066,22 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     result = {"symbol": code, "name": name, "instrument_type": instrument_type}
     if listing_date:
         result["listing_date"] = listing_date
+    coverage_replaced = force_history_replace
+    coverage_changed = (
+        verified_coverage_start != existing_coverage_start
+        if coverage_replaced
+        else bool(
+            verified_coverage_start
+            and (
+                not existing_coverage_start
+                or verified_coverage_start < existing_coverage_start
+            )
+        )
+    )
+    if coverage_replaced:
+        result["history_coverage_replace"] = True
+    if verified_coverage_start and (coverage_changed or coverage_replaced):
+        result["history_coverage_start_date"] = verified_coverage_start
     val_period = None
     if merged:
         # 估值：按 merged（合并后最新状态）判断是否需要拉取及拉取哪个period
@@ -884,9 +1100,9 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         changed_rows = [r for r in merged if r["date"] in changed_daily_dates]
         # 全无变化(估值新、无新交易日、未 prune、非回补、不刷财报)→ 重写会原样落回同样数据，
         # 直接跳过：免去对「已最新」股票的整段 DELETE+重插（重复跑/周末/停牌股尤其明显）。
-        force_history_replace = full_daily_backfill or qfq_rebased
         if (val_period is None and existing_unchanged and not changed_rows
-                and not force_history_replace and not need_fundamentals):
+                and not force_history_replace and not need_fundamentals
+                and not coverage_changed):
             # 行情无需改写时仍要校正证券品种；ETF 可能在引入 instrument_type
             # 之前已经以默认 stock 身份入库。
             mark_stage("stock_history_write")
@@ -906,7 +1122,9 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
     if need_fundamentals:
         mark_stage("fundamentals")
         from stock_crawl_fundamentals import fetch_fundamentals
-        result.update(fetch_fundamentals(code, pledge_info))
+        result.update(
+            fetch_fundamentals(code, pledge_info, listing_date=listing_date)
+        )
 
     if not merged and not need_fundamentals:
         safe_print(f"[{idx}/{total}] {code} {name}: 无数据")
@@ -930,6 +1148,10 @@ def process_stock(code, name, idx, total, *, need_fundamentals=False, pledge_inf
         )
     if need_fundamentals:
         parts.append("财报已刷新")
+    if coverage_changed:
+        parts.append(
+            f"历史覆盖边界={verified_coverage_start or '已清除（等待重新验证）'}"
+        )
     write_state = "已入写库队列" if queued_write else "已写库"
     safe_print(f"[{idx}/{total}] {code} {name}: {write_state} | " + " | ".join(parts))
     return {"status": "queued" if queued_write else "saved"}
@@ -1010,12 +1232,12 @@ def refresh_stock_histories(stocks, *, max_years=MAX_YEARS, workers=THREAD_COUNT
             )
             if (
                 isinstance(outcome, dict)
-                and outcome.get("status") in {"no_data", "source_empty"}
+                and outcome.get("status") in {"no_data", "source_empty", "source_invalid"}
             ):
                 status = outcome.get("status")
                 error = (
-                    "所有已配置行情源均未返回日线数据"
-                    if status == "source_empty"
+                    _daily_failure_message(outcome)
+                    if status in {"source_empty", "source_invalid"}
                     else "本轮未生成可写入的行情或基本面数据"
                 )
                 detail = _failure_detail(code, name, "daily_history", error)
@@ -1239,24 +1461,43 @@ def _plan_fundamentals_refresh(codes):
     from stock_crawl_fundamentals import (
         fetch_pledge_data_bulk,
         fetch_latest_report_announce_dates,
+        fundamentals_missing_families,
         needs_fundamentals_refresh,
         FUNDAMENTALS_EXPIRE_DAYS,
     )
+    codes = list(dict.fromkeys(str(code).zfill(6) for code in codes if code))
     conn = ss.connect()
     try:
-        refetched = ss.financials_refetched_map(conn, list(codes))
+        states = ss.fundamentals_state_map(conn, codes)
     finally:
         conn.close()
     safe_print("[财报] 拉取业绩报表(yjbb)检测新报告 + 全市场质押...")
     announce = fetch_latest_report_announce_dates()
     pledge_map = fetch_pledge_data_bulk()
+    incomplete = {
+        code: fundamentals_missing_families(states.get(code) or {})
+        for code in codes
+    }
+    freshness_needs = {
+        code: needs_fundamentals_refresh(
+            (states.get(code) or {}).get("financials_refetched_at"),
+            announce.get(code),
+            expire_days=FUNDAMENTALS_EXPIRE_DAYS,
+        )
+        for code in codes
+    }
     needs = {
-        code: needs_fundamentals_refresh(refetched.get(code), announce.get(code),
-                                         expire_days=FUNDAMENTALS_EXPIRE_DAYS)
+        code: bool(incomplete[code]) or freshness_needs[code]
         for code in codes
     }
     n = sum(1 for v in needs.values() if v)
-    safe_print(f"[财报] {n}/{len(codes)} 只需刷新财报(新报告/超{FUNDAMENTALS_EXPIRE_DAYS}天/从未爬)")
+    incomplete_count = sum(1 for missing in incomplete.values() if missing)
+    freshness_count = sum(1 for value in freshness_needs.values() if value)
+    safe_print(
+        f"[财报] {n}/{len(codes)} 只需刷新财报"
+        f"(数据族不完整 {incomplete_count}；新报告/超{FUNDAMENTALS_EXPIRE_DAYS}天/从未爬 "
+        f"{freshness_count})"
+    )
     return needs, pledge_map
 
 

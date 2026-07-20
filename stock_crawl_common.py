@@ -498,10 +498,15 @@ def _fetch_daily_eastmoney_qfq(symbol, start_date, end_date, include_trading_val
     if df is None or df.empty:
         return []
 
+    start = _date_dash(start_date)
+    end = _date_dash(end_date)
     records = []
     for _, row in df.iterrows():
+        date_text = str(row["日期"])[:10]
+        if not start <= date_text <= end:
+            continue
         record = {
-            "date": str(row["日期"])[:10],
+            "date": date_text,
             "close": safe_float(row["收盘"]),
             "change_pct": safe_float(row["涨跌幅"]),
             "turnover_rate": safe_float(row["换手率"]),
@@ -864,7 +869,14 @@ def _fetch_daily_source(source, symbol, start_date, end_date, include_trading_va
         raise
 
 
-def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=False, warn=None):
+def fetch_qfq_daily_records(
+    symbol,
+    start_date,
+    end_date,
+    include_trading_value=False,
+    warn=None,
+    attempt_callback=None,
+):
     """A 股前复权日线，change_pct 统一为 close-to-close 日涨跌幅。"""
     last_err = None
     saw_empty_response = False
@@ -881,13 +893,27 @@ def fetch_qfq_daily_records(symbol, start_date, end_date, include_trading_value=
                 )
                 if not records:
                     saw_empty_response = True
+                    if attempt_callback:
+                        attempt_callback({"source": source, "status": "empty"})
                     if warn:
                         warn(f"{symbol} {source}行情返回空数据，切换下一数据源")
                     continue
                 _record_daily_source_success(source)
+                if attempt_callback:
+                    attempt_callback({
+                        "source": source,
+                        "status": "success",
+                        "rows": len(records),
+                    })
                 return records
             except Exception as exc:
                 last_err = exc
+                if attempt_callback:
+                    attempt_callback({
+                        "source": source,
+                        "status": "error",
+                        "error": f"{type(exc).__name__}: {exc}"[:1000],
+                    })
                 disabled_now = _record_daily_source_failure(source)
                 if warn:
                     warn(f"{symbol} {source}行情失败({exc})，切换下一数据源")

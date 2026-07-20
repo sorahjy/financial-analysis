@@ -439,7 +439,54 @@ class StockListingDateRefreshTest(unittest.TestCase):
         self.assertEqual(calls, [(listing_date, "2026-07-17")])
         self.assertEqual(saved[0]["listing_date"], listing_date)
 
-    def test_qfq_full_refetch_is_clamped_to_listing_date(self):
+    def test_embedded_fundamentals_receive_resolved_listing_date(self):
+        listing_date = "2025-08-08"
+        fundamentals = {
+            **valid_fundamentals(),
+            "financials_refetched_at": "2026-07-19T10:00:00",
+        }
+        saved = []
+        with patch.object(
+            stock_crawl_price_valuation,
+            "load_stock_file",
+            return_value={},
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "latest_weekday_date",
+            return_value=listing_date,
+        ), patch.object(
+            stock_crawl_fundamentals,
+            "fetch_fundamentals",
+            return_value=fundamentals,
+        ) as fetch_fundamentals:
+            stock_crawl_price_valuation.process_stock(
+                "301666",
+                "大普微",
+                1,
+                1,
+                need_fundamentals=True,
+                pledge_info={"pledge_ratio": 0.0},
+                max_years=10,
+                refresh_valuation=False,
+                listing_date=listing_date,
+                daily_fetcher=lambda *_args: [{
+                    "date": listing_date,
+                    "open": 10.0,
+                    "high": 10.5,
+                    "low": 9.5,
+                    "close": 10.0,
+                    "volume": 1000.0,
+                    "amount": 1000000.0,
+                }],
+                save_callback=lambda _code, _name, data: saved.append(data),
+            )
+
+        fetch_fundamentals.assert_called_once_with(
+            "301666", {"pledge_ratio": 0.0}, listing_date=listing_date
+        )
+        self.assertEqual(saved[0]["listing_date"], listing_date)
+
+    def test_qfq_full_refetch_is_clamped_and_clears_unproven_coverage(self):
         listing_date = "2020-01-01"
         existing = [
             {**self._daily_row("2026-07-01", 41.2), "daily_change_pct": 1.402904},
@@ -458,6 +505,7 @@ class StockListingDateRefreshTest(unittest.TestCase):
             },
         ]
         calls = []
+        saved = []
 
         def daily_fetcher(_code, start_date, end_date):
             calls.append((start_date, end_date))
@@ -470,6 +518,7 @@ class StockListingDateRefreshTest(unittest.TestCase):
                 "records": existing,
                 "start_date": "2026-07-01",
                 "end_date": "2026-07-02",
+                "history_coverage_start_date": listing_date,
             },
         ), patch.object(
             stock_crawl_price_valuation,
@@ -485,10 +534,12 @@ class StockListingDateRefreshTest(unittest.TestCase):
                 refresh_valuation=False,
                 listing_date=listing_date,
                 daily_fetcher=daily_fetcher,
-                save_callback=lambda *_args: None,
+                save_callback=lambda _code, _name, data: saved.append(data),
             )
 
         self.assertEqual(calls, [(listing_date, "2026-07-02")])
+        self.assertTrue(saved[0]["history_coverage_replace"])
+        self.assertNotIn("history_coverage_start_date", saved[0])
 
     def test_records_before_listing_date_are_removed(self):
         listing_date = "2020-01-02"
@@ -527,6 +578,203 @@ class StockListingDateRefreshTest(unittest.TestCase):
         daily_fetch.assert_not_called()
         self.assertEqual([row["date"] for row in saved[0]["records"]], [listing_date])
         self.assertTrue(saved[0]["history_replace"])
+
+
+class HistoryCoverageBoundaryTest(unittest.TestCase):
+    @staticmethod
+    def _canonical_row(trade_date):
+        return {
+            "date": trade_date,
+            "daily_open": 10.0,
+            "daily_high": 11.0,
+            "daily_low": 9.0,
+            "daily_close": 10.5,
+            "daily_volume": 1000.0,
+            "daily_amount": 10000.0,
+            "daily_change_pct": 0.0,
+            "daily_turnover_rate": 1.0,
+        }
+
+    @staticmethod
+    def _source_row(trade_date):
+        return {
+            "date": trade_date,
+            "open": 10.0,
+            "high": 11.0,
+            "low": 9.0,
+            "close": 10.5,
+            "volume": 1000.0,
+            "amount": 10000.0,
+            "change_pct": 0.0,
+            "turnover_rate": 1.0,
+        }
+
+    def test_response_covering_floor_and_anchor_persists_boundary_and_skips_next_run(self):
+        start_date = "2020-01-10"
+        listing_date = "2010-01-01"
+        history_floor = "2019-01-10"
+        conn = stock_storage.connect(":memory:")
+        stock_storage.save_stock(conn, {
+            "symbol": "600822",
+            "name": "上海物贸",
+            "listing_date": listing_date,
+            "history_refetched_at": f"{start_date}T15:11:00",
+            "history": history_payload_from_records(
+                "600822",
+                "上海物贸",
+                [self._canonical_row(start_date)],
+                "test",
+            ),
+        })
+        calls = []
+
+        def anchor_fetch(_code, range_start, range_end):
+            calls.append((range_start, range_end))
+            return [
+                self._source_row(history_floor),
+                self._source_row(start_date),
+            ]
+
+        try:
+            with patch.object(
+                stock_crawl_price_valuation.ss,
+                "thread_conn",
+                return_value=conn,
+            ), patch.object(
+                stock_crawl_price_valuation,
+                "latest_weekday_date",
+                return_value=start_date,
+            ):
+                first = stock_crawl_price_valuation.process_stock(
+                    "600822",
+                    "上海物贸",
+                    1,
+                    1,
+                    max_years=1,
+                    refresh_valuation=False,
+                    listing_date=listing_date,
+                    daily_fetcher=anchor_fetch,
+                )
+                second = stock_crawl_price_valuation.process_stock(
+                    "600822",
+                    "上海物贸",
+                    1,
+                    1,
+                    max_years=1,
+                    refresh_valuation=False,
+                    listing_date=listing_date,
+                    daily_fetcher=lambda *_args: self.fail(
+                        "verified coverage must skip a repeated left-boundary request"
+                    ),
+                )
+
+            self.assertEqual(first["status"], "saved")
+            self.assertEqual(second["status"], "up_to_date")
+            self.assertEqual(calls, [(history_floor, start_date)])
+            self.assertEqual(
+                stock_storage.history_coverage_start_date(conn, "600822"),
+                history_floor,
+            )
+        finally:
+            conn.close()
+
+    def test_anchor_only_does_not_permanently_claim_the_wide_left_gap(self):
+        start_date = "2020-01-10"
+        history_floor = "2019-01-10"
+        conn = stock_storage.connect(":memory:")
+        stock_storage.save_stock(conn, {
+            "symbol": "600822",
+            "name": "上海物贸",
+            "listing_date": "2010-01-01",
+            "history_refetched_at": f"{start_date}T15:11:00",
+            "history": history_payload_from_records(
+                "600822",
+                "上海物贸",
+                [self._canonical_row(start_date)],
+                "test",
+            ),
+        })
+        calls = []
+
+        def anchor_only(_code, range_start, range_end):
+            calls.append((range_start, range_end))
+            return [self._source_row(start_date)]
+
+        try:
+            with patch.object(
+                stock_crawl_price_valuation.ss,
+                "thread_conn",
+                return_value=conn,
+            ), patch.object(
+                stock_crawl_price_valuation,
+                "latest_weekday_date",
+                return_value=start_date,
+            ):
+                first = stock_crawl_price_valuation.process_stock(
+                    "600822",
+                    "上海物贸",
+                    1,
+                    1,
+                    max_years=1,
+                    refresh_valuation=False,
+                    listing_date="2010-01-01",
+                    daily_fetcher=anchor_only,
+                )
+                second = stock_crawl_price_valuation.process_stock(
+                    "600822",
+                    "上海物贸",
+                    1,
+                    1,
+                    max_years=1,
+                    refresh_valuation=False,
+                    listing_date="2010-01-01",
+                    daily_fetcher=anchor_only,
+                )
+
+            self.assertEqual(first["status"], "up_to_date")
+            self.assertEqual(second["status"], "up_to_date")
+            self.assertEqual(calls, [
+                (history_floor, start_date),
+                (history_floor, start_date),
+            ])
+            self.assertIsNone(
+                stock_storage.history_coverage_start_date(conn, "600822")
+            )
+        finally:
+            conn.close()
+
+    def test_nonempty_left_response_without_known_anchor_is_rejected(self):
+        start_date = "2020-01-10"
+        existing = self._canonical_row(start_date)
+        with patch.object(
+            stock_crawl_price_valuation,
+            "load_stock_file",
+            return_value={
+                "records": [existing],
+                "start_date": start_date,
+                "end_date": start_date,
+                "history_refetched_at": f"{start_date}T15:11:00",
+            },
+        ), patch.object(
+            stock_crawl_price_valuation,
+            "latest_weekday_date",
+            return_value=start_date,
+        ):
+            outcome = stock_crawl_price_valuation.process_stock(
+                "600822",
+                "上海物贸",
+                1,
+                1,
+                max_years=1,
+                refresh_valuation=False,
+                listing_date="2010-01-01",
+                daily_fetcher=lambda *_args: [self._source_row("2020-01-09")],
+            )
+
+        self.assertEqual(outcome["status"], "source_invalid")
+        self.assertEqual(outcome["reason"], "left_boundary_anchor_missing")
+        self.assertEqual(outcome["expected_anchor"], start_date)
+        self.assertEqual(outcome["received_dates"], ["2020-01-09"])
 
 
 class RefreshFailurePropagationTest(unittest.TestCase):
@@ -745,6 +993,7 @@ class RefreshFailurePropagationTest(unittest.TestCase):
                 "start_date": "2026-07-16",
                 "end_date": "2026-07-16",
                 "history_refetched_at": "2026-07-16T10:00:00",
+                "history_coverage_start_date": "2016-07-19",
             },
         ), patch.object(
             stock_crawl_price_valuation,
@@ -867,6 +1116,69 @@ class RefreshFailurePropagationTest(unittest.TestCase):
         self.assertIn("301332 [daily_history]", history["error"])
         self.assertEqual(report["failures"], [{"step": "segment_leader_history", **detail}])
 
+    def test_hot_money_failure_sidecar_expands_global_exit_to_per_stock_errors(self):
+        detail = {
+            "code": "603075",
+            "name": "热威股份",
+            "stage": "fundamentals",
+            "error": "RuntimeError: 603075 基本面数据不完整: indicators.records",
+        }
+
+        def fake_run_step(name, cmd, *, timeout=None, env=None, skip=False):
+            if skip:
+                return stock_data_refresh.StepResult(
+                    name, " ".join(cmd), True, 0, 0.0, skipped=True
+                )
+            if name == "hot_money_small_cap_universe":
+                path = Path(cmd[cmd.index("--failure-report") + 1])
+                stock_crawl_common.write_json_file(path, {
+                    "requested": 558,
+                    "processed": 558,
+                    "write_enqueued": 557,
+                    "write_completed": 557,
+                    "failed": ["603075"],
+                    "failure_details": [detail],
+                })
+                return stock_data_refresh.StepResult(
+                    name, " ".join(cmd), False, 1, 0.0
+                )
+            return stock_data_refresh.StepResult(
+                name, " ".join(cmd), True, 0, 0.0
+            )
+
+        def fake_local_step(name, command, func):
+            return stock_data_refresh.StepResult(name, command, True, 0, 0.0)
+
+        with patch.object(
+            stock_data_refresh, "run_step", side_effect=fake_run_step
+        ), patch.object(
+            stock_data_refresh, "local_step_result", side_effect=fake_local_step
+        ), patch.object(
+            stock_data_refresh, "collect_data_health", return_value={}
+        ), patch.object(stock_data_refresh, "write_json_file"):
+            report = stock_data_refresh.refresh_before_server(mode="full", timeout=1)
+
+        hot_money = next(
+            step
+            for step in report["steps"]
+            if step["name"] == "hot_money_small_cap_universe"
+        )
+        self.assertEqual(hot_money["meta"]["failure_details"], [detail])
+        self.assertEqual(hot_money["meta"]["write_completed"], 557)
+        self.assertIn("603075 [fundamentals]", hot_money["error"])
+        self.assertIn(
+            {"step": "hot_money_small_cap_universe", **detail},
+            report["failures"],
+        )
+        short_step = next(
+            step for step in report["steps"] if step["name"] == "short_signal_enrichment"
+        )
+        strategy_step = next(
+            step for step in report["steps"] if step["name"] == "strategy_results"
+        )
+        self.assertTrue(short_step["skipped"])
+        self.assertTrue(strategy_step["skipped"])
+
     def test_nonzero_child_with_empty_sidecar_still_has_an_error(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             sidecar = Path(tmpdir) / "failure.json"
@@ -988,6 +1300,7 @@ class DailySourceFallbackTest(unittest.TestCase):
     def test_empty_primary_source_falls_back_to_next_source(self):
         expected = [{"date": "2026-07-10", "close": 10.0}]
         warnings = []
+        attempts = []
         with patch.object(
             stock_crawl_common,
             "_enabled_daily_source_groups",
@@ -1000,13 +1313,41 @@ class DailySourceFallbackTest(unittest.TestCase):
             stock_crawl_common, "_record_daily_source_success"
         ) as success_mock:
             records = stock_crawl_common.fetch_qfq_daily_records(
-                "000001", "20260710", "20260710", warn=warnings.append
+                "000001",
+                "20260710",
+                "20260710",
+                warn=warnings.append,
+                attempt_callback=attempts.append,
             )
 
         self.assertEqual(records, expected)
         self.assertEqual(fetch_mock.call_count, 2)
         success_mock.assert_called_once_with("fallback")
         self.assertTrue(any("空数据" in message for message in warnings))
+        self.assertEqual(attempts, [
+            {"source": "primary", "status": "empty"},
+            {"source": "fallback", "status": "success", "rows": 1},
+        ])
+
+    def test_eastmoney_adapter_filters_rows_outside_requested_range(self):
+        frame = pd.DataFrame([
+            {"日期": "2026-07-09", "开盘": 9, "最高": 10, "最低": 8,
+             "收盘": 9.5, "成交量": 100, "成交额": 1000, "涨跌幅": 0, "换手率": 1},
+            {"日期": "2026-07-10", "开盘": 10, "最高": 11, "最低": 9,
+             "收盘": 10.5, "成交量": 200, "成交额": 2000, "涨跌幅": 1, "换手率": 2},
+            {"日期": "2026-07-11", "开盘": 11, "最高": 12, "最低": 10,
+             "收盘": 11.5, "成交量": 300, "成交额": 3000, "涨跌幅": 2, "换手率": 3},
+        ])
+        with patch.object(
+            stock_crawl_common.ak,
+            "stock_zh_a_hist",
+            return_value=frame,
+        ):
+            rows = stock_crawl_common._fetch_daily_eastmoney_qfq(
+                "000001", "2026-07-10", "2026-07-10", include_trading_value=True
+            )
+
+        self.assertEqual([row["date"] for row in rows], ["2026-07-10"])
 
     def test_empty_primary_does_not_hide_fallback_transport_failure(self):
         def passthrough(func, *args, **kwargs):
@@ -1193,6 +1534,141 @@ class PlateCoverageIntegrityTest(unittest.TestCase):
 
 
 class FundamentalsIntegrityTest(unittest.TestCase):
+    def test_sina_indicators_clamp_to_listing_year_and_do_not_call_fallback(self):
+        sina = pd.DataFrame([
+            {"日期": "2024-12-31", "净资产收益率(%)": 8.0},
+            {"日期": "2025-12-31", "净资产收益率(%)": 10.0},
+        ])
+        expected_start_year = str(max(
+            datetime.now().year - stock_crawl_fundamentals.FINANCIAL_YEARS,
+            2021,
+        ))
+        with patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator",
+            return_value=sina,
+        ) as sina_fetch, patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator_em",
+        ) as em_fetch:
+            result = stock_crawl_fundamentals.fetch_financial_indicators(
+                "001309", listing_date="2021-11-12"
+            )
+
+        sina_fetch.assert_called_once_with(symbol="001309", start_year=expected_start_year)
+        em_fetch.assert_not_called()
+        self.assertEqual(result["source"], "akshare.stock_financial_analysis_indicator")
+        self.assertEqual(
+            [row["date"] for row in result["records"]],
+            ["2025-12-31", "2024-12-31"],
+        )
+        self.assertEqual(result["roe_stats"]["mean"], 9.0)
+
+    def test_empty_sina_indicators_fall_back_to_real_eastmoney_fields(self):
+        em = pd.DataFrame([
+            {
+                "REPORT_DATE": "2025-12-31 00:00:00",
+                "ROEJQ": 10.57,
+                "ROEKCJQ": 99.0,
+                "EPSXS": 21.76,
+                "EPSKCJB": None,
+                "BPS": 216.32,
+                "MGJYXJJE": 21.49,
+                "XSMLL": 89.76,
+                "XSJLL": 52.22,
+                "TOTALOPERATEREVETZ": 6.34,
+                "PARENTNETPROFITTZ": 1.47,
+                "EQUITY_YOYRATIO_PK": 7.5,
+                "TOTAL_ASSETS_PK": 300_000_000.0,
+                "KCFJCXSYJLR": 27_239_985_194.41,
+                "ZCFZL": 12.12,
+            },
+        ])
+        with patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator",
+            return_value=pd.DataFrame(),
+        ), patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator_em",
+            return_value=em,
+        ) as em_fetch:
+            result = stock_crawl_fundamentals.fetch_financial_indicators(
+                "600519", listing_date="2001-08-27"
+            )
+
+        em_fetch.assert_called_once_with(symbol="600519.SH", indicator="按报告期")
+        record = result["records"][0]
+        self.assertEqual(result["source"], "akshare.stock_financial_analysis_indicator_em")
+        self.assertEqual(record["roe"], 10.57)
+        self.assertEqual(record["roe_weighted"], 10.57)
+        self.assertEqual(record["eps_diluted"], 21.76)
+        self.assertIsNone(record["eps_adjusted"])
+        self.assertEqual(record["bvps_adjusted"], 216.32)
+        self.assertEqual(record["ocfps"], 21.49)
+        self.assertEqual(record["gross_margin"], 89.76)
+        self.assertEqual(record["revenue_growth"], 6.34)
+        self.assertEqual(record["net_assets_growth"], 7.5)
+        self.assertEqual(record["total_assets"], 300_000_000.0)
+        self.assertEqual(record["asset_liability_ratio"], 12.12)
+        self.assertNotEqual(record["roe"], 99.0)
+
+    def test_eastmoney_indicator_symbol_maps_supported_markets_and_rejects_bse(self):
+        expected = {
+            "001309": "001309.SZ",
+            "301666": "301666.SZ",
+            "603075": "603075.SH",
+            "688548": "688548.SH",
+        }
+        for code, symbol in expected.items():
+            with self.subTest(code=code):
+                self.assertEqual(
+                    stock_crawl_fundamentals._eastmoney_indicator_symbol(code),
+                    symbol,
+                )
+        with self.assertRaisesRegex(ValueError, "暂不支持"):
+            stock_crawl_fundamentals._eastmoney_indicator_symbol("920001")
+
+    def test_two_empty_indicator_sources_remain_incomplete(self):
+        with patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator",
+            return_value=pd.DataFrame(),
+        ), patch.object(
+            stock_crawl_fundamentals.ak,
+            "stock_financial_analysis_indicator_em",
+            return_value=pd.DataFrame(),
+        ):
+            indicators = stock_crawl_fundamentals.fetch_financial_indicators("301666")
+
+        payload = valid_fundamentals()
+        payload["indicators"] = indicators
+        self.assertEqual(indicators["records"], [])
+        with self.assertRaisesRegex(RuntimeError, "indicators.records"):
+            stock_crawl_fundamentals.ensure_fundamentals_complete(payload, "301666")
+
+    def test_fetch_fundamentals_passes_listing_date_to_indicators(self):
+        payload = valid_fundamentals()
+        with patch.object(
+            stock_crawl_fundamentals,
+            "fetch_financial_reports",
+            return_value=payload["financials"],
+        ), patch.object(
+            stock_crawl_fundamentals,
+            "fetch_financial_indicators",
+            return_value=payload["indicators"],
+        ) as indicator_fetch, patch.object(
+            stock_crawl_fundamentals,
+            "fetch_dividend_history",
+            return_value=payload["dividends"],
+        ):
+            result = stock_crawl_fundamentals.fetch_fundamentals(
+                "301666", listing_date="2025-08-08"
+            )
+
+        indicator_fetch.assert_called_once_with("301666", listing_date="2025-08-08")
+        self.assertIn("financials_refetched_at", result)
+
     def test_empty_required_record_family_is_incomplete(self):
         payload = valid_fundamentals()
         payload["indicators"] = {"records": []}
@@ -1291,6 +1767,71 @@ class FundamentalsIntegrityTest(unittest.TestCase):
             conn.close()
 
         self.assertNotIn("600001", existing)
+
+    def test_fundamentals_state_map_decodes_blobs_and_marks_missing_rows(self):
+        conn = stock_storage.connect(":memory:")
+        try:
+            stock_storage.save_stock(conn, {
+                "symbol": "600001",
+                "name": "完整",
+                "financials_refetched_at": "2026-07-19T10:00:00",
+                **valid_fundamentals(),
+            }, write_history=False)
+            conn.execute(
+                "INSERT INTO stock_meta "
+                "(code, name, financials_refetched_at, financials_json, "
+                "indicators_json, dividends_json) VALUES (?, ?, ?, ?, ?, ?)",
+                ("600002", "损坏", "2026-07-19T10:00:00", "{}", "{bad", "{}"),
+            )
+            conn.commit()
+
+            states = stock_storage.fundamentals_state_map(
+                conn, ["600001", "600002", "600003"]
+            )
+        finally:
+            conn.close()
+
+        self.assertEqual(states["600001"]["indicators"]["records"][0]["roe"], 10)
+        self.assertIsNone(states["600002"]["indicators"])
+        self.assertIsNone(states["600003"]["financials_refetched_at"])
+        self.assertIsNone(states["600003"]["financials"])
+
+    def test_planner_repairs_recent_but_incomplete_fundamentals(self):
+        conn = stock_storage.connect(":memory:")
+        complete = {"symbol": "600001", "name": "完整", **valid_fundamentals()}
+        complete["financials_refetched_at"] = "2026-07-19T10:00:00"
+        incomplete = {"symbol": "600002", "name": "缺指标", **valid_fundamentals()}
+        incomplete["indicators"] = {"records": []}
+        incomplete["financials_refetched_at"] = "2026-07-19T10:00:00"
+        stock_storage.save_stock(conn, complete, write_history=False)
+        stock_storage.save_stock(conn, incomplete, write_history=False)
+
+        with patch.object(
+            stock_crawl_price_valuation.ss,
+            "connect",
+            return_value=conn,
+        ), patch.object(
+            stock_crawl_fundamentals,
+            "fetch_latest_report_announce_dates",
+            return_value={},
+        ), patch.object(
+            stock_crawl_fundamentals,
+            "fetch_pledge_data_bulk",
+            return_value={},
+        ), patch.object(
+            stock_crawl_fundamentals,
+            "needs_fundamentals_refresh",
+            return_value=False,
+        ):
+            needs, pledge = stock_crawl_price_valuation._plan_fundamentals_refresh(
+                ["600001", "600002", "600003"]
+            )
+
+        self.assertEqual(
+            needs,
+            {"600001": False, "600002": True, "600003": True},
+        )
+        self.assertEqual(pledge, {})
 
 
 class CompletedDailyBarTest(unittest.TestCase):

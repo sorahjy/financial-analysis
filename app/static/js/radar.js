@@ -26,10 +26,21 @@
     return "w";
   }
   const fmt = (v, d = 2) => (v === null || v === undefined || v === "" || Number.isNaN(Number(v)) ? "-" : Number(v).toFixed(d));
+  const finiteNumber = (v) => (
+    v === null || v === undefined || v === "" || !Number.isFinite(Number(v))
+      ? Number.NaN
+      : Number(v)
+  );
   const fmtSignedPct = (v, d = 2) => {
     if (v === null || v === undefined || v === "" || Number.isNaN(Number(v))) return "-";
     const n = Number(v);
     return `${n > 0 ? "+" : ""}${n.toFixed(d)}%`;
+  };
+  const fmtSigned = (v, d = 2, forceNegativeZero = false) => {
+    if (v === null || v === undefined || v === "" || Number.isNaN(Number(v))) return "-";
+    const n = Number(v);
+    if (n === 0 && forceNegativeZero) return `-${Math.abs(n).toFixed(d)}`;
+    return `${n > 0 ? "+" : ""}${n.toFixed(d)}`;
   };
   const fmtRatioPct = (v) =>
     (v === null || v === undefined || v === "" || Number.isNaN(Number(v))
@@ -244,7 +255,19 @@
 
     function industryHeatRow(row, kind, maxMetric) {
       const hot = kind === "hottest";
-      const metric = hot ? Number(row.amount_20d_yi) : Number(row.rising_score);
+      const trendScore = finiteNumber(row.trend_score);
+      const legacyRisingScore = finiteNumber(row.rising_score);
+      const shareChange = finiteNumber(row.last5_vs_first5_share_pct);
+      const falling = !hot && (
+        row.direction === "falling"
+        || row.is_falling_candidate === true
+        || (Number.isFinite(trendScore) && trendScore < 0)
+        || (!Number.isFinite(trendScore) && Number.isFinite(shareChange) && shareChange < 0)
+      );
+      const trendMetric = Number.isFinite(trendScore)
+        ? trendScore
+        : (Number.isFinite(legacyRisingScore) ? legacyRisingScore : shareChange);
+      const metric = hot ? Number(row.amount_20d_yi) : Math.abs(trendMetric);
       const barWidth = Number.isFinite(metric) && maxMetric > 0
         ? Math.max(2, Math.min(100, metric / maxMetric * 100))
         : 0;
@@ -254,11 +277,14 @@
         : fmtSignedPct(row.last5_vs_first5_share_pct, 1);
       const secondary = hot
         ? `20日 ${amountPrefix}${fmtMarketCap(row.amount_20d_yi)}`
-        : `上升分 ${fmt(row.rising_score, 1)}`;
+        : (Number.isFinite(trendScore)
+          ? `趋势分 ${fmtSigned(trendScore, 1, falling)}`
+          : `20日相关 ${fmtSigned(row.trend_correlation, 2)}`);
       const detail = hot
         ? `最新 ${fmtMarketCap(row.latest_amount_yi)} · 份额 ${fmt(row.avg_daily_market_share_pct, 2)}%`
         : `末5日日均 ${fmtMarketCap(row.last5_avg_amount_yi)} · 相关 ${fmt(row.trend_correlation, 2)}`;
-      return `<article class="industry-heat-row ${hot ? "is-hot" : "is-rising"}">
+      const rowClass = hot ? "is-hot" : (falling ? "is-falling" : "is-rising");
+      return `<article class="industry-heat-row ${rowClass}">
         <span class="industry-heat-rank">${esc(row.rank)}</span>
         <div class="industry-heat-name"><strong>${esc(row.segment_name || "未命名行业")}</strong><small>${esc(row.segment_code)} · ${esc(row.parent_segment || "-")}</small><div class="industry-heat-bar" aria-hidden="true"><i style="width:${barWidth.toFixed(1)}%"></i></div><em>${esc(industryHeatCapText(row))}${esc(industryHeatAmountNote(row))}</em></div>
         <div class="industry-heat-numbers"><b>${esc(primary)}</b><span>${esc(secondary)}</span><small>${esc(detail)}</small></div>
@@ -291,6 +317,34 @@
       })).sort((left, right) => left.rank - right.rank);
     }
 
+    function industryHeatTrendRows(report) {
+      const ranked = industryHeatRankedRows(report, "trend", "trend_rank");
+      if (ranked.length) return ranked;
+
+      // v1/v2 报告没有合并趋势榜：保留原升温次序，再追加双负下降行业，
+      // 让旧的原子快照也能立即展示负数；刷新后由后端 trend_rank 接管排序。
+      const industries = Array.isArray(report && report.industries) ? report.industries : [];
+      const rising = industryHeatRankedRows(report, "rising", "rising_rank").map((row) => ({
+        ...row,
+        trend_score: row.rising_score,
+      }));
+      const seen = new Set(rising.map((row) => String(row.segment_code || "")));
+      const falling = industries.filter((row) => {
+        if (seen.has(String(row && row.segment_code || ""))) return false;
+        const growth = finiteNumber(row && row.last5_vs_first5_share_pct);
+        const correlation = finiteNumber(row && row.trend_correlation);
+        return Number.isFinite(growth) && growth < 0
+          && Number.isFinite(correlation) && correlation < 0;
+      }).sort((left, right) => {
+        const growthOrder = Number(right.last5_vs_first5_share_pct) - Number(left.last5_vs_first5_share_pct);
+        if (growthOrder) return growthOrder;
+        const trendOrder = Number(right.trend_correlation) - Number(left.trend_correlation);
+        if (trendOrder) return trendOrder;
+        return String(left.segment_code || "").localeCompare(String(right.segment_code || ""));
+      });
+      return [...rising, ...falling].map((row, index) => ({ ...row, rank: index + 1 }));
+    }
+
     function renderIndustryHeat(report) {
       const content = $("radar-industry-heat-content");
       if (!content) return;
@@ -302,7 +356,7 @@
         return;
       }
       const hottest = industryHeatRankedRows(report, "hottest", "hottest_rank");
-      const rising = industryHeatRankedRows(report, "rising", "rising_rank");
+      const trend = industryHeatTrendRows(report);
       if (!hottest.length) {
         renderIndustryHeat({ available: false, error: "报告全量行业排名不完整，请重新刷新数据。" });
         return;
@@ -313,20 +367,26 @@
       const latestAmountSource = industryHeatLatestSource(report);
       const amountSourceSummary = industryHeatSourceSummary(report);
       const hottestMax = Math.max(...hottest.map((row) => Number(row.amount_20d_yi) || 0), 1);
-      const risingMax = Math.max(...rising.map((row) => Number(row.rising_score) || 0), 1);
-      const risingRows = rising.length
-        ? rising.map((row) => industryHeatRow(row, "rising", risingMax)).join("")
-        : '<div class="industry-heat-panel-empty">本窗口没有同时满足“末5日成交份额增长且20日趋势为正”的行业。</div>';
+      const trendMax = Math.max(...trend.map((row) => {
+        const score = finiteNumber(row.trend_score);
+        if (Number.isFinite(score)) return Math.abs(score);
+        const legacyScore = finiteNumber(row.rising_score);
+        if (Number.isFinite(legacyScore)) return Math.abs(legacyScore);
+        return Math.abs(finiteNumber(row.last5_vs_first5_share_pct) || 0);
+      }), 1);
+      const trendRows = trend.length
+        ? trend.map((row) => industryHeatRow(row, "trend", trendMax)).join("")
+        : '<div class="industry-heat-panel-empty">本窗口没有份额变化与20日趋势同向的行业。</div>';
       content.innerHTML = `<div class="industry-heat-summary" role="group" aria-label="行业热度报告摘要">
         <div><span>数据截至</span><strong>${esc(report.as_of_date || "-")}</strong><small>最新日：${esc(latestAmountSource)} · 生成 ${esc(report.generated_at || "-")}</small></div>
         <div><span>统一窗口</span><strong>${esc(windowMeta.trading_days || 20)}个交易日</strong><small>${esc(windowMeta.start_date || "-")} 至 ${esc(windowMeta.end_date || "-")}</small></div>
         <div><span>行业覆盖</span><strong>${esc(quality.eligible_segment_count || 0)} / ${esc(quality.expected_segment_count || 0)}</strong><small>${fmt(quality.eligible_coverage_pct, 1)}% · ${esc(quality.estimated_industry_count || 0)}行业含成交额估算</small></div>
         <div><span>市值成员覆盖</span><strong>${fmt(quality.market_cap_coverage_pct, 1)}%</strong><small>不完整行业标注“约”</small></div>
       </div>
-      <aside class="industry-heat-method"><strong>口径与来源</strong><p>${esc(methodology.hottest_rank || "热门榜按20日成交额排序")}；${esc(methodology.rising_score || "上升榜按份额增幅与趋势相关性排序")}。成交额来源：${esc(amountSourceSummary)}；“成分汇总”表示按已校验的 SW3 成分聚合，不等同于申万指数直接值。热度是研究用活跃度，不代表收益概率。</p></aside>
+      <aside class="industry-heat-method"><strong>口径与来源</strong><p>${esc(methodology.hottest_rank || "热门榜按20日成交额排序")}；${esc(methodology.trend_score || methodology.rising_score || "趋势榜按份额增减幅与20日趋势相关性排序，下降显示负分")}。成交额来源：${esc(amountSourceSummary)}；“成分汇总”表示按已校验的 SW3 成分聚合，不等同于申万指数直接值。热度是研究用活跃度，不代表收益概率。</p></aside>
       <div class="industry-heat-grid">
         <section class="industry-heat-panel" aria-labelledby="industry-heat-hottest-title"><header><div><span>Amount ranking</span><h3 id="industry-heat-hottest-title">近20日成交额全量排名 · ${hottest.length}个</h3></div><p>条形长度=20日成交额；折线=每日成交份额热度指数</p></header><div class="industry-heat-list" aria-label="近20日成交额全量行业排名">${hottest.map((row) => industryHeatRow(row, "hottest", hottestMax)).join("")}</div></section>
-        <section class="industry-heat-panel" aria-labelledby="industry-heat-rising-title"><header><div><span>Rising attention</span><h3 id="industry-heat-rising-title">热度逐渐上升全量排名 · ${rising.length}个</h3></div><p>仅纳入末5日份额增长且20日趋势为正的行业</p></header><div class="industry-heat-list" aria-label="热度逐渐上升全量行业排名">${risingRows}</div></section>
+        <section class="industry-heat-panel" aria-labelledby="industry-heat-rising-title"><header><div><span>Attention trend</span><h3 id="industry-heat-rising-title">热度升降趋势排名 · ${trend.length}个</h3></div><p>份额变化与20日趋势同向；下降行业显示负分</p></header><div class="industry-heat-list" aria-label="热度升降趋势行业排名">${trendRows}</div></section>
       </div>`;
     }
 

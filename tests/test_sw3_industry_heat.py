@@ -1,3 +1,4 @@
+import copy
 import json
 import tempfile
 import unittest
@@ -7,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import sw3_industry_heat as heat
+from app.services import radar_service
 
 
 def _dates(count=20):
@@ -41,6 +43,53 @@ def _histories():
     }
 
 
+def _signed_trend_fixture():
+    dates = _dates()
+    segments = [
+        {
+            "segment_code": f"85000{index}",
+            "segment_name": f"行业{index}",
+            "parent_segment": "父行业",
+            "member_count": 0,
+            "members": [],
+        }
+        for index in range(1, 6)
+    ]
+    series = {
+        "850001": [10.0 + 0.5 * index for index in range(20)],
+        "850002": [20.0 + 0.1 * index for index in range(20)],
+        "850003": [30.0 - 0.5 * index for index in range(20)],
+        "850004": [20.0 - 0.1 * index for index in range(20)],
+        "850005": [20.0 for _index in range(20)],
+    }
+    histories = {
+        code: dict(zip(dates, amounts))
+        for code, amounts in series.items()
+    }
+    return segments, histories
+
+
+def _as_v2_payload(payload):
+    previous = copy.deepcopy(payload)
+    previous["schema"] = heat.SW3_INDUSTRY_HEAT_V2_SCHEMA
+    previous["rankings"].pop("falling", None)
+    previous["rankings"].pop("trend", None)
+    previous["data_quality"].pop("falling_candidate_count", None)
+    previous["data_quality"].pop("trend_candidate_count", None)
+    for row in previous["industries"]:
+        for field in (
+            "falling_growth_percentile",
+            "falling_trend_percentile",
+            "falling_score",
+            "is_falling_candidate",
+            "falling_rank",
+            "trend_score",
+            "trend_rank",
+        ):
+            row.pop(field, None)
+    return previous
+
+
 class Sw3IndustryHeatTest(unittest.TestCase):
     def test_compute_uses_sws_only_sources_and_complete_rankings(self):
         histories = _histories()
@@ -69,6 +118,94 @@ class Sw3IndustryHeatTest(unittest.TestCase):
             rows["850002"]["amount_sources"],
             ["sws_trend"],
         )
+
+    def test_compute_adds_negative_falling_scores_and_signed_trend_ranking(self):
+        segments, histories = _signed_trend_fixture()
+        payload = heat.compute_sw3_industry_heat(segments, histories)
+
+        heat.validate_complete_report(payload, min_eligible_coverage=1.0)
+        rows = {row["segment_code"]: row for row in payload["industries"]}
+        self.assertEqual(payload["schema"], "sw3_industry_heat.v3")
+        self.assertEqual(payload["data_quality"]["rising_candidate_count"], 2)
+        self.assertEqual(payload["data_quality"]["falling_candidate_count"], 2)
+        self.assertEqual(payload["data_quality"]["trend_candidate_count"], 4)
+        self.assertEqual(rows["850001"]["rising_score"], 80.0)
+        self.assertEqual(rows["850002"]["rising_score"], 20.0)
+        self.assertEqual(rows["850003"]["falling_score"], -80.0)
+        self.assertEqual(rows["850004"]["falling_score"], -20.0)
+        self.assertEqual(
+            [row["segment_code"] for row in payload["rankings"]["falling"]],
+            ["850003", "850004"],
+        )
+        self.assertEqual(
+            [row["segment_code"] for row in payload["rankings"]["trend"]],
+            ["850001", "850002", "850004", "850003"],
+        )
+        self.assertEqual(
+            [row["trend_score"] for row in payload["rankings"]["trend"]],
+            [80.0, 20.0, -20.0, -80.0],
+        )
+        self.assertFalse(rows["850005"]["is_rising_candidate"])
+        self.assertFalse(rows["850005"]["is_falling_candidate"])
+        self.assertIsNone(rows["850005"]["trend_score"])
+        self.assertIsNone(rows["850005"]["trend_rank"])
+
+    def test_v2_report_remains_valid_and_service_readable(self):
+        segments, histories = _signed_trend_fixture()
+        previous = _as_v2_payload(heat.compute_sw3_industry_heat(segments, histories))
+
+        heat.validate_complete_report(previous, min_eligible_coverage=1.0)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_file = Path(tmpdir) / "heat.json"
+            report_file.write_text(json.dumps(previous), encoding="utf-8")
+            with patch.object(radar_service, "RADAR_INDUSTRY_HEAT_FILE", report_file):
+                service_payload = radar_service.radar_industry_heat_payload()
+
+        self.assertTrue(service_payload["available"])
+        self.assertEqual(service_payload["schema"], heat.SW3_INDUSTRY_HEAT_V2_SCHEMA)
+
+    def test_v3_validator_and_service_reject_corrupted_trend_sets_and_ranks(self):
+        segments, histories = _signed_trend_fixture()
+        valid = heat.compute_sw3_industry_heat(segments, histories)
+
+        corrupted_payloads = []
+        missing_falling_ref = copy.deepcopy(valid)
+        missing_falling_ref["rankings"]["falling"].pop()
+        corrupted_payloads.append(missing_falling_ref)
+
+        duplicate_trend_rank = copy.deepcopy(valid)
+        row = next(
+            item for item in duplicate_trend_rank["industries"]
+            if item["segment_code"] == "850003"
+        )
+        row["trend_rank"] = 3
+        corrupted_payloads.append(duplicate_trend_rank)
+
+        unknown_trend_ref = copy.deepcopy(valid)
+        unknown_trend_ref["rankings"]["trend"][0]["segment_code"] = "859999"
+        corrupted_payloads.append(unknown_trend_ref)
+
+        direction_conflict = copy.deepcopy(valid)
+        row = next(
+            item for item in direction_conflict["industries"]
+            if item["segment_code"] == "850005"
+        )
+        row["trend_score"] = -1.0
+        corrupted_payloads.append(direction_conflict)
+
+        for index, corrupted in enumerate(corrupted_payloads):
+            with self.subTest(index=index):
+                with self.assertRaises(heat.IndustryHeatIncompleteError):
+                    heat.validate_complete_report(corrupted, min_eligible_coverage=1.0)
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            report_file = Path(tmpdir) / "heat.json"
+            report_file.write_text(json.dumps(unknown_trend_ref), encoding="utf-8")
+            with patch.object(radar_service, "RADAR_INDUSTRY_HEAT_FILE", report_file):
+                service_payload = radar_service.radar_industry_heat_payload()
+
+        self.assertFalse(service_payload["available"])
+        self.assertIn("损坏", service_payload["error"])
 
     def test_compute_marks_akshare_component_sum_as_derived_not_estimated(self):
         histories = _histories()

@@ -18,13 +18,15 @@ from __future__ import annotations
 import argparse
 import os
 import statistics
+import sys
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 os.environ.setdefault("STOCK_CRAWL_NO_PROXY", "1")
 
 import stock_storage
-from stock_crawl_common import strip_proxy_env
+from stock_crawl_common import load_json_file, strip_proxy_env, write_json_file
 from stock_crawl_price_valuation import (
     plan_fundamentals_refresh,
     refresh_stock_histories,
@@ -39,6 +41,79 @@ DEFAULT_WORKERS = 6          # 别调高：>6 易把龙虎榜/K线接口跑挂(�
 DEFAULT_YEARS = 4.0         # 覆盖 verify 的 LOOKBACK(90)+WINDOW(750)+前向(40) ≈ 880 交易日
 MIN_BARS = 250              # 上市/数据不足(次新)门槛：有效日线 < 250 视为次新剔除
 MAX_HISTORY_LAG_DAYS = 7    # 停牌容忍；超过则不进入需要即时交易的游资小盘池
+
+
+def _failure_error(exc: Exception) -> str:
+    return f"{type(exc).__name__}: {exc}"[:4000]
+
+
+def _failure_detail(code, name, stage, error) -> Dict[str, Any]:
+    return {
+        "code": str(code).zfill(6) if code else None,
+        "name": str(name or ""),
+        "stage": str(stage or "hot_money_small_cap_universe"),
+        "error": str(error or "unknown error")[:4000],
+    }
+
+
+def _refresh_failure_payload(
+    refresh_result: Dict[str, Any],
+    selected: List[str],
+    names: Dict[str, str],
+    *,
+    extra_details: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    failed = [str(code).zfill(6) for code in refresh_result.get("failed", []) if code]
+    details = []
+    for item in refresh_result.get("failure_details", []) or []:
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").zfill(6) if item.get("code") else None
+        details.append(_failure_detail(
+            code,
+            item.get("name") or names.get(code or "", ""),
+            item.get("stage") or "hot_money_long_factor_refresh",
+            item.get("error") or "长线因子刷新失败",
+        ))
+    details.extend(extra_details or [])
+    detailed_codes = {item.get("code") for item in details if item.get("code")}
+    for code in failed:
+        if code not in detailed_codes:
+            details.append(_failure_detail(
+                code,
+                names.get(code, ""),
+                "hot_money_long_factor_refresh",
+                "长线因子数据刷新失败",
+            ))
+    for item in details:
+        if item.get("code") and item["code"] not in failed:
+            failed.append(item["code"])
+    return {
+        "requested": int(refresh_result.get("requested", len(selected)) or 0),
+        "processed": int(refresh_result.get("processed", 0) or 0),
+        "write_enqueued": int(refresh_result.get("write_enqueued", 0) or 0),
+        "write_completed": int(refresh_result.get("write_completed", 0) or 0),
+        "failed": failed,
+        "failure_details": details,
+        "selected": len(selected),
+    }
+
+
+def incomplete_selected_fundamentals(codes: List[str]) -> Dict[str, List[str]]:
+    """Final atomic-switch guard: every selected stock must have complete factor families."""
+    from stock_crawl_fundamentals import fundamentals_missing_families
+
+    conn = stock_storage.connect()
+    try:
+        states = stock_storage.fundamentals_state_map(conn, codes)
+    finally:
+        conn.close()
+    incomplete = {}
+    for code in codes:
+        missing = fundamentals_missing_families(states.get(code) or {})
+        if missing:
+            incomplete[code] = missing
+    return incomplete
 
 
 def select_seed(conn, min_lhb: int, since: str) -> Dict[str, List[str]]:
@@ -138,7 +213,7 @@ def float_cap_yi(conn, code: str) -> Optional[float]:
     return statistics.median(caps) if caps else None
 
 
-def main() -> None:
+def main(argv=None) -> Dict[str, Any]:
     ap = argparse.ArgumentParser(description="游资小盘 universe 选股建池")
     ap.add_argument("--min-lhb", type=int, default=DEFAULT_MIN_LHB, help="近1年龙虎榜最少上榜次数")
     ap.add_argument("--max-cap", type=float, default=DEFAULT_MAX_CAP_YI, help="流通市值上限(亿)")
@@ -150,8 +225,13 @@ def main() -> None:
         action="store_true",
         help="建池后补齐最终成员的估值与基本面；生产 full 刷新启用",
     )
+    ap.add_argument(
+        "--failure-report",
+        type=Path,
+        help="把致命的逐股失败代码、阶段和异常写入该 JSON sidecar",
+    )
     ap.add_argument("--dry-run", action="store_true", help="只选股不爬K线不标记")
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     since = args.since or (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
     conn = stock_storage.connect()
@@ -171,7 +251,18 @@ def main() -> None:
         if not_member[:10]:
             print(f"  [dry-run] 不在册样本: {' '.join(not_member[:10])}")
         conn.close()
-        return
+        result = {
+            "requested": len(in_member),
+            "processed": len(in_member),
+            "write_enqueued": 0,
+            "write_completed": 0,
+            "failed": [],
+            "failure_details": [],
+            "selected": None,
+        }
+        if args.failure_report:
+            write_json_file(args.failure_report, result)
+        return result
 
     # 1) 加 is_hot_money 列
     stock_storage._ensure_table_columns(conn, "sw3_member", {"is_hot_money": "INTEGER NOT NULL DEFAULT 0"})
@@ -208,18 +299,81 @@ def main() -> None:
     conn.close()
 
     if not selected:
+        detail = _failure_detail(
+            None,
+            "",
+            "hot_money_pool_selection",
+            "RuntimeError: 游资小盘筛选结果为空，保留上一份有效股票池",
+        )
+        result = {
+            "requested": len(in_member),
+            "processed": len(in_member),
+            "write_enqueued": int(refresh_result.get("write_enqueued", 0) or 0),
+            "write_completed": int(refresh_result.get("write_completed", 0) or 0),
+            "failed": [],
+            "failure_details": [detail],
+            "selected": 0,
+        }
+        if args.failure_report:
+            write_json_file(args.failure_report, result)
         raise RuntimeError("游资小盘筛选结果为空，保留上一份有效股票池")
 
     # 4) 生产 full 刷新会启用因子补齐。任一股票失败时不切换池标记，让上层
     # 保留旧策略结果，避免新池配旧数据；独立建池/quick 模式维持轻量行为。
+    factor_result = {
+        "requested": len(selected),
+        "processed": len(selected),
+        "write_enqueued": 0,
+        "write_completed": 0,
+        "failed": [],
+        "failure_details": [],
+    }
     if args.enrich_long_factors:
-        factor_result = refresh_selected_factor_data(
-            selected, names, years=args.years, workers=args.workers
-        )
-        if factor_result.get("failed"):
-            samples = ", ".join(str(code) for code in factor_result["failed"][:8])
+        try:
+            factor_result = refresh_selected_factor_data(
+                selected, names, years=args.years, workers=args.workers
+            )
+        except Exception as exc:
+            detail = _failure_detail(
+                None,
+                "",
+                "hot_money_long_factor_refresh",
+                _failure_error(exc),
+            )
+            result = _refresh_failure_payload(
+                {}, selected, names, extra_details=[detail]
+            )
+            if args.failure_report:
+                write_json_file(args.failure_report, result)
+            raise
+        if factor_result.get("failed") or factor_result.get("failure_details"):
+            result = _refresh_failure_payload(factor_result, selected, names)
+            if args.failure_report:
+                write_json_file(args.failure_report, result)
+            samples = ", ".join(str(code) for code in result["failed"][:8])
             raise RuntimeError(
-                f"游资小盘长线因子数据刷新失败 {len(factor_result['failed'])} 只"
+                f"游资小盘长线因子数据刷新失败 {len(result['failed'])} 只"
+                f"（{samples}），保留上一份有效股票池"
+            )
+        incomplete = incomplete_selected_fundamentals(selected)
+        if incomplete:
+            details = [
+                _failure_detail(
+                    code,
+                    names.get(code, ""),
+                    "fundamentals_validation",
+                    f"基本面数据不完整: {', '.join(missing)}",
+                )
+                for code, missing in incomplete.items()
+            ]
+            result = _refresh_failure_payload(
+                factor_result, selected, names, extra_details=details
+            )
+            if args.failure_report:
+                write_json_file(args.failure_report, result)
+            samples = ", ".join(str(code) for code in result["failed"][:8])
+            raise RuntimeError(
+                f"游资小盘长线因子完整性复核失败 {len(incomplete)} 只"
                 f"（{samples}），保留上一份有效股票池"
             )
 
@@ -240,7 +394,49 @@ def main() -> None:
         f"· K线落后>{MAX_HISTORY_LAG_DAYS}天 {skip_stale} · 无市值数据 {skip_nocap}"
     )
     print(f"  不在 sw3_member 未处理(TODO): {len(not_member)}")
+    result = _refresh_failure_payload(factor_result, selected, names)
+    if args.failure_report:
+        write_json_file(args.failure_report, result)
+    return result
+
+
+def _failure_report_from_argv(argv) -> Optional[Path]:
+    values = list(sys.argv[1:] if argv is None else argv)
+    try:
+        index = values.index("--failure-report")
+        return Path(values[index + 1])
+    except (ValueError, IndexError):
+        return None
+
+
+def cli(argv=None) -> int:
+    failure_report = _failure_report_from_argv(argv)
+    if failure_report:
+        write_json_file(failure_report, {"failure_details": []})
+    try:
+        main(argv)
+        return 0
+    except Exception as exc:
+        payload = load_json_file(failure_report, None) if failure_report else None
+        details = payload.get("failure_details") if isinstance(payload, dict) else None
+        if failure_report and not details:
+            detail = _failure_detail(
+                None,
+                "",
+                "hot_money_small_cap_universe",
+                _failure_error(exc),
+            )
+            write_json_file(failure_report, {
+                "requested": 0,
+                "processed": 0,
+                "write_enqueued": 0,
+                "write_completed": 0,
+                "failed": [],
+                "failure_details": [detail],
+            })
+        print(f"[ERROR] hot_money_small_cap_universe: {_failure_error(exc)}")
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(cli())

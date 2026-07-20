@@ -37,6 +37,7 @@ from stock_crawl_common import (
     safe_float as _safe_float,
     retry_fetch as _retry_fetch,
     is_bse_stock,
+    exchange_prefix,
     fetch_index_constituents,
     fetch_qfq_daily_records,
     daily_payload_from_history_records,
@@ -60,6 +61,54 @@ STAGE_TIMING_ORDER = ("daily", "financials", "indicators", "dividends", "save", 
 # full 模式的跳过条件要按“已回补较长日线”判断，避免一年短日线被误判为完整。
 MIN_COMPLETE_DAILY_ROWS = 200
 DAILY_FRESH_MAX_GAP_DAYS = 20
+
+INDICATOR_FIELDS = (
+    "roe", "roe_weighted", "eps_diluted", "eps_adjusted", "eps_deducted",
+    "bvps_adjusted", "ocfps", "gross_margin", "net_margin", "revenue_growth",
+    "net_profit_growth", "net_assets_growth", "total_assets",
+    "deducted_net_profit", "dividend_payout_ratio", "asset_liability_ratio",
+)
+
+SINA_INDICATOR_COLUMNS = {
+    "roe": "净资产收益率(%)",
+    "roe_weighted": "加权净资产收益率(%)",
+    "eps_diluted": "摊薄每股收益(元)",
+    "eps_adjusted": "每股收益_调整后(元)",
+    "eps_deducted": "扣除非经常性损益后的每股收益(元)",
+    "bvps_adjusted": "每股净资产_调整后(元)",
+    "ocfps": "每股经营性现金流(元)",
+    "gross_margin": "销售毛利率(%)",
+    "net_margin": "销售净利率(%)",
+    "revenue_growth": "主营业务收入增长率(%)",
+    "net_profit_growth": "净利润增长率(%)",
+    "net_assets_growth": "净资产增长率(%)",
+    "total_assets": "总资产(元)",
+    "deducted_net_profit": "扣除非经常性损益后的净利润(元)",
+    "dividend_payout_ratio": "股息发放率(%)",
+    "asset_liability_ratio": "资产负债率(%)",
+}
+
+# AkShare 1.18.57 的东财接口原样返回 APP_F10_MAINFINADATA 字段。这里保留
+# canonical 名以兼容现有因子；其中 BPS、营业总收入同比和归母净利同比分别是
+# bvps_adjusted、revenue_growth、net_profit_growth 的最接近可用口径。
+EASTMONEY_INDICATOR_COLUMNS = {
+    "roe": "ROEJQ",
+    "roe_weighted": "ROEJQ",
+    "eps_diluted": "EPSXS",
+    "eps_adjusted": [],
+    "eps_deducted": "EPSKCJB",
+    "bvps_adjusted": "BPS",
+    "ocfps": "MGJYXJJE",
+    "gross_margin": "XSMLL",
+    "net_margin": "XSJLL",
+    "revenue_growth": "TOTALOPERATEREVETZ",
+    "net_profit_growth": "PARENTNETPROFITTZ",
+    "net_assets_growth": "EQUITY_YOYRATIO_PK",
+    "total_assets": "TOTAL_ASSETS_PK",
+    "deducted_net_profit": "KCFJCXSYJLR",
+    "dividend_payout_ratio": [],
+    "asset_liability_ratio": "ZCFZL",
+}
 
 
 def _json_mapping(value):
@@ -178,11 +227,75 @@ def _df_to_records(df, cols_map, date_col="报告日"):
             val = None
             for col_name in candidates:
                 if col_name in df.columns:
-                    val = _safe_float(row[col_name])
-                    break
+                    candidate = _safe_float(row[col_name])
+                    if candidate is not None:
+                        val = candidate
+                        break
             rec[new_key] = val
         records.append(rec)
     return records
+
+
+def _indicator_records_from_df(df, columns, *, date_col):
+    """Normalize one indicator source without accepting date-only/schema-drift rows."""
+    if not isinstance(df, pd.DataFrame) or df.empty or date_col not in df.columns:
+        return []
+    normalized = []
+    seen_dates = set()
+    for record in _df_to_records(df, columns, date_col=date_col):
+        date_text = str(record.get("date") or "")[:10]
+        try:
+            datetime.strptime(date_text, "%Y-%m-%d")
+        except (TypeError, ValueError):
+            continue
+        if date_text in seen_dates:
+            continue
+        if not any(record.get(field) is not None for field in INDICATOR_FIELDS):
+            continue
+        record["date"] = date_text
+        seen_dates.add(date_text)
+        normalized.append(record)
+    return sorted(normalized, key=lambda row: row["date"], reverse=True)[:FINANCIAL_QUARTERS]
+
+
+def _financial_indicator_start_year(listing_date=None):
+    start_year = datetime.now().year - FINANCIAL_YEARS
+    normalized_listing_date = ss.normalize_listing_date(listing_date)
+    if normalized_listing_date:
+        start_year = max(start_year, int(normalized_listing_date[:4]))
+    return str(start_year)
+
+
+def _eastmoney_indicator_symbol(symbol):
+    code = str(symbol or "").strip()
+    if len(code) != 6 or not code.isdigit():
+        raise ValueError(f"无效证券代码: {symbol!r}")
+    market = exchange_prefix(code)
+    if market == "bj":
+        raise ValueError(f"{code} 暂不支持东方财富财务指标 fallback")
+    if market not in {"sh", "sz"}:
+        raise ValueError(f"{code} 无法识别交易所")
+    return f"{code}.{market.upper()}"
+
+
+def _indicator_result(records, *, source, requested_start_year, fallback_reason=None):
+    roe_series = [row["roe"] for row in records if row.get("roe") is not None]
+    roe_stats = {}
+    if roe_series:
+        roe_stats = {
+            "mean": _safe_float(np.mean(roe_series)),
+            "std": _safe_float(np.std(roe_series)),
+            "count": len(roe_series),
+        }
+    result = {
+        "records": records,
+        "roe_stats": roe_stats,
+        "source": source,
+        "requested_start_year": requested_start_year,
+    }
+    if fallback_reason:
+        result["fallback_reason"] = fallback_reason
+    return result
 
 
 def fetch_daily_price(symbol, years=1):
@@ -248,45 +361,67 @@ def fetch_financial_reports(stock_code):
     return result
 
 
-def fetch_financial_indicators(symbol):
-    """获取财务分析指标（ROE、增长率、每股净资产等）"""
-    start_year = str(datetime.now().year - FINANCIAL_YEARS)
-    df = _retry_fetch(ak.stock_financial_analysis_indicator, symbol=symbol, start_year=start_year)
-    # 按日期降序排列，最新在前
-    df = df.iloc[::-1].reset_index(drop=True)
+def fetch_financial_indicators(symbol, *, listing_date=None):
+    """获取财务分析指标；新浪空表/字段漂移时回退东方财富。"""
+    start_year = _financial_indicator_start_year(listing_date)
+    sina_error = None
+    try:
+        sina_df = _retry_fetch(
+            ak.stock_financial_analysis_indicator,
+            symbol=symbol,
+            start_year=start_year,
+        )
+    except Exception as exc:
+        sina_error = exc
+        sina_df = None
+    sina_records = _indicator_records_from_df(
+        sina_df, SINA_INDICATOR_COLUMNS, date_col="日期"
+    )
+    if sina_records:
+        return _indicator_result(
+            sina_records,
+            source="akshare.stock_financial_analysis_indicator",
+            requested_start_year=start_year,
+        )
 
-    indicator_cols = {
-        "roe": "净资产收益率(%)",
-        "roe_weighted": "加权净资产收益率(%)",
-        "eps_diluted": "摊薄每股收益(元)",
-        "eps_adjusted": "每股收益_调整后(元)",
-        "eps_deducted": "扣除非经常性损益后的每股收益(元)",
-        "bvps_adjusted": "每股净资产_调整后(元)",
-        "ocfps": "每股经营性现金流(元)",
-        "gross_margin": "销售毛利率(%)",
-        "net_margin": "销售净利率(%)",
-        "revenue_growth": "主营业务收入增长率(%)",
-        "net_profit_growth": "净利润增长率(%)",
-        "net_assets_growth": "净资产增长率(%)",
-        "total_assets": "总资产(元)",
-        "deducted_net_profit": "扣除非经常性损益后的净利润(元)",
-        "dividend_payout_ratio": "股息发放率(%)",
-        "asset_liability_ratio": "资产负债率(%)",
-    }
-
-    records = _df_to_records(df, indicator_cols, date_col="日期")
-
-    # 提取 ROE 序列（用于计算 ROE 均值-标准差因子）
-    roe_series = [r["roe"] for r in records if r["roe"] is not None]
-    roe_stats = {}
-    if roe_series:
-        roe_stats = {
-            "mean": _safe_float(np.mean(roe_series)),
-            "std": _safe_float(np.std(roe_series)),
-            "count": len(roe_series),
-        }
-
-    return {"records": records, "roe_stats": roe_stats}
+    fallback_reason = (
+        f"sina_error:{type(sina_error).__name__}" if sina_error
+        else "sina_empty_or_incompatible"
+    )
+    em_fetcher = getattr(ak, "stock_financial_analysis_indicator_em", None)
+    if not callable(em_fetcher):
+        raise RuntimeError(
+            f"{str(symbol).zfill(6)} 财务指标新浪源不可用，当前 AkShare 缺少东方财富 fallback"
+        ) from sina_error
+    em_symbol = _eastmoney_indicator_symbol(symbol)
+    try:
+        em_df = _retry_fetch(em_fetcher, symbol=em_symbol, indicator="按报告期")
+    except Exception as exc:
+        raise RuntimeError(
+            f"{str(symbol).zfill(6)} 财务指标两源均不可用: "
+            f"新浪={fallback_reason}, 东方财富={type(exc).__name__}: {exc}"
+        ) from exc
+    em_records = _indicator_records_from_df(
+        em_df, EASTMONEY_INDICATOR_COLUMNS, date_col="REPORT_DATE"
+    )
+    if em_records:
+        return _indicator_result(
+            em_records,
+            source="akshare.stock_financial_analysis_indicator_em",
+            requested_start_year=start_year,
+            fallback_reason=fallback_reason,
+        )
+    if sina_error:
+        raise RuntimeError(
+            f"{str(symbol).zfill(6)} 财务指标两源均不可用: "
+            f"新浪={type(sina_error).__name__}: {sina_error}, 东方财富=empty"
+        ) from sina_error
+    return _indicator_result(
+        [],
+        source="none",
+        requested_start_year=start_year,
+        fallback_reason=fallback_reason,
+    )
 
 
 def fetch_dividend_history(symbol):
@@ -418,7 +553,7 @@ def fetch_one_stock(symbol, name, pledge_map, timing_callback=None):
 FUNDAMENTALS_EXPIRE_DAYS = 90  # 兜底：超过该天数未刷强制刷一次(yjbb 出新报告会更早触发)
 
 
-def fetch_fundamentals(symbol, pledge_info=None):
+def fetch_fundamentals(symbol, pledge_info=None, *, listing_date=None):
     """只爬财报相关(financials/indicators/dividends + 可选 pledge)，不含日线。
 
     供 stock_crawl_price_valuation 的龙头池 per-stock 爬取嵌入调用：日线/估值它自己有，
@@ -426,7 +561,7 @@ def fetch_fundamentals(symbol, pledge_info=None):
     """
     out = {
         "financials": fetch_financial_reports(symbol),
-        "indicators": fetch_financial_indicators(symbol),
+        "indicators": fetch_financial_indicators(symbol, listing_date=listing_date),
         "dividends": fetch_dividend_history(symbol),
     }
     ensure_fundamentals_complete(out, symbol)
@@ -1009,7 +1144,9 @@ def refetch_financials(codes=None, workers=8):
             return code, False, "无 stock_data 记录"
         try:
             data["financials"] = fetch_financial_reports(code)
-            data["indicators"] = fetch_financial_indicators(code)
+            data["indicators"] = fetch_financial_indicators(
+                code, listing_date=data.get("listing_date")
+            )
             data["dividends"] = fetch_dividend_history(code)
             ensure_fundamentals_complete(data, code)
             data["financials_refetched_at"] = datetime.now().isoformat()

@@ -554,17 +554,24 @@ def refresh_before_server(
         )
     )
 
-    hot_money_universe_step = run_step(
-        "hot_money_small_cap_universe",
-        [
-            python_bin,
-            "-B",
-            "stock_crawl_hot_money_universe.py",
-            *(["--enrich-long-factors"] if full else []),
-        ],
-        timeout=timeout,
-        env=env,
-    )
+    with TemporaryDirectory(prefix="stock-hot-money-refresh-") as tmpdir:
+        hot_money_failure_sidecar = Path(tmpdir) / "failure-report.json"
+        hot_money_universe_step = run_step(
+            "hot_money_small_cap_universe",
+            [
+                python_bin,
+                "-B",
+                "stock_crawl_hot_money_universe.py",
+                *(["--enrich-long-factors"] if full else []),
+                "--failure-report",
+                str(hot_money_failure_sidecar),
+            ],
+            timeout=timeout,
+            env=env,
+        )
+        _attach_failure_sidecar(
+            hot_money_universe_step, hot_money_failure_sidecar
+        )
     steps.append(hot_money_universe_step)
 
     steps.append(
